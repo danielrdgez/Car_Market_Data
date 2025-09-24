@@ -1,4 +1,4 @@
-from logging import raiseExceptions
+import logging
 from re import X
 from socket import timeout
 import pandas as pd
@@ -26,10 +26,21 @@ options = webdriver.ChromeOptions()
 options.add_experimental_option('excludeSwitches', ['enable-logging'])
 options.add_argument('--start-maximized')  # Start with maximized window
 options.add_argument('--disable-popup-blocking')  # Disable popup blocking
+options.add_argument('--headless')  # Run in headless mode for background execution
+options.add_argument('--no-sandbox')  # Required for running as root
+options.add_argument('--disable-dev-shm-usage')  # Overcome limited resource problems
+options.add_argument('--disable-gpu')  # Disable GPU hardware acceleration
 
 # Initialize the Chrome driver with options
 driver = webdriver.Chrome(options=options)
 driver.implicitly_wait(5)  # Set a default implicit wait time
+
+# Set up logging
+logging.basicConfig(
+    filename=os.path.join(output_directory, f'scraping_{date.today()}.log'),
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
 
 #input_make = "hyundai"      #input(f'Make:{str()}').casefold()
 #input_model = "veloster"        #input(f'Model:{str()}').casefold()
