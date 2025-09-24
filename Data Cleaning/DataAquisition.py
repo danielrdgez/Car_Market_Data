@@ -8,7 +8,7 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 import time
-from selenium.common.exceptions import NoSuchElementException, StaleElementReferenceException, TimeoutException, WebDriverException
+from selenium.common.exceptions import NoSuchElementException, TimeoutException, WebDriverException
 from selenium.webdriver.common.action_chains import ActionChains 
 from datetime import date
 import os
@@ -52,7 +52,7 @@ logging.basicConfig(
 input_zip = "33186"      #input(f'Zip:{int(max=5)}')
 input_radius = "50"       #input(f'Radius:{str(max=4)}')
 input_year = 2000
-input_state = "country"
+input_state = "state"
 
 
 driver.get(f'https://www.autotempest.com/results?localization={input_state}&zip={input_zip}&minyear={input_year}')

@@ -11,3 +11,13 @@ source .venv/bin/activate
 # -d prevents display sleep
 # -m prevents disk from sleeping
 caffeinate -i -d -m python "Data Cleaning/DataAquisition.py"
+
+# Calculate duration
+end_time=$(date +%s)
+duration=$((end_time - start_time))
+hours=$((duration / 3600))
+minutes=$(( (duration % 3600) / 60 ))
+seconds=$((duration % 60))
+
+# Log runtime
+echo "Total runtime: ${hours}h ${minutes}m ${seconds}s" >> "${HOME}/scraper_runtime.log"
