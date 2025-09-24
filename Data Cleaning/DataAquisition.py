@@ -24,16 +24,21 @@ if not os.path.exists(output_directory):
 # Configure Chrome options
 options = webdriver.ChromeOptions()
 options.add_experimental_option('excludeSwitches', ['enable-logging'])
-options.add_argument('--start-maximized')  # Start with maximized window
-options.add_argument('--disable-popup-blocking')  # Disable popup blocking
-options.add_argument('--headless')  # Run in headless mode for background execution
-options.add_argument('--no-sandbox')  # Required for running as root
-options.add_argument('--disable-dev-shm-usage')  # Overcome limited resource problems
-options.add_argument('--disable-gpu')  # Disable GPU hardware acceleration
+options.add_argument('--start-maximized')
+options.add_argument('--disable-popup-blocking')
+options.add_argument('--headless')
+options.add_argument('--no-sandbox')
+options.add_argument('--disable-dev-shm-usage')
+options.add_argument('--disable-gpu')
+options.add_argument('--disable-browser-side-navigation')
+options.add_argument('--disable-infobars')
+options.add_argument('--disable-extensions')
+options.page_load_strategy = 'eager'  # Load faster by not waiting for all resources
 
 # Initialize the Chrome driver with options
 driver = webdriver.Chrome(options=options)
-driver.implicitly_wait(5)  # Set a default implicit wait time
+driver.set_page_load_timeout(300)  # Increase timeout to 5 minutes
+driver.implicitly_wait(10)  # Increase implicit wait time
 
 # Set up logging
 logging.basicConfig(
@@ -91,7 +96,7 @@ def scroll_to_bottom():
             break
         last_height = new_height
 
-def click_button(xpath, timeout=10):
+def click_button(xpath, timeout=30):  # Increased default timeout
     try:
         # Get current page content length
         old_content_length = len(driver.page_source)
@@ -99,14 +104,17 @@ def click_button(xpath, timeout=10):
         # Scroll to ensure all current content is loaded
         scroll_to_bottom()
         
-        # Wait for element to be clickable with a reasonable timeout
+        # Add explicit wait before looking for button
+        time.sleep(2)
+        
+        # Wait for element to be clickable with increased timeout
         button = WebDriverWait(driver, timeout).until(
             EC.element_to_be_clickable((By.XPATH, xpath))
         )
         
         # Scroll element into view and add padding to ensure it's visible
         driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", button)
-        time.sleep(1)  # Wait for scroll to complete
+        time.sleep(2)  # Increased wait time after scroll
         
         # Try to click the button in different ways
         try:
@@ -277,10 +285,23 @@ def save_and_exit(accumulated_df=None, driver=None):
     sys.exit(0)
 
 def car_data():
-    max_retries = 3  # Maximum retries for each iteration
+    max_retries = 5  # Increased maximum retries
     iteration = 1
-    accumulated_df = None  # Initialize accumulated dataframe
-    ribbon_handled = False  # Flag to track if ribbon has been handled
+    accumulated_df = None
+    ribbon_handled = False
+    
+    def reset_driver():
+        """Helper function to reset the driver if it becomes unresponsive"""
+        global driver
+        try:
+            driver.quit()
+        except:
+            pass
+        driver = webdriver.Chrome(options=options)
+        driver.set_page_load_timeout(300)
+        driver.implicitly_wait(10)
+        driver.get(f'https://www.autotempest.com/results?localization={input_state}&zip={input_zip}&minyear={input_year}')
+        time.sleep(5)  # Wait for initial page load
     
     try:
         while True:  # Continue until no buttons are clickable
