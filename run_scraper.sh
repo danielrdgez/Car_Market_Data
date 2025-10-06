@@ -10,7 +10,7 @@ source .venv/bin/activate
 # -i prevents idle sleep
 # -d prevents display sleep
 # -m prevents disk from sleeping
-caffeinate -i -d -m python "Data Cleaning/DataAquisition.py"
+caffeinate -i -d -m python "DataPipeline/DataAquisition.py"
 
 # Calculate duration
 end_time=$(date +%s)
