@@ -27,11 +27,11 @@ options.add_experimental_option('excludeSwitches', ['enable-logging'])
 options.add_argument('--start-maximized')
 options.add_argument('--disable-popup-blocking')
 options.add_argument('--headless')
-options.add_argument('--no-sandbox')
-options.add_argument('--disable-dev-shm-usage')
-options.add_argument('--disable-gpu')
-options.add_argument('--disable-browser-side-navigation')
-options.add_argument('--disable-infobars')
+#options.add_argument('--no-sandbox')
+#options.add_argument('--disable-dev-shm-usage')
+#options.add_argument('--disable-gpu')
+#options.add_argument('--disable-browser-side-navigation')
+#options.add_argument('--disable-infobars')
 options.add_argument('--disable-extensions')
 options.page_load_strategy = 'eager'  # Load faster by not waiting for all resources
 
@@ -61,7 +61,7 @@ continue_buttons_xpath = {
     "autotempest" : '//*[@id="te-results"]/section/button',
     "hemmings" : '//*[@id="hem-results"]/section/button',
     "cars" : '//*[@id="cm-results"]/section/button',
-    "carsoup" : '//*[@id="cs-results"]/section/button',
+    #"carsoup" : '//*[@id="cs-results"]/section/button',
     "carvana" : '//*[@id="cv-results"]/section/button',
     "ebay" : '//*[@id="eb-results"]/section/button',
     "truecar" : '//*[@id="tc-results"]/section/button',
@@ -70,13 +70,13 @@ continue_buttons_xpath = {
     
 def wait_for_new_content(old_content_length):
     """Wait for new content to load by monitoring the page source length"""
-    max_wait = 10  # Maximum seconds to wait
+    max_wait = 5  # Maximum seconds to wait
     start_time = time.time()
     
     while time.time() - start_time < max_wait:
         new_length = len(driver.page_source)
         if new_length > old_content_length:
-            time.sleep(2)  # Give a moment for everything to settle
+            time.sleep(1)  # Give a moment for everything to settle
             return True
         time.sleep(0.5)
     return False
@@ -88,7 +88,7 @@ def scroll_to_bottom():
     while True:
         # Scroll down
         driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-        time.sleep(2)  # Wait for content to load
+        time.sleep(0.5)  # Wait for content to load
         
         # Calculate new scroll height and compare with last scroll height
         new_height = driver.execute_script("return document.body.scrollHeight")
@@ -105,7 +105,7 @@ def click_button(xpath, timeout=30):  # Increased default timeout
         scroll_to_bottom()
         
         # Add explicit wait before looking for button
-        time.sleep(2)
+        time.sleep(0.5)
         
         # Wait for element to be clickable with increased timeout
         button = WebDriverWait(driver, timeout).until(
@@ -210,7 +210,7 @@ def car_df(existing_df=None):
             car_dictionary["make"].append(name_car[1] if len(name_car) > 1 else "")
             car_dictionary["model"].append(name_car[2] if len(name_car) > 2 else "")
             # Join trim words into a single string
-            trim_words = name_car[3:6] if len(name_car) > 3 else []
+            trim_words = name_car[3:] if len(name_car) > 3 else []
             car_dictionary["trim"].append(" ".join(trim_words) if trim_words else "")
             
         distance = section.find("span", class_="distance")
@@ -298,83 +298,11 @@ def car_data():
         except:
             pass
         driver = webdriver.Chrome(options=options)
-        driver.set_page_load_timeout(300)
-        driver.implicitly_wait(10)
+        driver.set_page_load_timeout(120)
+        driver.implicitly_wait(5)
         driver.get(f'https://www.autotempest.com/results?localization={input_state}&zip={input_zip}&minyear={input_year}')
         time.sleep(5)  # Wait for initial page load
     
-    try:
-        while True:  # Continue until no buttons are clickable
-            print(f"\nStarting iteration {iteration}")
-            
-            try:
-                # Get current car count before clicking buttons
-                accumulated_df = car_df(accumulated_df)  # Pass the existing dataframe
-                print(f"Current number of cars before iteration {iteration}: {len(accumulated_df)}")
-            except (urllib3.exceptions.ReadTimeoutError, WebDriverException) as e:
-                print(f"\nConnection error while getting car data: {e}")
-                save_and_exit(accumulated_df, driver)
-            
-            any_button_clicked = False  # Track if any button was successfully clicked
-            
-            for button_name, button_xpath in continue_buttons_xpath.items():
-                retry_count = 0
-                while retry_count < max_retries:
-                    try:
-                        print(f"Attempting to click {button_name} button...")
-                        
-                        # Check for ribbon before clicking each button
-                        if handle_ribbon():
-                            print("Ribbon found and dismissed")
-                        
-                        # Try to click the button
-                        if click_button(button_xpath):
-                            print(f"Successfully clicked {button_name} button")
-                            any_button_clicked = True  # Mark that we clicked at least one button
-                            break  # Success - move to next button
-                        else:
-                            print(f"Button {button_name} not found or not clickable")
-                            break  # Button not found - move to next button
-                        
-                    except (urllib3.exceptions.ReadTimeoutError, WebDriverException) as e:
-                        print(f"\nConnection error during button click: {e}")
-                        save_and_exit(accumulated_df, driver)
-                    except Exception as e:
-                        retry_count += 1
-                        print(f"Error clicking {button_name} button (attempt {retry_count}): {str(e)}")
-                        if retry_count < max_retries:
-                            print("Retrying...")
-                        else:
-                            print(f"Failed to click {button_name} button after {max_retries} attempts")
-            
-            # If no buttons were clicked in this iteration, we're done
-            if not any_button_clicked:
-                print("\nNo more buttons found to click. Finishing...")
-                break
-                
-            try:
-                # Get car count after clicking all buttons in this iteration
-                accumulated_df = car_df(accumulated_df)  # Pass the accumulated dataframe
-                print(f"Number of cars after iteration {iteration}: {len(accumulated_df)}")
-                
-                # Save progress
-                accumulated_df["load_date"] = date.today()
-                accumulated_df.to_csv(os.path.join(output_directory, f"CAR_DATA_{date.today()}.csv"), index=False)
-                print(f"Saved current progress to CSV file")
-            except (urllib3.exceptions.ReadTimeoutError, WebDriverException) as e:
-                print(f"\nConnection error while saving progress: {e}")
-                save_and_exit(accumulated_df, driver)
-            
-            iteration += 1
-            print(f"Completed iteration {iteration-1}, continuing to next iteration...")
-
-    except Exception as e:
-        print(f"\nUnexpected error: {e}")
-        save_and_exit(accumulated_df, driver)
-    
-    # Normal completion
-    save_and_exit(accumulated_df, driver)
-
     try:
         while True:  # Continue until no buttons are clickable
             print(f"\nStarting iteration {iteration}")

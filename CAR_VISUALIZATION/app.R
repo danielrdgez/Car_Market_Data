@@ -16,12 +16,15 @@ if(length(new_packages)) install.packages(new_packages)
 library(shiny)
 library(tidyverse)
 
-# Get the latest CSV file from the output directory
+# Get the latest CSV file from the output directory and print its name
 latest_csv <- list.files(
   path = '/Users/OneTwo/Documents/CAR_ML/CAR_DATA_OUTPUT/',
   pattern = "CAR_DATA_.*\\.csv$",
   full.names = TRUE
 ) |> sort() |> tail(1)
+
+# Print the CSV filename to console
+cat("Using CSV file:", basename(latest_csv), "\n")
 
 # Add error handling for CSV reading
 tryCatch({
@@ -45,7 +48,7 @@ ui <- fluidPage(
                        selected = NULL),
             selectInput("year_select",
                        "Select Year:",
-                       choices = unique(car_data$year),
+                       choices = sort(unique(car_data$year), decreasing = TRUE),
                        selected = NULL)
         ),
 
