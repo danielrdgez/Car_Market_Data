@@ -27,13 +27,13 @@ options.add_experimental_option('excludeSwitches', ['enable-logging'])
 options.add_argument('--start-maximized')
 options.add_argument('--disable-popup-blocking')
 options.add_argument('--headless')
-#options.add_argument('--no-sandbox')
+options.add_argument('--no-sandbox')
 #options.add_argument('--disable-dev-shm-usage')
 #options.add_argument('--disable-gpu')
 #options.add_argument('--disable-browser-side-navigation')
 #options.add_argument('--disable-infobars')
-options.add_argument('--disable-extensions')
-options.page_load_strategy = 'eager'  # Load faster by not waiting for all resources
+#options.add_argument('--disable-extensions')
+#options.page_load_strategy = 'eager'  # Load faster by not waiting for all resources
 
 # Initialize the Chrome driver with options
 driver = webdriver.Chrome(options=options)
@@ -68,44 +68,28 @@ continue_buttons_xpath = {
     "other" : '//*[@id="ot-results"]/section/button'
 }
     
-def wait_for_new_content(old_content_length):
-    """Wait for new content to load by monitoring the page source length"""
-    max_wait = 5  # Maximum seconds to wait
-    start_time = time.time()
-    
-    while time.time() - start_time < max_wait:
-        new_length = len(driver.page_source)
-        if new_length > old_content_length:
-            time.sleep(1)  # Give a moment for everything to settle
-            return True
-        time.sleep(0.5)
-    return False
-
-def scroll_to_bottom():
-    """Scroll to the bottom of the page to ensure all content is loaded"""
-    last_height = driver.execute_script("return document.body.scrollHeight")
-    
-    while True:
-        # Scroll down
-        driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-        time.sleep(0.5)  # Wait for content to load
-        
-        # Calculate new scroll height and compare with last scroll height
-        new_height = driver.execute_script("return document.body.scrollHeight")
-        if new_height == last_height:
-            break
-        last_height = new_height
-
-def click_button(xpath, timeout=30):  # Increased default timeout
+def wait_for_page_load(timeout=10):
+    """Wait for page to complete loading using Selenium's built-in mechanisms"""
     try:
-        # Get current page content length
-        old_content_length = len(driver.page_source)
+        # Wait for document ready state
+        WebDriverWait(driver, timeout).until(
+            lambda d: d.execute_script('return document.readyState') == 'complete'
+        )
         
-        # Scroll to ensure all current content is loaded
-        scroll_to_bottom()
+        # Wait for specific element that indicates new content
+        WebDriverWait(driver, timeout).until(
+            EC.presence_of_all_elements_located((By.CLASS_NAME, 'description-wrap'))
+        )
         
-        # Add explicit wait before looking for button
-        time.sleep(0.5)
+        return True
+    except TimeoutException:
+        logging.warning('Timeout waiting for page load')
+        return False
+
+def click_button(xpath, timeout=30):
+    try:
+        # Wait for page to be fully loaded before attempting to click
+        wait_for_page_load(timeout)
         
         # Wait for element to be clickable with increased timeout
         button = WebDriverWait(driver, timeout).until(
@@ -128,12 +112,12 @@ def click_button(xpath, timeout=30):  # Increased default timeout
                 # Try JavaScript click as last resort
                 driver.execute_script("arguments[0].click();", button)
         
-        # Wait for new content to load
-        if wait_for_new_content(old_content_length):
-            print("New content loaded successfully")
+        # Wait for new content to load using improved wait mechanism
+        if wait_for_page_load(timeout):
+            logging.info("New content loaded successfully")
             return True
         else:
-            print("No new content detected after click")
+            logging.info("No new content detected after click")
             return False
             
     except Exception as e:
