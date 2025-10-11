@@ -1,6 +1,5 @@
 import logging
 from re import X
-from socket import timeout
 import pandas as pd
 from bs4 import BeautifulSoup
 from selenium import webdriver
@@ -26,8 +25,8 @@ options = webdriver.ChromeOptions()
 options.add_experimental_option('excludeSwitches', ['enable-logging'])
 options.add_argument('--start-maximized')
 options.add_argument('--disable-popup-blocking')
-options.add_argument('--headless')
-options.add_argument('--no-sandbox')
+#options.add_argument('--headless')
+#options.add_argument('--no-sandbox')
 #options.add_argument('--disable-dev-shm-usage')
 #options.add_argument('--disable-gpu')
 #options.add_argument('--disable-browser-side-navigation')
@@ -55,7 +54,7 @@ input_year = 2000
 input_state = "state"
 
 
-driver.get(f'https://www.autotempest.com/results?localization={input_state}&zip={input_zip}&minyear={input_year}')
+driver.get(f'https://www.autotempest.com/results?localization={input_state}&zip={input_zip}&minprice=1')
 
 continue_buttons_xpath = {
     "autotempest" : '//*[@id="te-results"]/section/button',
@@ -168,16 +167,33 @@ def car_df(existing_df=None):
         "distance_from_zip" : [],
         "city" : [],
         "time_listed" : [],
-        "branded_title" : []
+        "branded_title" : [],
+        "current_bid" : []
     }
 
     for section in section_card:
         price = section.find("div", class_= "badge__label label--price")
+
+        # Track if price is a current bid
+        is_bid = False
+
+        if price is None:
+            bid_price = section.find("div", class_="badge__label label--bid")
+            history_price = section.find("div" , class_= "badge__label label--price price-history")
+
+            if bid_price is not None:
+                price = bid_price
+                is_bid = True
+            elif history_price is not None:
+                price = history_price
+
         if price != None:
             price_car = price.text
             car_dictionary["price"].append(price_car)
         else:
             car_dictionary["price"].append("Inquire")
+
+        car_dictionary["current_bid"].append(1 if is_bid else 0)
 
         mileage = section.find("span", class_="mileage")
         if mileage != None:
@@ -284,7 +300,7 @@ def car_data():
         driver = webdriver.Chrome(options=options)
         driver.set_page_load_timeout(120)
         driver.implicitly_wait(5)
-        driver.get(f'https://www.autotempest.com/results?localization={input_state}&zip={input_zip}&minyear={input_year}')
+        driver.get(f'https://www.autotempest.com/results?localization={input_state}&zip={input_zip}&minprice=1')
         time.sleep(5)  # Wait for initial page load
     
     try:
