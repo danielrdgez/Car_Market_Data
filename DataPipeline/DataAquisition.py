@@ -14,7 +14,7 @@ import os
 import urllib3
 import sys
 
-output_directory = "/Users/OneTwo/Documents/CAR_ML/CAR_DATA_OUTPUT"
+output_directory = os.path.join(os.path.dirname(os.path.dirname(__file__)), "CAR_DATA_OUTPUT")
 
 # Create the output directory if it doesn't exist
 if not os.path.exists(output_directory):
@@ -22,10 +22,11 @@ if not os.path.exists(output_directory):
 
 # Configure Chrome options
 options = webdriver.ChromeOptions()
-options.add_experimental_option('excludeSwitches', ['enable-logging'])
-options.add_argument('--start-maximized')
+options.add_experimental_option('excludeSwitches', ['enable-logging', 'enable-automation'])
+options.add_argument('--disable-blink-features=AutomationControlled')
+#options.add_argument('--start-maximized')
 options.add_argument('--disable-popup-blocking')
-#options.add_argument('--headless')
+options.add_argument('--headless')
 #options.add_argument('--no-sandbox')
 #options.add_argument('--disable-dev-shm-usage')
 #options.add_argument('--disable-gpu')
@@ -51,19 +52,19 @@ logging.basicConfig(
 input_zip = "33186"      #input(f'Zip:{int(max=5)}')
 input_radius = "50"       #input(f'Radius:{str(max=4)}')
 input_year = 2000
-input_state = "state"
+input_state = "country"
 
 
-driver.get(f'https://www.autotempest.com/results?localization={input_state}&zip={input_zip}&minprice=1')
+driver.get(f'https://www.autotempest.com/results?localization={input_state}&zip={input_zip}')
 
 continue_buttons_xpath = {
     "autotempest" : '//*[@id="te-results"]/section/button',
     "hemmings" : '//*[@id="hem-results"]/section/button',
     "cars" : '//*[@id="cm-results"]/section/button',
-    #"carsoup" : '//*[@id="cs-results"]/section/button',
+    "carsoup" : '//*[@id="cs-results"]/section/button',
     "carvana" : '//*[@id="cv-results"]/section/button',
     "ebay" : '//*[@id="eb-results"]/section/button',
-    "truecar" : '//*[@id="tc-results"]/section/button',
+    #"truecar" : '//*[@id="tc-results"]/section/button',
     "other" : '//*[@id="ot-results"]/section/button'
 }
     
@@ -168,7 +169,8 @@ def car_df(existing_df=None):
         "city" : [],
         "time_listed" : [],
         "branded_title" : [],
-        "current_bid" : []
+        "current_bid" : [],
+        "description" : []
     }
 
     for section in section_card:
@@ -240,6 +242,15 @@ def car_df(existing_df=None):
             car_dictionary["branded_title"].append(branded_title_car)
         else:
             car_dictionary["branded_title"].append(0)
+        
+        # Extract description from the details div containing 4 spans
+        details_div = section.find("div", class_="details")
+        if details_div:
+            spans = details_div.find_all("span")
+            description_text = " ".join([span.text.strip() for span in spans if span.text])
+            car_dictionary["description"].append(description_text if description_text else "")
+        else:
+            car_dictionary["description"].append("")
     
     new_df = pd.DataFrame.from_dict(car_dictionary)
     
@@ -376,4 +387,4 @@ def car_data():
     save_and_exit(accumulated_df, driver)
 
 if __name__ == "__main__":
-    car_data()  # This now handles everything including saving the final CSV
+    car_data()
