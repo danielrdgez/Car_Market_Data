@@ -33,12 +33,12 @@ options.add_argument('--headless')
 #options.add_argument('--disable-browser-side-navigation')
 #options.add_argument('--disable-infobars')
 #options.add_argument('--disable-extensions')
-#options.page_load_strategy = 'eager'  # Load faster by not waiting for all resources
+options.page_load_strategy = 'eager'  # Load faster by not waiting for all resources
 
 # Initialize the Chrome driver with options
 driver = webdriver.Chrome(options=options)
-driver.set_page_load_timeout(300)  # Increase timeout to 5 minutes
-driver.implicitly_wait(10)  # Increase implicit wait time
+driver.set_page_load_timeout(60)  # Set page load timeout
+driver.implicitly_wait(2)  # Increase implicit wait time
 
 # Set up logging
 logging.basicConfig(
@@ -77,9 +77,9 @@ def wait_for_page_load(timeout=10):
         )
         
         # Wait for specific element that indicates new content
-        WebDriverWait(driver, timeout).until(
-            EC.presence_of_all_elements_located((By.CLASS_NAME, 'description-wrap'))
-        )
+        #WebDriverWait(driver, timeout).until(
+        #    EC.presence_of_all_elements_located((By.CLASS_NAME, 'description-wrap'))
+        #)
         
         return True
     except TimeoutException:
@@ -89,7 +89,7 @@ def wait_for_page_load(timeout=10):
 def click_button(xpath, timeout=30):
     try:
         # Wait for page to be fully loaded before attempting to click
-        wait_for_page_load(timeout)
+        #wait_for_page_load(timeout)
         
         # Wait for element to be clickable with increased timeout
         button = WebDriverWait(driver, timeout).until(
@@ -98,7 +98,7 @@ def click_button(xpath, timeout=30):
         
         # Scroll element into view and add padding to ensure it's visible
         driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", button)
-        time.sleep(2)  # Increased wait time after scroll
+        time.sleep(0.5)  # Increased wait time after scroll
         
         # Try to click the button in different ways
         try:
@@ -127,13 +127,13 @@ def click_button(xpath, timeout=30):
 def handle_ribbon():
     try:
         # Check if the ribbon exists with a reasonable timeout
-        ribbon = WebDriverWait(driver, 2).until(
+        ribbon = WebDriverWait(driver, 1).until(
             EC.presence_of_element_located((By.XPATH, '//*[@id="results"]/div[9]/div'))
         )
         
         # If ribbon exists, try to find and click the dismiss button
         try:
-            dismiss_button = WebDriverWait(driver, 2).until(
+            dismiss_button = WebDriverWait(driver, 1).until(
                 EC.element_to_be_clickable((By.XPATH, '//*[@id="cta-dismiss"]/i'))
             )
             # Scroll to the dismiss button
@@ -142,7 +142,7 @@ def handle_ribbon():
             ActionChains(driver).move_to_element(dismiss_button).click().perform()
             
             # Wait for ribbon to disappear
-            WebDriverWait(driver, 2).until(
+            WebDriverWait(driver, 1).until(
                 EC.invisibility_of_element_located((By.XPATH, '//*[@id="results"]/div[9]/div'))
             )
         except Exception as e:
@@ -300,6 +300,7 @@ def car_data():
     iteration = 1
     accumulated_df = None
     ribbon_handled = False
+    unclickable_buttons = set()  # Track buttons that are confirmed not clickable
     
     def reset_driver():
         """Helper function to reset the driver if it becomes unresponsive"""
@@ -329,6 +330,11 @@ def car_data():
             any_button_clicked = False  # Track if any button was successfully clicked
             
             for button_name, button_xpath in continue_buttons_xpath.items():
+                # Skip buttons that are already confirmed as unclickable
+                if button_name in unclickable_buttons:
+                    print(f"Skipping {button_name} button (already confirmed not clickable)")
+                    continue
+                
                 retry_count = 0
                 while retry_count < max_retries:
                     try:
@@ -345,6 +351,7 @@ def car_data():
                             break  # Success - move to next button
                         else:
                             print(f"Button {button_name} not found or not clickable")
+                            unclickable_buttons.add(button_name)  # Mark as unclickable for future iterations
                             break  # Button not found - move to next button
                         
                     except (urllib3.exceptions.ReadTimeoutError, WebDriverException) as e:
