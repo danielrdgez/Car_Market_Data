@@ -9,10 +9,11 @@ from selenium.webdriver.support import expected_conditions as EC
 import time
 from selenium.common.exceptions import NoSuchElementException, TimeoutException, WebDriverException
 from selenium.webdriver.common.action_chains import ActionChains 
-from datetime import date
+from datetime import date, datetime, timezone
 import os
 import urllib3
 import sys
+import json
 
 output_directory = os.path.join(os.path.dirname(os.path.dirname(__file__)), "CAR_DATA_OUTPUT")
 
@@ -34,6 +35,8 @@ options.add_argument('--headless')
 #options.add_argument('--disable-infobars')
 #options.add_argument('--disable-extensions')
 options.page_load_strategy = 'eager'  # Load faster by not waiting for all resources
+# Enable CDP performance logging for capturing network responses
+options.set_capability("goog:loggingPrefs", {"performance": "ALL"})
 
 # Initialize the Chrome driver with options
 driver = webdriver.Chrome(options=options)
@@ -152,185 +155,121 @@ def handle_ribbon():
         return True
     except (NoSuchElementException, TimeoutException):
         return False  # Ribbon not found, which is fine
+
+# ============= CDP-based JSON data extraction functions =============
+def parse_performance_logs_for_queue_results(seen_request_ids):
+    """Extract queue-results API responses from performance logs"""
+    rows = []
+    try:
+        logs = driver.get_log("performance")
+        for entry in logs:
+            try:
+                msg = json.loads(entry["message"])['message']
+            except Exception:
+                continue
+            if msg.get("method") != "Network.responseReceived":
+                continue
+            params = msg.get("params", {})
+            response = params.get("response", {})
+            url = response.get("url", "")
+            if "queue-results" not in url:
+                continue
+            request_id = params.get("requestId")
+            if not request_id or request_id in seen_request_ids:
+                continue
+            seen_request_ids.add(request_id)
+            try:
+                body = driver.execute_cdp_cmd("Network.getResponseBody", {"requestId": request_id})
+                text = body.get("body", "")
+                if not text:
+                    continue
+                api_json = json.loads(text)
+                rows.extend(extract_rows_from_api_data(api_json))
+                print(f"Captured queue-results response (requestId={request_id})")
+            except WebDriverException:
+                continue
+            except Exception:
+                continue
+    except Exception as e:
+        print(f"Error reading performance logs: {e}")
+    return rows
+
+def extract_rows_from_api_data(api_data):
+    """Extract individual car rows from API JSON response with selected fields"""
+    rows = []
+    items = api_data.get("items") or api_data.get("results") or []
     
-def car_df(existing_df=None):
-    html = driver.page_source
-    soup = BeautifulSoup(html, "html.parser")
-    section_card = soup.find_all("div", class_="description-wrap")
+    # Fields to extract from each item
+    fields_to_extract = [
+        "date", "endDate", "archiveDate", "location", "locationCode", "countryCode",
+        "pendingSale", "title", "trim", "currentBid", "bids", "distance", "priceHistory",
+        "priceRecentChange", "price", "listingHistory", "mileage", "make", "model",
+        "backendModel", "year", "vin", "sellerType", "vehicleTitle", "listingType",
+        "vehicleTitleDesc", "sourceName", "detailsShort", "detailsMid", "detailsLong", "detailsExtraLong"
+    ]
     
-    car_dictionary = {
-        "price" : [],
-        "mileage" : [],
-        "year" : [],
-        "make" : [],
-        "model" : [],
-        "trim" : [],
-        "distance_from_zip" : [],
-        "city" : [],
-        "time_listed" : [],
-        "branded_title" : [],
-        "current_bid" : [],
-        "description" : []
-    }
-
-    for section in section_card:
-        price = section.find("div", class_= "badge__label label--price")
-
-        # Track if price is a current bid
-        is_bid = False
-
-        if price is None:
-            bid_price = section.find("div", class_="badge__label label--bid")
-            history_price = section.find("div" , class_= "badge__label label--price price-history")
-
-            if bid_price is not None:
-                price = bid_price
-                is_bid = True
-            elif history_price is not None:
-                price = history_price
-
-        if price != None:
-            price_car = price.text
-            car_dictionary["price"].append(price_car)
-        else:
-            car_dictionary["price"].append("Inquire")
-
-        car_dictionary["current_bid"].append(1 if is_bid else 0)
-
-        mileage = section.find("span", class_="mileage")
-        if mileage != None:
-            mileage_car = mileage.text
-            car_dictionary["mileage"].append(mileage_car)
-        else:
-            car_dictionary["mileage"].append(f"None")
-                        
-        name = section.find("span", class_="title-wrap listing-title")
-        if name != None:
-            name_car = name.text.strip().split(" ")
-            # Check if the list has enough elements before accessing them
-            car_dictionary["year"].append(name_car[0] if len(name_car) > 0 else "")
-            car_dictionary["make"].append(name_car[1] if len(name_car) > 1 else "")
-            car_dictionary["model"].append(name_car[2] if len(name_car) > 2 else "")
-            # Join trim words into a single string
-            trim_words = name_car[3:] if len(name_car) > 3 else []
-            car_dictionary["trim"].append(" ".join(trim_words) if trim_words else "")
-            
-        distance = section.find("span", class_="distance")
-        if distance != None:
-            distance_car = distance.text
-            car_dictionary["distance_from_zip"].append(distance_car)
-        else:
-            car_dictionary["distance_from_zip"].append(f"delivers to {input_zip}")
-
-        city = section.find("span", class_="city")
-        if city != None:
-            city_car = city.text
-            car_dictionary["city"].append(city_car)
-        else:
-            car_dictionary["city"].append("")
-
-        time_listed = section.find("span", class_="date")
-        if time_listed != None:
-            time_listed_car = time_listed.text
-            car_dictionary["time_listed"].append(time_listed_car)
-        else:
-            car_dictionary["time_listed"].append("")
-
-        branded_title = section.find("span", class_="title-status")
-        if branded_title != None:
-            branded_title_car = 1
-            car_dictionary["branded_title"].append(branded_title_car)
-        else:
-            car_dictionary["branded_title"].append(0)
+    for item in items:
+        row = {}
+        row["timestamp"] = datetime.now(timezone.utc).isoformat()
+        row["loaddate"] = date.today()
         
-        # Extract description from the details div containing 4 spans
-        details_div = section.find("div", class_="details")
-        if details_div:
-            spans = details_div.find_all("span")
-            description_text = " ".join([span.text.strip() for span in spans if span.text])
-            car_dictionary["description"].append(description_text if description_text else "")
-        else:
-            car_dictionary["description"].append("")
-    
-    new_df = pd.DataFrame.from_dict(car_dictionary)
-    
-    # Add load date to the new dataframe
-    new_df["load_date"] = date.today()
-    
-    if existing_df is not None:
-        # Concatenate new data with existing data
-        combined_df = pd.concat([existing_df, new_df], ignore_index=True)
-        # Drop duplicates based on all columns except 'distance from zip' and 'load_date'
-        columns_for_dupes = [col for col in combined_df.columns if col not in ['distance from zip', 'load_date']]
-        combined_df = combined_df.drop_duplicates(subset=columns_for_dupes, keep='first')
+        # Extract only the specified fields
+        for field in fields_to_extract:
+            value = item.get(field)
+            # Serialize nested structures (lists/dicts) to JSON strings
+            if isinstance(value, (list, dict)):
+                row[field] = json.dumps(value, ensure_ascii=False)
+            else:
+                row[field] = value
         
-        # Save the current state to CSV
-        combined_df.to_csv(os.path.join(output_directory, f"CAR_DATA_{date.today()}.csv"), index=False)
-        print(f"Saved {len(combined_df)} cars to CSV file")
-        
-        return combined_df
+        rows.append(row)
+    return rows
+
+def append_api_rows_to_csv(rows, csv_path=None):
+    """Append API-extracted rows to CAR_DATA CSV"""
+    if not rows:
+        return 0
+    if csv_path is None:
+        csv_path = os.path.join(output_directory, f"CAR_DATA_{date.today()}.csv")
+    df = pd.DataFrame(rows)
+    if os.path.exists(csv_path):
+        existing = pd.read_csv(csv_path)
+        combined = pd.concat([existing, df], ignore_index=True, sort=False)
+        # Deduplicate by vin (primary key for vehicles)
+        if "vin" in combined.columns and combined["vin"].notna().any():
+            combined = combined.drop_duplicates(subset=["vin"], keep="last")
+        combined.to_csv(csv_path, index=False)
+        added = len(combined) - len(existing)
+        print(f"Appended {added} rows, total now {len(combined)}")
+        return added
     else:
-        # Save the initial state to CSV
-        new_df.to_csv(os.path.join(output_directory, f"CAR_DATA_{date.today()}.csv"), index=False)
-        print(f"Saved {len(new_df)} cars to CSV file")
-        
-        return new_df
+        df.to_csv(csv_path, index=False)
+        print(f"Wrote {len(df)} rows to CAR_DATA CSV")
+        return len(df)
+# ====================================================================
+# HTML scraping removed - using API data only
+# ====================================================================
 
-def save_and_exit(accumulated_df=None, driver=None):
-    """Helper function to save data and clean up before exiting"""
-    if accumulated_df is not None:
-        try:
-            # Final save of the data
-            accumulated_df["load_date"] = date.today()
-            accumulated_df.to_csv(os.path.join(output_directory, f"CAR_DATA_{date.today()}.csv"), index=False)
-            print(f"\nFinal save completed. Total cars collected: {len(accumulated_df)}")
-        except Exception as e:
-            print(f"Error saving final data: {e}")
-    
-    if driver is not None:
-        try:
-            driver.quit()
-        except Exception:
-            pass
-    
-    sys.exit(0)
 
 def car_data():
-    max_retries = 5  # Increased maximum retries
+    max_retries = 5
     iteration = 1
-    accumulated_df = None
-    ribbon_handled = False
-    unclickable_buttons = set()  # Track buttons that are confirmed not clickable
+    unclickable_buttons = set()
+    seen_api_request_ids = set()
     
-    def reset_driver():
-        """Helper function to reset the driver if it becomes unresponsive"""
-        global driver
-        try:
-            driver.quit()
-        except:
-            pass
-        driver = webdriver.Chrome(options=options)
-        driver.set_page_load_timeout(120)
-        driver.implicitly_wait(5)
-        driver.get(f'https://www.autotempest.com/results?localization={input_state}&zip={input_zip}&minprice=1')
-        time.sleep(5)  # Wait for initial page load
+    # Enable CDP commands for API response capture
+    try:
+        driver.execute_cdp_cmd("Network.enable", {})
+    except Exception as e:
+        print(f"Warning: Could not enable Network CDP command: {e}")
     
     try:
-        while True:  # Continue until no buttons are clickable
+        while True:
             print(f"\nStarting iteration {iteration}")
             
-            try:
-                # Get current car count before clicking buttons
-                accumulated_df = car_df(accumulated_df)  # Pass the existing dataframe
-                print(f"Current number of cars before iteration {iteration}: {len(accumulated_df)}")
-            except (urllib3.exceptions.ReadTimeoutError, WebDriverException) as e:
-                print(f"\nConnection error while getting car data: {e}")
-                save_and_exit(accumulated_df, driver)
-            
-            any_button_clicked = False  # Track if any button was successfully clicked
+            any_button_clicked = False
             
             for button_name, button_xpath in continue_buttons_xpath.items():
-                # Skip buttons that are already confirmed as unclickable
                 if button_name in unclickable_buttons:
                     print(f"Skipping {button_name} button (already confirmed not clickable)")
                     continue
@@ -340,23 +279,22 @@ def car_data():
                     try:
                         print(f"Attempting to click {button_name} button...")
                         
-                        # Check for ribbon before clicking each button
                         if handle_ribbon():
                             print("Ribbon found and dismissed")
                         
-                        # Try to click the button
                         if click_button(button_xpath):
                             print(f"Successfully clicked {button_name} button")
-                            any_button_clicked = True  # Mark that we clicked at least one button
-                            break  # Success - move to next button
+                            any_button_clicked = True
+                            break
                         else:
                             print(f"Button {button_name} not found or not clickable")
-                            unclickable_buttons.add(button_name)  # Mark as unclickable for future iterations
-                            break  # Button not found - move to next button
+                            unclickable_buttons.add(button_name)
+                            break
                         
                     except (urllib3.exceptions.ReadTimeoutError, WebDriverException) as e:
                         print(f"\nConnection error during button click: {e}")
-                        save_and_exit(accumulated_df, driver)
+                        driver.quit()
+                        sys.exit(0)
                     except Exception as e:
                         retry_count += 1
                         print(f"Error clicking {button_name} button (attempt {retry_count}): {str(e)}")
@@ -365,33 +303,30 @@ def car_data():
                         else:
                             print(f"Failed to click {button_name} button after {max_retries} attempts")
             
-            # If no buttons were clicked in this iteration, we're done
             if not any_button_clicked:
                 print("\nNo more buttons found to click. Finishing...")
                 break
-                
+            
+            # Collect API data after each iteration
             try:
-                # Get car count after clicking all buttons in this iteration
-                accumulated_df = car_df(accumulated_df)  # Pass the accumulated dataframe
-                print(f"Number of cars after iteration {iteration}: {len(accumulated_df)}")
-                
-                # Save progress
-                accumulated_df["load_date"] = date.today()
-                accumulated_df.to_csv(os.path.join(output_directory, f"CAR_DATA_{date.today()}.csv"), index=False)
-                print(f"Saved current progress to CSV file")
-            except (urllib3.exceptions.ReadTimeoutError, WebDriverException) as e:
-                print(f"\nConnection error while saving progress: {e}")
-                save_and_exit(accumulated_df, driver)
+                api_rows = parse_performance_logs_for_queue_results(seen_api_request_ids)
+                if api_rows:
+                    append_api_rows_to_csv(api_rows)
+                    print(f"Captured {len(api_rows)} rows from iteration {iteration}")
+            except Exception as e:
+                print(f"Warning: Error collecting API data: {e}")
             
             iteration += 1
             print(f"Completed iteration {iteration-1}, continuing to next iteration...")
 
     except Exception as e:
         print(f"\nUnexpected error: {e}")
-        save_and_exit(accumulated_df, driver)
-    
-    # Normal completion
-    save_and_exit(accumulated_df, driver)
+    finally:
+        try:
+            driver.quit()
+        except Exception:
+            pass
+        print(f"\nData collection completed. Output saved to CAR_DATA_{date.today()}.csv")
 
 if __name__ == "__main__":
     car_data()
