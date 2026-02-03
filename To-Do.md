@@ -30,3 +30,6 @@
 ## Backlog / Future Tasks
 - [ ]
 - [ ]
+
+## Ideas
+ - Use the price history as another dataset for different slices of time series
