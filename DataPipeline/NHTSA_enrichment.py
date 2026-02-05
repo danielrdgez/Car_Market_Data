@@ -13,6 +13,9 @@ class NHTSAEnricher:
     
     BASE_URL = "https://vpic.nhtsa.dot.gov/api/vehicles/"
     DECODE_ENDPOINT = "DecodeVinValuesExtended/"
+    RATINGS_BASE_URL = "https://api.nhtsa.gov/SafetyRatings/"
+    RECALLS_BASE_URL = "https://api.nhtsa.gov/recalls/"
+    COMPLAINTS_BASE_URL = "https://api.nhtsa.gov/complaints/"
     MAX_BATCH_SIZE = 50  # NHTSA recommends max 50 VINs per request
     
     def __init__(self, rate_limit_delay: float = 0.5, output_dir: Optional[str] = None):
@@ -170,6 +173,217 @@ class NHTSAEnricher:
         
         return specs
     
+    def get_safety_ratings(self, model_year: str, make: str, model: str) -> Optional[Dict]:
+        """
+        Query NHTSA Safety Ratings API
+        
+        Args:
+            model_year: Vehicle model year (e.g., '2013')
+            make: Vehicle make (e.g., 'Acura')
+            model: Vehicle model (e.g., 'RDX')
+            
+        Returns:
+            Dictionary with API response data or None if request fails
+            Sample: {"Count":2,"Message":"Results returned successfully","Results":[...]}
+        """
+        self._apply_rate_limit()
+        
+        try:
+            url = f"{self.RATINGS_BASE_URL}modelyear/{model_year}/make/{make}/model/{model}?format=json"
+            logging.info(f"Querying NHTSA Safety Ratings API: {model_year} {make} {model}")
+            
+            response = requests.get(url, timeout=30)
+            response.raise_for_status()
+            
+            data = response.json()
+            
+            if data.get("Results"):
+                return data
+            else:
+                logging.warning(f"No safety ratings found for {model_year} {make} {model}")
+                return None
+                
+        except requests.exceptions.Timeout:
+            logging.error(f"Timeout querying safety ratings for {model_year} {make} {model}")
+            return None
+        except requests.exceptions.RequestException as e:
+            logging.error(f"Error querying safety ratings: {e}")
+            return None
+        except Exception as e:
+            logging.error(f"Unexpected error getting safety ratings: {e}")
+            return None
+    
+    def get_recalls(self, make: str, model: str, model_year: str) -> Optional[Dict]:
+        """
+        Query NHTSA Recalls API
+        
+        Args:
+            make: Vehicle make (e.g., 'acura')
+            model: Vehicle model (e.g., 'rdx')
+            model_year: Vehicle model year (e.g., '2012')
+            
+        Returns:
+            Dictionary with API response data or None if request fails
+            Sample: {"Count":2,"Message":"Results returned successfully","results":[...]}
+        """
+        self._apply_rate_limit()
+        
+        try:
+            url = f"{self.RECALLS_BASE_URL}recallsByVehicle?make={make}&model={model}&modelYear={model_year}&format=json"
+            logging.info(f"Querying NHTSA Recalls API: {model_year} {make} {model}")
+            
+            response = requests.get(url, timeout=30)
+            response.raise_for_status()
+            
+            data = response.json()
+            
+            if data.get("results") or data.get("Results"):
+                return data
+            else:
+                logging.warning(f"No recalls found for {model_year} {make} {model}")
+                return None
+                
+        except requests.exceptions.Timeout:
+            logging.error(f"Timeout querying recalls for {model_year} {make} {model}")
+            return None
+        except requests.exceptions.RequestException as e:
+            logging.error(f"Error querying recalls: {e}")
+            return None
+        except Exception as e:
+            logging.error(f"Unexpected error getting recalls: {e}")
+            return None
+    
+    def get_complaints(self, make: str, model: str, model_year: str) -> Optional[Dict]:
+        """
+        Query NHTSA Complaints API
+        
+        Args:
+            make: Vehicle make (e.g., 'acura')
+            model: Vehicle model (e.g., 'rdx')
+            model_year: Vehicle model year (e.g., '2012')
+            
+        Returns:
+            Dictionary with API response data or None if request fails
+            Sample: {"count":15,"message":"Results returned successfully","results":[...]}
+        """
+        self._apply_rate_limit()
+        
+        try:
+            url = f"{self.COMPLAINTS_BASE_URL}complaintsByVehicle?make={make}&model={model}&modelYear={model_year}&format=json"
+            logging.info(f"Querying NHTSA Complaints API: {model_year} {make} {model}")
+            
+            response = requests.get(url, timeout=30)
+            response.raise_for_status()
+            
+            data = response.json()
+            
+            if data.get("results") or data.get("Results"):
+                return data
+            else:
+                logging.warning(f"No complaints found for {model_year} {make} {model}")
+                return None
+                
+        except requests.exceptions.Timeout:
+            logging.error(f"Timeout querying complaints for {model_year} {make} {model}")
+            return None
+        except requests.exceptions.RequestException as e:
+            logging.error(f"Error querying complaints: {e}")
+            return None
+        except Exception as e:
+            logging.error(f"Unexpected error getting complaints: {e}")
+            return None
+    
+    def extract_ratings_data(self, results: List[Dict]) -> Dict:
+        """
+        Extract safety ratings data from NHTSA API results
+        
+        Args:
+            results: List of result dictionaries from NHTSA Safety Ratings API
+            
+        Returns:
+            Dictionary with extracted safety ratings data
+        """
+        ratings = {}
+        
+        if isinstance(results, list) and len(results) > 0:
+            # Store count of ratings found
+            ratings['nhtsa_safety_ratings_count'] = len(results)
+            
+            # Extract key fields from each rating (typically just one, but handle multiple)
+            for idx, result in enumerate(results[:1]):  # Usually just one result
+                ratings[f'nhtsa_overall_rating'] = result.get('OverallRating', '')
+                ratings[f'nhtsa_front_crash_rating'] = result.get('FrontCrashRating', '')
+                ratings[f'nhtsa_rollover_rating'] = result.get('RolloverRating', '')
+                ratings[f'nhtsa_side_crash_rating'] = result.get('SideCrashRating', '')
+        
+        return ratings
+    
+    def extract_recalls_data(self, results: List[Dict]) -> Dict:
+        """
+        Extract recalls data from NHTSA API results
+        
+        Args:
+            results: List of result dictionaries from NHTSA Recalls API
+            
+        Returns:
+            Dictionary with extracted recall information
+        """
+        recalls = {}
+        
+        if isinstance(results, list):
+            recalls['nhtsa_total_recalls'] = len(results)
+            
+            if len(results) > 0:
+                # Extract key recall components
+                all_components = []
+                for recall in results:
+                    component = recall.get('Component', '')
+                    if component:
+                        all_components.append(component)
+                
+                recalls['nhtsa_recall_components'] = '; '.join(set(all_components[:3]))  # Top 3 unique
+                recalls['nhtsa_latest_recall_date'] = results[0].get('ReportReceivedDate', '')
+        
+        return recalls
+    
+    def extract_complaints_data(self, results: List[Dict]) -> Dict:
+        """
+        Extract complaints data from NHTSA API results
+        
+        Args:
+            results: List of result dictionaries from NHTSA Complaints API
+            
+        Returns:
+            Dictionary with extracted complaint information
+        """
+        complaints = {}
+        
+        if isinstance(results, list):
+            complaints['nhtsa_total_complaints'] = len(results)
+            
+            if len(results) > 0:
+                # Extract complaint statistics
+                injury_count = sum(r.get('numberOfInjuries', 0) for r in results)
+                death_count = sum(r.get('numberOfDeaths', 0) for r in results)
+                crash_count = sum(1 for r in results if r.get('crash', False))
+                fire_count = sum(1 for r in results if r.get('fire', False))
+                
+                complaints['nhtsa_complaint_injuries'] = injury_count
+                complaints['nhtsa_complaint_deaths'] = death_count
+                complaints['nhtsa_complaint_crash_related'] = crash_count
+                complaints['nhtsa_complaint_fire_related'] = fire_count
+                
+                # Extract main complaint components
+                all_components = []
+                for complaint in results:
+                    component = complaint.get('components', '')
+                    if component:
+                        all_components.append(component)
+                
+                complaints['nhtsa_common_complaint_areas'] = '; '.join(set(all_components[:3]))
+        
+        return complaints
+    
     def enrich_data_from_csv(self, input_csv: str, output_csv: Optional[str] = None) -> pd.DataFrame:
         """
         Read AutoTempest data, enrich with NHTSA specs, and merge on VIN
@@ -207,12 +421,38 @@ class NHTSAEnricher:
             print(f"[{i}/{len(unique_vins)}] Querying VIN: {vin}")
             
             api_response = self.decode_vin(vin)
+            specs = {}
             
             if api_response and api_response.get("Results"):
                 specs = self.extract_specs_from_results(api_response["Results"])
-                nhtsa_specs[vin] = specs
-            else:
-                nhtsa_specs[vin] = {}
+                
+                # Extract make, model, and model_year for additional API queries
+                result = api_response["Results"][0] if isinstance(api_response["Results"], list) else api_response["Results"]
+                make = result.get("Make", "").lower()
+                model = result.get("Model", "").lower()
+                model_year = result.get("ModelYear", "")
+                
+                # Query additional NHTSA APIs if we have make, model, year
+                if make and model and model_year:
+                    # Get Safety Ratings
+                    ratings_response = self.get_safety_ratings(model_year, make.title(), model.title())
+                    if ratings_response and ratings_response.get("Results"):
+                        ratings_data = self.extract_ratings_data(ratings_response["Results"])
+                        specs.update(ratings_data)
+                    
+                    # Get Recalls
+                    recalls_response = self.get_recalls(make, model, model_year)
+                    if recalls_response:
+                        recalls_data = self.extract_recalls_data(recalls_response.get("results", []))
+                        specs.update(recalls_data)
+                    
+                    # Get Complaints
+                    complaints_response = self.get_complaints(make, model, model_year)
+                    if complaints_response:
+                        complaints_data = self.extract_complaints_data(complaints_response.get("results", []))
+                        specs.update(complaints_data)
+            
+            nhtsa_specs[vin] = specs
         
         # Convert specs dictionary to DataFrame
         df_nhtsa = pd.DataFrame.from_dict(nhtsa_specs, orient='index')
@@ -297,10 +537,7 @@ class NHTSAEnricher:
 
 def main():
     """Main function to run the NHTSA enrichment pipeline"""
-    enricher = NHTSAEnricher(
-        rate_limit_delay=0.5,
-        output_dir="/Users/OneTwo/Desktop/Car-Price-Data-Visualization-Learning/CAR_DATA_OUTPUT"
-    )
+    enricher = NHTSAEnricher(rate_limit_delay=0.5)
     
     try:
         # Run enrichment (auto-detects latest CAR_DATA file)
