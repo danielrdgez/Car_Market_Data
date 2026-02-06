@@ -1,19 +1,50 @@
 import logging
-from re import X
 import pandas as pd
-from bs4 import BeautifulSoup
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 import time
+import random
+from selenium_stealth import stealth
 from selenium.common.exceptions import NoSuchElementException, TimeoutException, WebDriverException
-from selenium.webdriver.common.action_chains import ActionChains 
+from selenium.webdriver.common.action_chains import ActionChains
 from datetime import date, datetime, timezone
 import os
 import urllib3
 import sys
 import json
+
+def setup_driver(headless=True):
+    """Initializes a stealth-configured Chrome driver."""
+    options = webdriver.ChromeOptions()
+    
+    # CRITICAL: Disable internal automation flags and logging
+    options.add_experimental_option("excludeSwitches", ["enable-automation", "enable-logging"])
+    options.add_experimental_option('useAutomationExtension', False)
+    options.add_argument('--disable-blink-features=AutomationControlled')
+    options.add_argument('--disable-popup-blocking')
+    options.page_load_strategy = 'eager'
+    
+    # Enable Performance Logging for API Interception
+    options.set_capability("goog:loggingPrefs", {"performance": "ALL"})
+    
+    if headless:
+        options.add_argument('--headless=new')
+        options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+
+    driver = webdriver.Chrome(options=options)
+
+    # Apply Stealth Library configurations
+    stealth(driver,
+        languages=["en-US", "en"],
+        vendor="Google Inc.",
+        platform="Win32",
+        webgl_vendor="Intel Inc.",
+        renderer="Intel Iris OpenGL Engine",
+        fix_hairline=True,
+    )
+    return driver
 
 output_directory = os.path.join(os.path.dirname(os.path.dirname(__file__)), "CAR_DATA_OUTPUT")
 
@@ -21,27 +52,10 @@ output_directory = os.path.join(os.path.dirname(os.path.dirname(__file__)), "CAR
 if not os.path.exists(output_directory):
     os.makedirs(output_directory)
 
-# Configure Chrome options
-options = webdriver.ChromeOptions()
-options.add_experimental_option('excludeSwitches', ['enable-logging', 'enable-automation'])
-options.add_argument('--disable-blink-features=AutomationControlled')
-#options.add_argument('--start-maximized')
-options.add_argument('--disable-popup-blocking')
-options.add_argument('--headless')
-#options.add_argument('--no-sandbox')
-#options.add_argument('--disable-dev-shm-usage')
-#options.add_argument('--disable-gpu')
-#options.add_argument('--disable-browser-side-navigation')
-#options.add_argument('--disable-infobars')
-#options.add_argument('--disable-extensions')
-options.page_load_strategy = 'eager'  # Load faster by not waiting for all resources
-# Enable CDP performance logging for capturing network responses
-options.set_capability("goog:loggingPrefs", {"performance": "ALL"})
-
-# Initialize the Chrome driver with options
-driver = webdriver.Chrome(options=options)
-driver.set_page_load_timeout(60)  # Set page load timeout
-driver.implicitly_wait(2)  # Increase implicit wait time
+# Initialize the Chrome driver with stealth options
+driver = setup_driver(headless=True)
+driver.set_page_load_timeout(60)
+driver.implicitly_wait(0)  # Use explicit waits for better control and reliability
 
 # Set up logging
 logging.basicConfig(
@@ -50,13 +64,12 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 
-#input_make = "hyundai"      #input(f'Make:{str()}').casefold()
-#input_model = "veloster"        #input(f'Model:{str()}').casefold()
-input_zip = "33186"      #input(f'Zip:{int(max=5)}')
-input_radius = "50"       #input(f'Radius:{str(max=4)}')
+#input_make = "hyundai"
+#input_model = "veloster"
+input_zip = "33186"
+input_radius = "50"
 input_year = 2000
 input_state = "country"
-
 
 driver.get(f'https://www.autotempest.com/results?localization={input_state}&zip={input_zip}')
 
@@ -67,55 +80,38 @@ continue_buttons_xpath = {
     "carsoup" : '//*[@id="cs-results"]/section/button',
     "carvana" : '//*[@id="cv-results"]/section/button',
     "ebay" : '//*[@id="eb-results"]/section/button',
-    #"truecar" : '//*[@id="tc-results"]/section/button',
     "other" : '//*[@id="ot-results"]/section/button'
 }
     
 def wait_for_page_load(timeout=10):
-    """Wait for page to complete loading using Selenium's built-in mechanisms"""
+    """Wait for page to complete loading."""
     try:
-        # Wait for document ready state
         WebDriverWait(driver, timeout).until(
             lambda d: d.execute_script('return document.readyState') == 'complete'
         )
-        
-        # Wait for specific element that indicates new content
-        #WebDriverWait(driver, timeout).until(
-        #    EC.presence_of_all_elements_located((By.CLASS_NAME, 'description-wrap'))
-        #)
-        
         return True
     except TimeoutException:
         logging.warning('Timeout waiting for page load')
         return False
 
 def click_button(xpath, timeout=30):
+    """Clicks a button with robust fallbacks and randomized waits."""
     try:
-        # Wait for page to be fully loaded before attempting to click
-        #wait_for_page_load(timeout)
-        
-        # Wait for element to be clickable with increased timeout
         button = WebDriverWait(driver, timeout).until(
             EC.element_to_be_clickable((By.XPATH, xpath))
         )
         
-        # Scroll element into view and add padding to ensure it's visible
         driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", button)
-        time.sleep(0.5)  # Increased wait time after scroll
+        time.sleep(random.uniform(0.6, 1.2))  # Human-like pause
         
-        # Try to click the button in different ways
         try:
-            # Try regular click first
             button.click()
         except:
             try:
-                # Try ActionChains click
                 ActionChains(driver).move_to_element(button).click().perform()
             except:
-                # Try JavaScript click as last resort
                 driver.execute_script("arguments[0].click();", button)
         
-        # Wait for new content to load using improved wait mechanism
         if wait_for_page_load(timeout):
             logging.info("New content loaded successfully")
             return True
@@ -128,24 +124,21 @@ def click_button(xpath, timeout=30):
         return False
 
 def handle_ribbon():
+    """Handles the potential appearance of a dismissible ribbon."""
     try:
-        # Check if the ribbon exists with a reasonable timeout
-        ribbon = WebDriverWait(driver, 1).until(
+        WebDriverWait(driver, 1).until(
             EC.presence_of_element_located((By.XPATH, '//*[@id="results"]/div[9]/div'))
         )
         
-        # If ribbon exists, try to find and click the dismiss button
         try:
             dismiss_button = WebDriverWait(driver, 1).until(
                 EC.element_to_be_clickable((By.XPATH, '//*[@id="cta-dismiss"]/i'))
             )
-            # Scroll to the dismiss button
             driver.execute_script("arguments[0].scrollIntoView(true);", dismiss_button)
-            driver.implicitly_wait(1)  # Small pause for stability
+            time.sleep(random.uniform(0.8, 1.5)) # Human-like pause
             ActionChains(driver).move_to_element(dismiss_button).click().perform()
             
-            # Wait for ribbon to disappear
-            WebDriverWait(driver, 1).until(
+            WebDriverWait(driver, 2).until(
                 EC.invisibility_of_element_located((By.XPATH, '//*[@id="results"]/div[9]/div'))
             )
         except Exception as e:
@@ -154,11 +147,10 @@ def handle_ribbon():
             
         return True
     except (NoSuchElementException, TimeoutException):
-        return False  # Ribbon not found, which is fine
+        return False
 
-# ============= CDP-based JSON data extraction functions =============
 def parse_performance_logs_for_queue_results(seen_request_ids):
-    """Extract queue-results API responses from performance logs"""
+    """Extracts car data from 'queue-results' API responses in performance logs."""
     rows = []
     try:
         logs = driver.get_log("performance")
@@ -188,66 +180,51 @@ def parse_performance_logs_for_queue_results(seen_request_ids):
                 print(f"Captured queue-results response (requestId={request_id})")
             except WebDriverException:
                 continue
-            except Exception:
-                continue
     except Exception as e:
         print(f"Error reading performance logs: {e}")
     return rows
 
 def extract_rows_from_api_data(api_data):
-    """Extract individual car rows from API JSON response with selected fields"""
+    """Extracts and formats car data from the API JSON response."""
     rows = []
     items = api_data.get("items") or api_data.get("results") or []
     
-    # Fields to extract from each item
     fields_to_extract = [
         "date", "endDate", "archiveDate", "location", "locationCode", "countryCode",
-        "pendingSale", "title", "trim", "currentBid", "bids", "distance", "priceHistory",
+        "pendingSale", "title", "currentBid", "bids", "distance", "priceHistory",
         "priceRecentChange", "price", "listingHistory", "mileage", "year", "vin", "sellerType", "vehicleTitle", "listingType",
         "vehicleTitleDesc", "sourceName", "detailsShort", "detailsMid", "detailsLong", "detailsExtraLong", "img"
     ]
     
     for item in items:
-        row = {}
-        row["timestamp"] = datetime.now(timezone.utc).isoformat()
-        row["loaddate"] = date.today()
-        
-        # Extract only the specified fields
+        row = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "loaddate": date.today().isoformat()
+        }
         for field in fields_to_extract:
             value = item.get(field)
-            # Serialize nested structures (lists/dicts) to JSON strings
             if isinstance(value, (list, dict)):
                 row[field] = json.dumps(value, ensure_ascii=False)
             else:
                 row[field] = value
-        
         rows.append(row)
     return rows
 
-def append_api_rows_to_csv(rows, seen_vins=None, csv_path=None):
-    """Append API-extracted rows to CAR_DATA CSV"""
+def append_api_rows_to_csv(rows, seen_vins, csv_path):
+    """Appends new rows to the CSV, avoiding duplicates."""
     if not rows:
         return 0
-    if csv_path is None:
-        csv_path = os.path.join(output_directory, f"CAR_DATA_{date.today()}.csv")
     
-    # Filter out rows that have already been collected (based on VIN)
-    if seen_vins is not None:
-        rows = [r for r in rows if r.get("vin") not in seen_vins]
-        # Update the seen_vins set
-        for r in rows:
-            if r.get("vin"):
-                seen_vins.add(r.get("vin"))
-    
-    if not rows:
+    new_rows = [r for r in rows if r.get("vin") and r.get("vin") not in seen_vins]
+    if not new_rows:
         return 0
+        
+    for r in new_rows:
+        seen_vins.add(r.get("vin"))
 
-    df = pd.DataFrame(rows)
-    
-    # Check if file exists to determine if we need to write the header
+    df = pd.DataFrame(new_rows)
     file_exists = os.path.exists(csv_path)
     
-    # Append to CSV (mode='a') instead of reading/rewriting the whole file
     try:
         df.to_csv(csv_path, mode='a', header=not file_exists, index=False)
         print(f"Appended {len(df)} new rows to CAR_DATA CSV")
@@ -256,31 +233,24 @@ def append_api_rows_to_csv(rows, seen_vins=None, csv_path=None):
         print(f"Error appending to CSV: {e}")
         return 0
 
-# ====================================================================
-# HTML scraping removed - using API data only
-# ====================================================================
-
-
 def car_data():
-    max_retries = 5
+    """Main function to drive the data collection process."""
+    max_retries = 3
     iteration = 1
     unclickable_buttons = set()
     seen_api_request_ids = set()
     
-    # Initialize seen_vins to track duplicates in memory rather than reading CSV every time
-    seen_vins = set()
     csv_path = os.path.join(output_directory, f"CAR_DATA_{date.today()}.csv")
+    seen_vins = set()
     if os.path.exists(csv_path):
         try:
             print("Loading existing VINs to avoid duplicates...")
-            # Only read the VIN column to save memory/time
-            existing_data = pd.read_csv(csv_path, usecols=["vin"])
+            existing_data = pd.read_csv(csv_path, usecols=["vin"], on_bad_lines='skip')
             seen_vins = set(existing_data["vin"].dropna().astype(str).tolist())
             print(f"Loaded {len(seen_vins)} existing VINs")
         except Exception as e:
             print(f"Error loading existing VINs: {e}")
     
-    # Enable CDP commands for API response capture
     try:
         driver.execute_cdp_cmd("Network.enable", {})
     except Exception as e:
@@ -295,50 +265,45 @@ def car_data():
             
             for button_name, button_xpath in continue_buttons_xpath.items():
                 if button_name in unclickable_buttons:
-                    print(f"Skipping {button_name} button (already confirmed not clickable)")
                     continue
                 
                 retry_count = 0
                 while retry_count < max_retries:
                     try:
-                        print(f"Attempting to click {button_name} button...")
+                        print(f"Attempting to click '{button_name}' button...")
                         
                         if handle_ribbon():
                             print("Ribbon found and dismissed")
                         
                         if click_button(button_xpath):
-                            print(f"Successfully clicked {button_name} button")
+                            print(f"Successfully clicked '{button_name}' button")
                             any_button_clicked = True
                             break
                         else:
-                            print(f"Button {button_name} not found or not clickable")
+                            print(f"Button '{button_name}' not found or not clickable, adding to skip list.")
                             unclickable_buttons.add(button_name)
                             break
                         
                     except (urllib3.exceptions.ReadTimeoutError, WebDriverException) as e:
-                        print(f"\nConnection error during button click: {e}")
+                        print(f"\nConnection error during button click: {e}. Exiting.")
                         driver.quit()
-                        sys.exit(0)
+                        sys.exit(1)
                     except Exception as e:
                         retry_count += 1
-                        print(f"Error clicking {button_name} button (attempt {retry_count}): {str(e)}")
-                        if retry_count < max_retries:
-                            print("Retrying...")
-                        else:
-                            print(f"Failed to click {button_name} button after {max_retries} attempts")
+                        print(f"Error clicking '{button_name}' button (attempt {retry_count}): {e}")
+                        if retry_count >= max_retries:
+                            print(f"Failed to click '{button_name}' after {max_retries} attempts.")
             
-            if not any_button_clicked:
-                print("\nNo more buttons found to click. Finishing...")
-                break
-            
-            # Collect API data after each iteration
             try:
                 api_rows = parse_performance_logs_for_queue_results(seen_api_request_ids)
                 if api_rows:
-                    append_api_rows_to_csv(api_rows, seen_vins)
-                    print(f"Captured {len(api_rows)} rows from iteration {iteration}")
+                    append_api_rows_to_csv(api_rows, seen_vins, csv_path)
             except Exception as e:
                 print(f"Warning: Error collecting API data: {e}")
+            
+            if not any_button_clicked:
+                print("\nNo more active 'load more' buttons found. Finishing...")
+                break
             
             loop_duration = time.time() - loop_start_time
             duration_msg = f"Iteration {iteration} took {loop_duration:.2f} seconds"
@@ -346,16 +311,16 @@ def car_data():
             logging.info(duration_msg)
             
             iteration += 1
-            print(f"Completed iteration {iteration-1}, continuing to next iteration...")
 
     except Exception as e:
-        print(f"\nUnexpected error: {e}")
+        print(f"\nAn unexpected error occurred: {e}")
+        logging.error(f"An unexpected error occurred: {e}")
     finally:
         try:
             driver.quit()
         except Exception:
             pass
-        print(f"\nData collection completed. Output saved to CAR_DATA_{date.today()}.csv")
+        print(f"\nData collection finished. Output saved to {csv_path}")
 
 if __name__ == "__main__":
     car_data()
