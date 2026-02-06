@@ -129,7 +129,7 @@ class NHTSAEnricher:
         
         # Extract ALL fields from the NHTSA API response
         # Prefix with 'nhtsa_' to distinguish from AutoTempest data
-        all_fields = [
+        """all_fields = [
             "ABS", "ActiveSafetySysNote", "AdaptiveCruiseControl", "AdaptiveDrivingBeam",
             "AdaptiveHeadlights", "AdditionalErrorText", "AirBagLocCurtain", "AirBagLocFront",
             "AirBagLocKnee", "AirBagLocSeatCushion", "AirBagLocSide", "AutoReverseSystem",
@@ -163,10 +163,30 @@ class NHTSAEnricher:
             "TransmissionStyle", "Trim", "Trim2", "Turbo", "VIN", "ValveTrainDesign",
             "VehicleDescriptor", "VehicleType", "WheelBaseLong", "WheelBaseShort", "WheelBaseType",
             "WheelSizeFront", "WheelSizeRear", "WheelieMitigation", "Wheels", "Windows"
-        ]
+        ]"""
+        
+        selected_fields = ["ABS", "ActiveSafetySysNote", "AdaptiveCruiseControl", "AdaptiveDrivingBeam",
+            "AdaptiveHeadlights", "AdditionalErrorText", "AirBagLocCurtain", "AirBagLocFront",
+            "AirBagLocKnee", "AirBagLocSeatCushion", "AirBagLocSide", "AutoReverseSystem",
+            "AutomaticPedestrianAlertingSound", "AxleConfiguration", "Axles", "BasePrice", "BedLengthIN", "BedType", "BlindSpotIntervention", "BlindSpotMon",
+            "BodyCabType", "BodyClass", "BrakeSystemDesc", "BrakeSystemType", "ChargerLevel",
+            "ChargerPowerKW", "CombinedBrakingSystem", "CoolingType", "CurbWeightLB","DaytimeRunningLight", "DestinationMarket", "DisplacementCC",
+            "DisplacementCI", "DisplacementL", "Doors", "DriveType", "DriverAssist",
+            "DynamicBrakeSupport", "EDR", "ESC", "EVDriveUnit", "ElectrificationLevel",
+            "EngineConfiguration", "EngineCycles", "EngineCylinders", "EngineHP", "EngineHP_to",
+            "EngineKW", "EngineManufacturer", "EngineModel", "EntertainmentSystem", "ForwardCollisionWarning", "FuelInjectionType", "FuelTankMaterial",
+            "FuelTankType", "FuelTypePrimary", "FuelTypeSecondary",
+            "KeylessIgnition", "LaneCenteringAssistance", "LaneDepartureWarning", "LaneKeepSystem",
+            "LowerBeamHeadlampLightSource", "Make", "MakeID", "Manufacturer", "ManufacturerId",
+            "Model", "ModelID", "ModelYear", "OtherEngineInfo", "ParkAssist", "PedestrianAutomaticEmergencyBraking",
+            "RearAutomaticEmergencyBraking", "RearCrossTrafficAlert", "RearVisibilitySystem",
+            "SAEAutomationLevel", "SAEAutomationLevel_to", "SeatRows", "Seats",
+            "SemiautomaticHeadlampBeamSwitching", "TPMS", "TopSpeedMPH", "TrackWidth", "TractionControl", "TransmissionSpeeds",
+            "TransmissionStyle", "Trim", "Trim2",
+            "WheelSizeFront", "WheelSizeRear", "Windows","VehicleType", "WheelBaseLong", "WheelBaseShort", "WheelBaseType",]
         
         # Extract all fields from the API result
-        for field in all_fields:
+        for field in selected_fields:
             value = result_item.get(field, "")
             # Prefix with 'nhtsa_' to avoid conflicts with AutoTempest data
             specs[f"nhtsa_{field}"] = value

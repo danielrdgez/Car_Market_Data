@@ -203,9 +203,8 @@ def extract_rows_from_api_data(api_data):
     fields_to_extract = [
         "date", "endDate", "archiveDate", "location", "locationCode", "countryCode",
         "pendingSale", "title", "trim", "currentBid", "bids", "distance", "priceHistory",
-        "priceRecentChange", "price", "listingHistory", "mileage", "make", "model",
-        "backendModel", "year", "vin", "sellerType", "vehicleTitle", "listingType",
-        "vehicleTitleDesc", "sourceName", "detailsShort", "detailsMid", "detailsLong", "detailsExtraLong"
+        "priceRecentChange", "price", "listingHistory", "mileage", "year", "vin", "sellerType", "vehicleTitle", "listingType",
+        "vehicleTitleDesc", "sourceName", "detailsShort", "detailsMid", "detailsLong", "detailsExtraLong", "img"
     ]
     
     for item in items:
@@ -225,27 +224,38 @@ def extract_rows_from_api_data(api_data):
         rows.append(row)
     return rows
 
-def append_api_rows_to_csv(rows, csv_path=None):
+def append_api_rows_to_csv(rows, seen_vins=None, csv_path=None):
     """Append API-extracted rows to CAR_DATA CSV"""
     if not rows:
         return 0
     if csv_path is None:
         csv_path = os.path.join(output_directory, f"CAR_DATA_{date.today()}.csv")
+    
+    # Filter out rows that have already been collected (based on VIN)
+    if seen_vins is not None:
+        rows = [r for r in rows if r.get("vin") not in seen_vins]
+        # Update the seen_vins set
+        for r in rows:
+            if r.get("vin"):
+                seen_vins.add(r.get("vin"))
+    
+    if not rows:
+        return 0
+
     df = pd.DataFrame(rows)
-    if os.path.exists(csv_path):
-        existing = pd.read_csv(csv_path)
-        combined = pd.concat([existing, df], ignore_index=True, sort=False)
-        # Deduplicate by vin (primary key for vehicles)
-        if "vin" in combined.columns and combined["vin"].notna().any():
-            combined = combined.drop_duplicates(subset=["vin"], keep="last")
-        combined.to_csv(csv_path, index=False)
-        added = len(combined) - len(existing)
-        print(f"Appended {added} rows, total now {len(combined)}")
-        return added
-    else:
-        df.to_csv(csv_path, index=False)
-        print(f"Wrote {len(df)} rows to CAR_DATA CSV")
+    
+    # Check if file exists to determine if we need to write the header
+    file_exists = os.path.exists(csv_path)
+    
+    # Append to CSV (mode='a') instead of reading/rewriting the whole file
+    try:
+        df.to_csv(csv_path, mode='a', header=not file_exists, index=False)
+        print(f"Appended {len(df)} new rows to CAR_DATA CSV")
         return len(df)
+    except Exception as e:
+        print(f"Error appending to CSV: {e}")
+        return 0
+
 # ====================================================================
 # HTML scraping removed - using API data only
 # ====================================================================
@@ -256,6 +266,19 @@ def car_data():
     iteration = 1
     unclickable_buttons = set()
     seen_api_request_ids = set()
+    
+    # Initialize seen_vins to track duplicates in memory rather than reading CSV every time
+    seen_vins = set()
+    csv_path = os.path.join(output_directory, f"CAR_DATA_{date.today()}.csv")
+    if os.path.exists(csv_path):
+        try:
+            print("Loading existing VINs to avoid duplicates...")
+            # Only read the VIN column to save memory/time
+            existing_data = pd.read_csv(csv_path, usecols=["vin"])
+            seen_vins = set(existing_data["vin"].dropna().astype(str).tolist())
+            print(f"Loaded {len(seen_vins)} existing VINs")
+        except Exception as e:
+            print(f"Error loading existing VINs: {e}")
     
     # Enable CDP commands for API response capture
     try:
@@ -311,7 +334,7 @@ def car_data():
             try:
                 api_rows = parse_performance_logs_for_queue_results(seen_api_request_ids)
                 if api_rows:
-                    append_api_rows_to_csv(api_rows)
+                    append_api_rows_to_csv(api_rows, seen_vins)
                     print(f"Captured {len(api_rows)} rows from iteration {iteration}")
             except Exception as e:
                 print(f"Warning: Error collecting API data: {e}")

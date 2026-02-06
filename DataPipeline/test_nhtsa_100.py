@@ -17,8 +17,8 @@ def test_enrichment_100_iterations():
     df = pd.read_csv(input_csv)
     print(f"Original dataset size: {len(df)} records")
     
-    # Limit to 100 records
-    df_test = df.head(100)
+    # Limit to 1000 records
+    df_test = df[:1000].copy()
     print(f"Test dataset size: {len(df_test)} records")
     
     # Save test data
