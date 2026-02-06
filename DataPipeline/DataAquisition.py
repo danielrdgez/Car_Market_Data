@@ -288,6 +288,7 @@ def car_data():
     
     try:
         while True:
+            loop_start_time = time.time()
             print(f"\nStarting iteration {iteration}")
             
             any_button_clicked = False
@@ -338,6 +339,11 @@ def car_data():
                     print(f"Captured {len(api_rows)} rows from iteration {iteration}")
             except Exception as e:
                 print(f"Warning: Error collecting API data: {e}")
+            
+            loop_duration = time.time() - loop_start_time
+            duration_msg = f"Iteration {iteration} took {loop_duration:.2f} seconds"
+            print(duration_msg)
+            logging.info(duration_msg)
             
             iteration += 1
             print(f"Completed iteration {iteration-1}, continuing to next iteration...")
