@@ -190,17 +190,23 @@ def extract_rows_from_api_data(api_data):
     items = api_data.get("items") or api_data.get("results") or []
     
     fields_to_extract = [
-        "date", "endDate", "archiveDate", "location", "locationCode", "countryCode",
+        "date", "location", "locationCode", "countryCode",
         "pendingSale", "title", "currentBid", "bids", "distance", "priceHistory",
         "priceRecentChange", "price", "listingHistory", "mileage", "year", "vin", "sellerType", "vehicleTitle", "listingType",
-        "vehicleTitleDesc", "sourceName", "detailsShort", "detailsMid", "detailsLong", "detailsExtraLong", "img"
+        "vehicleTitleDesc", "sourceName", "img", "externalID"
     ]
     
     for item in items:
         row = {
-            "timestamp": datetime.now(timezone.utc).isoformat(),
             "loaddate": date.today().isoformat()
         }
+        
+        # Concatenate details columns
+        details_short = item.get("detailsShort") or ""
+        details_mid = item.get("detailsMid") or ""
+        details_long = item.get("detailsLong") or ""
+        row["details"] = f"{details_short}{details_mid}{details_long}"
+
         for field in fields_to_extract:
             value = item.get(field)
             if isinstance(value, (list, dict)):
