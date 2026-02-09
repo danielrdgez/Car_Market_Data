@@ -14,6 +14,7 @@ import os
 import urllib3
 import sys
 import json
+from database import CarDatabase
 
 def setup_driver(headless=True):
     """Initializes a stealth-configured Chrome driver."""
@@ -193,7 +194,7 @@ def extract_rows_from_api_data(api_data):
         "date", "location", "locationCode", "countryCode",
         "pendingSale", "title", "currentBid", "bids", "distance", "priceHistory",
         "priceRecentChange", "price", "listingHistory", "mileage", "year", "vin", "sellerType", "vehicleTitle", "listingType",
-        "vehicleTitleDesc", "sourceName", "img", "externalID"
+        "vehicleTitleDesc", "sourceName", "img"
     ]
     
     for item in items:
@@ -216,29 +217,6 @@ def extract_rows_from_api_data(api_data):
         rows.append(row)
     return rows
 
-def append_api_rows_to_csv(rows, seen_vins, csv_path):
-    """Appends new rows to the CSV, avoiding duplicates."""
-    if not rows:
-        return 0
-    
-    new_rows = [r for r in rows if r.get("vin") and r.get("vin") not in seen_vins]
-    if not new_rows:
-        return 0
-        
-    for r in new_rows:
-        seen_vins.add(r.get("vin"))
-
-    df = pd.DataFrame(new_rows)
-    file_exists = os.path.exists(csv_path)
-    
-    try:
-        df.to_csv(csv_path, mode='a', header=not file_exists, index=False)
-        print(f"Appended {len(df)} new rows to CAR_DATA CSV")
-        return len(df)
-    except Exception as e:
-        print(f"Error appending to CSV: {e}")
-        return 0
-
 def car_data():
     """Main function to drive the data collection process."""
     max_retries = 3
@@ -246,16 +224,12 @@ def car_data():
     unclickable_buttons = set()
     seen_api_request_ids = set()
     
-    csv_path = os.path.join(output_directory, f"CAR_DATA_{date.today()}.csv")
-    seen_vins = set()
-    if os.path.exists(csv_path):
-        try:
-            print("Loading existing VINs to avoid duplicates...")
-            existing_data = pd.read_csv(csv_path, usecols=["vin"], on_bad_lines='skip')
-            seen_vins = set(existing_data["vin"].dropna().astype(str).tolist())
-            print(f"Loaded {len(seen_vins)} existing VINs")
-        except Exception as e:
-            print(f"Error loading existing VINs: {e}")
+    db_path = os.path.join(output_directory, "CAR_DATA.db")
+    db = CarDatabase(db_path)
+    
+    print("Loading existing VINs from database to avoid duplicates in current session...")
+    seen_vins = db.get_seen_vins()
+    print(f"Loaded {len(seen_vins)} existing VINs")
     
     try:
         driver.execute_cdp_cmd("Network.enable", {})
@@ -303,7 +277,11 @@ def car_data():
             try:
                 api_rows = parse_performance_logs_for_queue_results(seen_api_request_ids)
                 if api_rows:
-                    append_api_rows_to_csv(api_rows, seen_vins, csv_path)
+                    inserted = db.insert_rows(api_rows)
+                    for r in api_rows:
+                        if r.get("vin"):
+                            seen_vins.add(r.get("vin"))
+                    print(f"Processed {len(api_rows)} rows, inserted/updated {inserted} in SQLite database")
             except Exception as e:
                 print(f"Warning: Error collecting API data: {e}")
             
@@ -326,7 +304,7 @@ def car_data():
             driver.quit()
         except Exception:
             pass
-        print(f"\nData collection finished. Output saved to {csv_path}")
+        print(f"\nData collection finished. Output saved to {db_path}")
 
 if __name__ == "__main__":
     car_data()

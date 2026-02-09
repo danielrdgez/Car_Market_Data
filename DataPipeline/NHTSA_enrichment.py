@@ -4,33 +4,54 @@ import pandas as pd
 import logging
 import time
 import os
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date
 from typing import List, Dict, Optional
 from urllib.parse import urljoin
+from database import CarDatabase
 
 class NHTSAEnricher:
     """Enrich car data with NHTSA vPIC API specifications using VIN"""
     
     BASE_URL = "https://vpic.nhtsa.dot.gov/api/vehicles/"
     DECODE_ENDPOINT = "DecodeVinValuesExtended/"
+    BATCH_DECODE_ENDPOINT = "DecodeVinValuesBatch/"
     RATINGS_BASE_URL = "https://api.nhtsa.gov/SafetyRatings/"
     RECALLS_BASE_URL = "https://api.nhtsa.gov/recalls/"
     COMPLAINTS_BASE_URL = "https://api.nhtsa.gov/complaints/"
     MAX_BATCH_SIZE = 50  # NHTSA recommends max 50 VINs per request
     
-    def __init__(self, rate_limit_delay: float = 0.5, output_dir: Optional[str] = None):
+    def __init__(self, rate_limit_delay: float = 0.5, output_dir: Optional[str] = None, db_path: Optional[str] = None, max_workers: int = 5):
         """
         Initialize NHTSA Enricher
         
         Args:
-            rate_limit_delay: Delay in seconds between API requests
+            rate_limit_delay: Delay in seconds between API requests (per thread)
             output_dir: Directory to save enriched data and logs
+            db_path: Path to CAR_DATA.db
+            max_workers: Number of parallel worker threads
         """
         self.rate_limit_delay = rate_limit_delay
         self.last_request_time = 0
+        self.max_workers = max_workers
         self.output_dir = output_dir or os.path.join(
             os.path.dirname(os.path.dirname(__file__)), "CAR_DATA_OUTPUT"
         )
+        
+        # Database path
+        if db_path is None:
+            self.db_path = os.path.join(self.output_dir, "CAR_DATA.db")
+        else:
+            self.db_path = db_path
+            
+        self.db = CarDatabase(self.db_path)
+        
+        # Caches for MMY data
+        self.cache_safety = {}
+        self.cache_recalls = {}
+        self.cache_complaints = {}
+        self.cache_lock = threading.Lock()
         
         # Create output directory if it doesn't exist
         os.makedirs(self.output_dir, exist_ok=True)
@@ -49,11 +70,12 @@ class NHTSAEnricher:
         )
     
     def _apply_rate_limit(self) -> None:
-        """Enforce rate limiting between API requests"""
-        elapsed = time.time() - self.last_request_time
-        if elapsed < self.rate_limit_delay:
-            time.sleep(self.rate_limit_delay - elapsed)
-        self.last_request_time = time.time()
+        """Enforce rate limiting between API requests in a thread-safe manner"""
+        with self.cache_lock:
+            elapsed = time.time() - self.last_request_time
+            if elapsed < self.rate_limit_delay:
+                time.sleep(self.rate_limit_delay - elapsed)
+            self.last_request_time = time.time()
     
     def _is_valid_vin(self, vin: str) -> bool:
         """Check if VIN is valid (not null, empty, or placeholder)"""
@@ -107,6 +129,47 @@ class NHTSAEnricher:
             return None
         except Exception as e:
             logging.error(f"Unexpected error decoding VIN {vin}: {e}")
+            return None
+
+    def decode_vins_batch(self, vins: List[str]) -> Optional[Dict]:
+        """
+        Query NHTSA API to decode multiple VINs in a single batch request
+        
+        Args:
+            vins: List of Vehicle Identification Numbers
+            
+        Returns:
+            Dictionary with API response data or None if request fails
+        """
+        self._apply_rate_limit()
+        
+        valid_vins = [str(v).strip() for v in vins if self._is_valid_vin(v)]
+        if not valid_vins:
+            return None
+            
+        try:
+            url = f"{self.BASE_URL}{self.BATCH_DECODE_ENDPOINT}"
+            # Format: DATA=vin1;vin2;...&format=json
+            payload = {
+                "DATA": ";".join(valid_vins),
+                "format": "json"
+            }
+            
+            logging.info(f"Querying NHTSA API Batch for {len(valid_vins)} VINs")
+            
+            response = requests.post(url, data=payload, timeout=60)
+            response.raise_for_status()
+            
+            data = response.json()
+            
+            if data.get("Results"):
+                return data
+            else:
+                logging.warning(f"No results returned for VIN batch")
+                return None
+                
+        except Exception as e:
+            logging.error(f"Error decoding VIN batch: {e}")
             return None
     
     def extract_specs_from_results(self, results: List[Dict]) -> Dict:
@@ -404,6 +467,103 @@ class NHTSAEnricher:
         
         return complaints
     
+    def enrich_database(self) -> int:
+        """
+        Enrich data in CAR_DATA.db with NHTSA specs using batching and parallel processing
+        
+        Returns:
+            Number of records enriched
+        """
+        # Get VINs that need enrichment
+        vins_to_process = self.db.get_vins_for_enrichment()
+        logging.info(f"Found {len(vins_to_process)} VINs needing enrichment in database")
+        
+        if not vins_to_process:
+            print("No new VINs to process in database.")
+            return 0
+            
+        print(f"Querying NHTSA API for {len(vins_to_process)} VINs using {self.max_workers} threads...")
+        
+        # Split into batches of 50
+        batches = [vins_to_process[i:i + self.MAX_BATCH_SIZE] for i in range(0, len(vins_to_process), self.MAX_BATCH_SIZE)]
+        
+        total_enriched = 0
+        processed_count = 0
+        
+        def process_batch(batch_vins):
+            nonlocal processed_count, total_enriched
+            
+            batch_specs = {}
+            api_response = self.decode_vins_batch(batch_vins)
+            
+            if api_response and api_response.get("Results"):
+                for result in api_response["Results"]:
+                    vin = result.get("VIN")
+                    if not vin:
+                        continue
+                        
+                    specs = self.extract_specs_from_results(result)
+                    
+                    make = result.get("Make", "")
+                    manufacturer = result.get("Manufacturer", "")
+                    model = result.get("Model", "")
+                    model_year = result.get("ModelYear", "")
+                    
+                    if make and model and model_year:
+                        mmy_key = f"{model_year}|{make}|{model}"
+                        
+                        # Use thread-safe caching for MMY-based data
+                        with self.cache_lock:
+                            cached_safety = self.cache_safety.get(mmy_key)
+                            cached_recalls = self.cache_recalls.get(mmy_key)
+                            cached_complaints = self.cache_complaints.get(mmy_key)
+                        
+                        # Get Safety Ratings
+                        if cached_safety is None:
+                            ratings_response = self.get_safety_ratings(model_year, make, model)
+                            cached_safety = self.extract_ratings_data(ratings_response["Results"]) if ratings_response and ratings_response.get("Results") else {}
+                            with self.cache_lock:
+                                self.cache_safety[mmy_key] = cached_safety
+                        specs.update(cached_safety)
+                        
+                        # Get Recalls
+                        if cached_recalls is None:
+                            recalls_response = self.get_recalls(make, model, model_year)
+                            cached_recalls = self.extract_recalls_data(recalls_response.get("results", [])) if recalls_response else {}
+                            with self.cache_lock:
+                                self.cache_recalls[mmy_key] = cached_recalls
+                        specs.update(cached_recalls)
+                        
+                        # Get Complaints
+                        if cached_complaints is None:
+                            complaints_response = self.get_complaints(make, model, model_year)
+                            cached_complaints = self.extract_complaints_data(complaints_response.get("results", [])) if complaints_response else {}
+                            with self.cache_lock:
+                                self.cache_complaints[mmy_key] = cached_complaints
+                        specs.update(cached_complaints)
+                    
+                    # Add to batch dictionary
+                    batch_specs[vin] = specs
+                
+                # Store batch in database
+                if batch_specs:
+                    self.db.insert_nhtsa_enrichment_batch(batch_specs)
+                    with self.cache_lock:
+                        total_enriched += len(batch_specs)
+            
+            with self.cache_lock:
+                processed_count += len(batch_vins)
+                if processed_count % 100 == 0 or processed_count >= len(vins_to_process):
+                    print(f"[{processed_count}/{len(vins_to_process)}] Processed VINs... Enriched: {total_enriched}")
+            
+            return len(batch_specs)
+
+        # Use ThreadPoolExecutor for parallel batch processing
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            executor.map(process_batch, batches)
+                
+        return total_enriched
+
     def enrich_data_from_csv(self, input_csv: str, output_csv: Optional[str] = None) -> pd.DataFrame:
         """
         Read AutoTempest data, enrich with NHTSA specs, and merge on VIN
@@ -522,33 +682,23 @@ class NHTSAEnricher:
             logging.error(f"Error finding latest CAR_DATA file: {e}")
             raise
     
-    def run(self, input_csv: Optional[str] = None, output_csv: Optional[str] = None) -> pd.DataFrame:
+    def run(self) -> int:
         """
-        Main method to run the enrichment pipeline
+        Main method to run the enrichment pipeline using the database
         
-        Args:
-            input_csv: Path to input CSV (auto-detects if not provided)
-            output_csv: Path to save enriched data (optional)
-            
         Returns:
-            Enriched DataFrame
+            Number of records enriched
         """
-        if input_csv is None:
-            input_csv = self.get_latest_car_data_file()
-            print(f"Auto-detected input file: {input_csv}")
-        
-        logging.info("Starting NHTSA enrichment pipeline")
+        logging.info("Starting NHTSA database enrichment pipeline")
         print("\n" + "="*60)
-        print("NHTSA Data Enrichment Pipeline")
+        print("NHTSA Database Data Enrichment Pipeline")
         print("="*60)
         
         try:
-            df_enriched = self.enrich_data_from_csv(input_csv, output_csv)
-            logging.info("NHTSA enrichment pipeline completed successfully")
-            print("\n✓ Enrichment pipeline completed successfully!")
-            
-            return df_enriched
-        
+            count = self.enrich_database()
+            logging.info(f"NHTSA enrichment pipeline completed successfully. Enriched {count} records.")
+            print(f"\n✓ Enrichment pipeline completed! Enriched {count} new records.")
+            return count
         except Exception as e:
             logging.error(f"Pipeline failed: {e}")
             print(f"\n✗ Pipeline failed: {e}")
@@ -557,16 +707,13 @@ class NHTSAEnricher:
 
 def main():
     """Main function to run the NHTSA enrichment pipeline"""
-    enricher = NHTSAEnricher(rate_limit_delay=0.5)
+    # Use higher parallelism and batching to speed up
+    enricher = NHTSAEnricher(rate_limit_delay=0.2, max_workers=10)
     
     try:
-        # Run enrichment (auto-detects latest CAR_DATA file)
-        df_enriched = enricher.run()
-        
-        print(f"\nEnriched dataset shape: {df_enriched.shape}")
-        print(f"Columns: {list(df_enriched.columns)}")
-        print("\nFirst few rows:")
-        print(df_enriched.head())
+        # Run enrichment (uses database)
+        count = enricher.run()
+        print(f"Total new records enriched: {count}")
         
     except Exception as e:
         print(f"Error in enrichment pipeline: {e}")
