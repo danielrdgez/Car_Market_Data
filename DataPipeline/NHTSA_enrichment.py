@@ -8,7 +8,6 @@ import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date
 from typing import List, Dict, Optional
-from urllib.parse import urljoin
 from database import CarDatabase
 
 class NHTSAEnricher:
@@ -189,44 +188,6 @@ class NHTSAEnricher:
             result_item = results[0]
         else:
             result_item = results
-        
-        # Extract ALL fields from the NHTSA API response
-        # Prefix with 'nhtsa_' to distinguish from AutoTempest data
-        """all_fields = [
-            "ABS", "ActiveSafetySysNote", "AdaptiveCruiseControl", "AdaptiveDrivingBeam",
-            "AdaptiveHeadlights", "AdditionalErrorText", "AirBagLocCurtain", "AirBagLocFront",
-            "AirBagLocKnee", "AirBagLocSeatCushion", "AirBagLocSide", "AutoReverseSystem",
-            "AutomaticPedestrianAlertingSound", "AxleConfiguration", "Axles", "BasePrice",
-            "BatteryA", "BatteryA_to", "BatteryCells", "BatteryInfo", "BatteryKWh",
-            "BatteryKWh_to", "BatteryModules", "BatteryPacks", "BatteryType", "BatteryV",
-            "BatteryV_to", "BedLengthIN", "BedType", "BlindSpotIntervention", "BlindSpotMon",
-            "BodyCabType", "BodyClass", "BrakeSystemDesc", "BrakeSystemType", "BusFloorConfigType",
-            "BusLength", "BusType", "CAN_AACN", "CIB", "CashForClunkers", "ChargerLevel",
-            "ChargerPowerKW", "CombinedBrakingSystem", "CoolingType", "CurbWeightLB",
-            "CustomMotorcycleType", "DaytimeRunningLight", "DestinationMarket", "DisplacementCC",
-            "DisplacementCI", "DisplacementL", "Doors", "DriveType", "DriverAssist",
-            "DynamicBrakeSupport", "EDR", "ESC", "EVDriveUnit", "ElectrificationLevel",
-            "EngineConfiguration", "EngineCycles", "EngineCylinders", "EngineHP", "EngineHP_to",
-            "EngineKW", "EngineManufacturer", "EngineModel", "EntertainmentSystem", "ErrorCode",
-            "ErrorText", "ForwardCollisionWarning", "FuelInjectionType", "FuelTankMaterial",
-            "FuelTankType", "FuelTypePrimary", "FuelTypeSecondary", "GCWR", "GCWR_to",
-            "KeylessIgnition", "LaneCenteringAssistance", "LaneDepartureWarning", "LaneKeepSystem",
-            "LowerBeamHeadlampLightSource", "Make", "MakeID", "Manufacturer", "ManufacturerId",
-            "Model", "ModelID", "ModelYear", "MotorcycleChassisType", "MotorcycleSuspensionType",
-            "NCSABodyType", "NCSAMake", "NCSAMapExcApprovedBy", "NCSAMapExcApprovedOn",
-            "NCSAMappingException", "NCSAModel", "NCSANote", "NonLandUse", "Note",
-            "OtherBusInfo", "OtherEngineInfo", "OtherMotorcycleInfo", "OtherRestraintSystemInfo",
-            "OtherTrailerInfo", "ParkAssist", "PedestrianAutomaticEmergencyBraking", "PlantCity",
-            "PlantCompanyName", "PlantCountry", "PlantState", "PossibleValues", "Pretensioner",
-            "RearAutomaticEmergencyBraking", "RearCrossTrafficAlert", "RearVisibilitySystem",
-            "SAEAutomationLevel", "SAEAutomationLevel_to", "SeatBeltsAll", "SeatRows", "Seats",
-            "SemiautomaticHeadlampBeamSwitching", "Series", "Series2", "SteeringLocation",
-            "SuggestedVIN", "TPMS", "TopSpeedMPH", "TrackWidth", "TractionControl",
-            "TrailerBodyType", "TrailerLength", "TrailerType", "TransmissionSpeeds",
-            "TransmissionStyle", "Trim", "Trim2", "Turbo", "VIN", "ValveTrainDesign",
-            "VehicleDescriptor", "VehicleType", "WheelBaseLong", "WheelBaseShort", "WheelBaseType",
-            "WheelSizeFront", "WheelSizeRear", "WheelieMitigation", "Wheels", "Windows"
-        ]"""
         
         selected_fields = ["ABS", "ActiveSafetySysNote", "AdaptiveCruiseControl", "AdaptiveDrivingBeam",
             "AdaptiveHeadlights", "AdditionalErrorText", "AirBagLocCurtain", "AirBagLocFront",
@@ -493,63 +454,71 @@ class NHTSAEnricher:
         def process_batch(batch_vins):
             nonlocal processed_count, total_enriched
             
-            batch_specs = {}
-            api_response = self.decode_vins_batch(batch_vins)
+            # Create a new database connection for this thread
+            thread_db = CarDatabase(self.db_path)
             
-            if api_response and api_response.get("Results"):
-                for result in api_response["Results"]:
-                    vin = result.get("VIN")
-                    if not vin:
-                        continue
-                        
-                    specs = self.extract_specs_from_results(result)
-                    
-                    make = result.get("Make", "")
-                    manufacturer = result.get("Manufacturer", "")
-                    model = result.get("Model", "")
-                    model_year = result.get("ModelYear", "")
-                    
-                    if make and model and model_year:
-                        mmy_key = f"{model_year}|{make}|{model}"
-                        
-                        # Use thread-safe caching for MMY-based data
-                        with self.cache_lock:
-                            cached_safety = self.cache_safety.get(mmy_key)
-                            cached_recalls = self.cache_recalls.get(mmy_key)
-                            cached_complaints = self.cache_complaints.get(mmy_key)
-                        
-                        # Get Safety Ratings
-                        if cached_safety is None:
-                            ratings_response = self.get_safety_ratings(model_year, make, model)
-                            cached_safety = self.extract_ratings_data(ratings_response["Results"]) if ratings_response and ratings_response.get("Results") else {}
-                            with self.cache_lock:
-                                self.cache_safety[mmy_key] = cached_safety
-                        specs.update(cached_safety)
-                        
-                        # Get Recalls
-                        if cached_recalls is None:
-                            recalls_response = self.get_recalls(make, model, model_year)
-                            cached_recalls = self.extract_recalls_data(recalls_response.get("results", [])) if recalls_response else {}
-                            with self.cache_lock:
-                                self.cache_recalls[mmy_key] = cached_recalls
-                        specs.update(cached_recalls)
-                        
-                        # Get Complaints
-                        if cached_complaints is None:
-                            complaints_response = self.get_complaints(make, model, model_year)
-                            cached_complaints = self.extract_complaints_data(complaints_response.get("results", [])) if complaints_response else {}
-                            with self.cache_lock:
-                                self.cache_complaints[mmy_key] = cached_complaints
-                        specs.update(cached_complaints)
-                    
-                    # Add to batch dictionary
-                    batch_specs[vin] = specs
+            batch_specs = {}
+            try:
+                api_response = self.decode_vins_batch(batch_vins)
                 
-                # Store batch in database
-                if batch_specs:
-                    self.db.insert_nhtsa_enrichment_batch(batch_specs)
-                    with self.cache_lock:
-                        total_enriched += len(batch_specs)
+                if api_response and api_response.get("Results"):
+                    for result in api_response["Results"]:
+                        vin = result.get("VIN")
+                        if not vin:
+                            continue
+                            
+                        specs = self.extract_specs_from_results(result)
+                        
+                        make = result.get("Make", "")
+                        manufacturer = result.get("Manufacturer", "")
+                        model = result.get("Model", "")
+                        model_year = result.get("ModelYear", "")
+                        
+                        if make and model and model_year:
+                            mmy_key = f"{model_year}|{make}|{model}"
+                            
+                            # Use thread-safe caching for MMY-based data
+                            with self.cache_lock:
+                                cached_safety = self.cache_safety.get(mmy_key)
+                                cached_recalls = self.cache_recalls.get(mmy_key)
+                                cached_complaints = self.cache_complaints.get(mmy_key)
+                            
+                            # Get Safety Ratings
+                            if cached_safety is None:
+                                ratings_response = self.get_safety_ratings(model_year, make, model)
+                                cached_safety = self.extract_ratings_data(ratings_response["Results"]) if ratings_response and ratings_response.get("Results") else {}
+                                with self.cache_lock:
+                                    self.cache_safety[mmy_key] = cached_safety
+                            specs.update(cached_safety)
+                            
+                            # Get Recalls
+                            if cached_recalls is None:
+                                recalls_response = self.get_recalls(make, model, model_year)
+                                cached_recalls = self.extract_recalls_data(recalls_response.get("results", [])) if recalls_response else {}
+                                with self.cache_lock:
+                                    self.cache_recalls[mmy_key] = cached_recalls
+                            specs.update(cached_recalls)
+                            
+                            # Get Complaints
+                            if cached_complaints is None:
+                                complaints_response = self.get_complaints(make, model, model_year)
+                                cached_complaints = self.extract_complaints_data(complaints_response.get("results", [])) if complaints_response else {}
+                                with self.cache_lock:
+                                    self.cache_complaints[mmy_key] = cached_complaints
+                            specs.update(cached_complaints)
+                        
+                        # Add to batch dictionary
+                        batch_specs[vin] = specs
+                    
+                    # Store batch in database
+                    if batch_specs:
+                        thread_db.insert_nhtsa_enrichment_batch(batch_specs)
+                        with self.cache_lock:
+                            total_enriched += len(batch_specs)
+            except Exception as e:
+                logging.error(f"Error processing batch: {e}")
+            finally:
+                thread_db.close()
             
             with self.cache_lock:
                 processed_count += len(batch_vins)
@@ -560,7 +529,12 @@ class NHTSAEnricher:
 
         # Use ThreadPoolExecutor for parallel batch processing
         with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-            executor.map(process_batch, batches)
+            futures = [executor.submit(process_batch, batch) for batch in batches]
+            for future in as_completed(futures):
+                try:
+                    future.result()
+                except Exception as e:
+                    logging.error(f"Batch execution failed: {e}")
                 
         return total_enriched
 

@@ -1,16 +1,18 @@
 import sqlite3
 import json
 import logging
-import os
 from datetime import date
 
 class CarDatabase:
     def __init__(self, db_path):
         self.db_path = db_path
+        self.conn = None
         self._init_db()
 
     def _get_connection(self):
-        return sqlite3.connect(self.db_path, timeout=30)
+        if self.conn is None:
+            self.conn = sqlite3.connect(self.db_path, timeout=30)
+        return self.conn
 
     def _init_db(self):
         with self._get_connection() as conn:
@@ -311,3 +313,13 @@ class CarDatabase:
                     logging.error(f"Failed to insert NHTSA enrichment for VIN {vin}: {e}")
             
             conn.commit()
+
+    def close(self):
+        """Close the database connection"""
+        if hasattr(self, 'conn') and self.conn:
+            try:
+                self.conn.close()
+                logging.info("Database connection closed")
+            except Exception as e:
+                logging.error(f"Error closing database connection: {e}")
+
