@@ -1,22 +1,26 @@
 """
-Optimized Car Data Acquisition Module
-======================================
-High-performance web scraper for AutoTempest using Selenium with stealth mode
-and API interception via Chrome DevTools Protocol.
+Parallel Multi-Make Car Data Acquisition Module
+================================================
+High-performance web scraper for AutoTempest using multi-tab strategy with
+per-make isolation, worker pool architecture, and centralized data aggregation.
 
-Critical Performance Fixes:
-- Performance log cleanup (prevents 3x slowdown after 100+ iterations)
-- Batch database operations (10x faster inserts)
+Key Features:
+- Parallel scraping of multiple makes (Toyota, Nissan, Ford, etc.)
+- Worker pool with configurable concurrency
+- Per-make lifecycle management with independent state
+- Aggressive memory management and CDP cleanup
+- Centralized SQLite aggregation with deduplication
 """
 
 import logging
 import time
 import random
-import sys
 import os
 import json
+import psutil
 from typing import Dict, Set, Optional, List
 from datetime import date
+from dataclasses import dataclass, field
 
 from selenium import webdriver
 from selenium.webdriver.common.by import By
@@ -34,33 +38,51 @@ from database import CarDatabase
 # CONFIGURATION
 # ============================================================================
 
-class Config:
-    """Centralized configuration for the scraper"""
-    # Search parameters
-    INPUT_ZIP = "33186"
-    INPUT_RADIUS = "50"
-    INPUT_YEAR = 2000
-    INPUT_STATE = "country"
+@dataclass
+class ParallelConfig:
+    """Configuration for parallel scraping operations"""
+    # Makes to scrape in parallel
+    MAKES: List[str] = field(default_factory=lambda: [
+        "toyota", "nissan", "ford", "chevrolet", "cadillac",
+        "honda", "volvo", "maserati", "porsche", "acura", "lexus", "tesla",
+        "kia", "bmw", "mercedes", "hyundai", "infiniti", "dodge", "lotus",
+        "suzuki", "mazda", "fiat", "lincoln", "subaru", "gmc",
+        "genesis", "jeep", "volkswagen", "landrover"
+    ])
 
-    # Performance tuning
-    DRIVER_RESTART_INTERVAL = 0   # Disabled to avoid state loss; set >0 to enable
-    LOG_CLEANUP_INTERVAL = 1      # Clear performance logs every N iterations
-    MAX_RETRIES = 3               # Retry failed operations
+    # Search parameters (shared across all makes)
+    INPUT_ZIP: str = "33186"
+    INPUT_STATE: str = "country"
+
+    # Worker pool configuration
+    MAX_WORKERS: int = 4              # Number of parallel browser instances
+    WORKER_STARTUP_STAGGER: float = 3.0  # Seconds between worker starts
+    WORKER_TIMEOUT: float = 14400     # 4 hours per worker
+
+    # Driver lifecycle
+    DRIVER_RESTART_INTERVAL: int = 0   # Set >0 to restart after N clicks
+    MEMORY_LIMIT_PER_WORKER: float = 3.5  # GB per worker process
+    LOG_CLEANUP_INTERVAL: int = 1     # Clear logs every N iterations
+    MAX_RETRIES: int = 3              # Retry failed operations
 
     # Timing (randomized for stealth)
-    MIN_WAIT_AFTER_CLICK = 0.6
-    MAX_WAIT_AFTER_CLICK = 1.2
-    MIN_WAIT_FOR_SCROLL = 0.8
-    MAX_WAIT_FOR_SCROLL = 1.5
-    MIN_WAIT_BETWEEN_ITERATIONS = 2.1
-    MAX_WAIT_BETWEEN_ITERATIONS = 4.5
+    MIN_WAIT_AFTER_CLICK: float = 0.6
+    MAX_WAIT_AFTER_CLICK: float = 1.2
+    MIN_WAIT_FOR_SCROLL: float = 0.8
+    MAX_WAIT_FOR_SCROLL: float = 1.5
+    MIN_WAIT_BETWEEN_ITERATIONS: float = 2.1
+    MAX_WAIT_BETWEEN_ITERATIONS: float = 4.5
 
     # Browser settings
-    HEADLESS = True
-    PAGE_LOAD_TIMEOUT = 60
+    HEADLESS: bool = True
+    PAGE_LOAD_TIMEOUT: int = 60
+
+    # Button exhaustion logic
+    EXHAUSTION_STRIKE_COUNT: int = 3  # Mark button exhausted after N zero-row clicks
+    MAX_CLICKS_PER_MAKE: int = 1000   # Safety cap on clicks per make
 
     # Button XPaths
-    CONTINUE_BUTTONS_XPATH = {
+    CONTINUE_BUTTONS_XPATH: Dict[str, str] = field(default_factory=lambda: {
         "autotempest": '//*[@id="te-results"]/section/button',
         "hemmings": '//*[@id="hem-results"]/section/button',
         "cars": '//*[@id="cm-results"]/section/button',
@@ -70,117 +92,137 @@ class Config:
         "autotrader": '//*[@id="at-results"]/section/button',
         "ebay": '//*[@id="eb-results"]/section/button',
         "other": '//*[@id="ot-results"]/section/button'
-    }
+    })
 
-    @classmethod
-    def get_base_url(cls) -> str:
-        """Generate the AutoTempest search URL"""
-        return f'https://www.autotempest.com/results?localization={cls.INPUT_STATE}&zip={cls.INPUT_ZIP}'
+    def get_base_url(self, make: Optional[str] = None) -> str:
+        """Generate the AutoTempest search URL for a specific make"""
+        base = f'https://www.autotempest.com/results?localization={self.INPUT_STATE}&zip={self.INPUT_ZIP}'
+        if make:
+            base += f'&make={make}'
+        return base
 
 
-class PerformanceMonitor:
-    """Monitors and logs performance metrics"""
+@dataclass
+class MakeScrapingMetrics:
+    """Metrics for a single make's scraping session"""
+    make: str
+    start_time: float = field(default_factory=time.time)
+    end_time: Optional[float] = None
+    total_clicks: int = 0
+    total_rows_processed: int = 0
+    total_rows_inserted: int = 0
+    iterations: int = 0
+    button_states: Dict[str, str] = field(default_factory=dict)  # button_name -> state
 
-    def __init__(self):
-        self.iteration_times: List[float] = []
+    def elapsed_time(self) -> float:
+        """Get elapsed time in seconds"""
+        end = self.end_time or time.time()
+        return end - self.start_time
+
+    def finalize(self):
+        """Mark scraping as complete"""
+        self.end_time = time.time()
+
+    def log_summary(self) -> str:
+        """Generate summary log for this make"""
+        lines = [
+            f"\n{'='*60}",
+            f"MAKE: {self.make.upper()}",
+            f"{'='*60}",
+            f"Total iterations: {self.iterations}",
+            f"Total clicks: {self.total_clicks}",
+            f"Total rows processed: {self.total_rows_processed}",
+            f"Total rows inserted: {self.total_rows_inserted}",
+            f"Elapsed time: {self.elapsed_time():.2f}s ({self.elapsed_time()/60:.2f}m)",
+            f"{'='*60}"
+        ]
+        return "\n".join(lines)
+
+
+# ============================================================================
+# PERFORMANCE & MONITORING
+# ============================================================================
+
+class WorkerMonitor:
+    """Monitor worker resource usage and performance"""
+
+    def __init__(self, worker_id: int, memory_limit_gb: float = 3.5):
+        self.worker_id = worker_id
+        self.memory_limit_gb = memory_limit_gb
+        self.process = psutil.Process()
         self.start_time = time.time()
 
-    def log_iteration(self, iteration: int, duration: float, rows_processed: int):
-        """Log iteration performance and detect degradation"""
-        self.iteration_times.append(duration)
-        avg_time = sum(self.iteration_times[-10:]) / min(len(self.iteration_times), 10)
+    def get_memory_usage_mb(self) -> float:
+        """Get current process memory usage in MB"""
+        try:
+            return self.process.memory_info().rss / (1024 * 1024)
+        except:
+            return 0.0
 
+    def get_memory_usage_gb(self) -> float:
+        """Get current process memory usage in GB"""
+        return self.get_memory_usage_mb() / 1024
+
+    def should_restart_driver(self) -> bool:
+        """Check if memory threshold exceeded"""
+        usage_gb = self.get_memory_usage_gb()
+        return usage_gb > self.memory_limit_gb
+
+    def log_status(self, iteration: int, make: str):
+        """Log current worker status"""
+        usage_mb = self.get_memory_usage_mb()
+        usage_pct = (usage_mb / (self.memory_limit_gb * 1024)) * 100
         logging.info(
-            f"Iteration {iteration}: {duration:.2f}s | "
-            f"Rows: {rows_processed} | "
-            f"Avg (last 10): {avg_time:.2f}s"
+            f"[Worker {self.worker_id}] {make} iteration {iteration}: "
+            f"Memory {usage_mb:.1f}MB ({usage_pct:.1f}% limit)"
         )
 
-        # Warning if performance degrades
-        if duration > 45 and len(self.iteration_times) > 10:
-            logging.warning(
-                f"⚠️ Performance degradation detected! Current: {duration:.2f}s, "
-                f"Avg: {avg_time:.2f}s"
-            )
-            print(f"⚠️ WARNING: Iteration took {duration:.2f}s (avg: {avg_time:.2f}s)")
-
-    def get_total_runtime(self) -> float:
-        """Get total runtime in seconds"""
-        return time.time() - self.start_time
-
-    def print_summary(self):
-        """Print performance summary"""
-        if not self.iteration_times:
-            return
-
-        total_time = self.get_total_runtime()
-        avg_time = sum(self.iteration_times) / len(self.iteration_times)
-        min_time = min(self.iteration_times)
-        max_time = max(self.iteration_times)
-
-        print("\n" + "="*60)
-        print("PERFORMANCE SUMMARY")
-        print("="*60)
-        print(f"Total iterations: {len(self.iteration_times)}")
-        print(f"Total runtime: {total_time/60:.2f} minutes")
-        print(f"Average iteration time: {avg_time:.2f}s")
-        print(f"Fastest iteration: {min_time:.2f}s")
-        print(f"Slowest iteration: {max_time:.2f}s")
-        print("="*60 + "\n")
-
 
 # ============================================================================
-# MAIN SCRAPER CLASS
+# SINGLE MAKE SCRAPER
 # ============================================================================
 
-class CarScraper:
-    """Main scraper class for AutoTempest data acquisition"""
+class MakeScraper:
+    """Scraper for a single vehicle make"""
 
-    def __init__(self, config: Config = None):
-        """Initialize the scraper with configuration"""
-        self.config = config or Config()
+    def __init__(self, make: str, worker_id: int, config: ParallelConfig,
+                 db_path: str, output_directory: str):
+        """Initialize scraper for a specific make"""
+        self.make = make
+        self.worker_id = worker_id
+        self.config = config
+        self.db_path = db_path
+        self.output_directory = output_directory
+
         self.driver: Optional[webdriver.Chrome] = None
         self.db: Optional[CarDatabase] = None
         self.seen_vins: Set[str] = set()
         self.seen_api_request_ids: Set[str] = set()
         self.unclickable_buttons: Set[str] = set()
-        self.performance_monitor = PerformanceMonitor()
+        self.button_strike_counts: Dict[str, int] = {}
 
-        # Setup output directory
-        self.output_directory = os.path.join(
-            os.path.dirname(os.path.dirname(__file__)),
-            "CAR_DATA_OUTPUT"
-        )
-        os.makedirs(self.output_directory, exist_ok=True)
+        self.metrics = MakeScrapingMetrics(make=make)
+        self.monitor = WorkerMonitor(worker_id, config.MEMORY_LIMIT_PER_WORKER)
 
-        # Setup logging
         self._setup_logging()
 
-        # Initialize database
-        db_path = os.path.join(self.output_directory, "CAR_DATA.db")
-        self.db = CarDatabase(db_path)
-
-        logging.info("CarScraper initialized successfully")
-
     def _setup_logging(self):
-        """Configure logging for the scraper"""
-        log_path = os.path.join(self.output_directory, f'scraping_{date.today()}.log')
-
-        # Clear any existing handlers
-        for handler in logging.root.handlers[:]:
-            logging.root.removeHandler(handler)
-
-        logging.basicConfig(
-            filename=log_path,
-            level=logging.INFO,
-            format='%(asctime)s - %(levelname)s - %(message)s',
-            force=True
+        """Configure per-make logging"""
+        log_path = os.path.join(
+            self.output_directory,
+            f'scraping_{self.make}_{date.today()}.log'
         )
 
-        # Also log to console
-        console = logging.StreamHandler()
-        console.setLevel(logging.INFO)
-        logging.getLogger('').addHandler(console)
+        # Create file handler for this make
+        handler = logging.FileHandler(log_path)
+        handler.setLevel(logging.INFO)
+        formatter = logging.Formatter(
+            f'%(asctime)s - [W{self.worker_id}] {self.make.upper()} - %(levelname)s - %(message)s'
+        )
+        handler.setFormatter(formatter)
+        logging.getLogger('').addHandler(handler)
+
+        logging.info(f"[W{self.worker_id}] Initialized logger for make={self.make}")
 
     def setup_driver(self) -> webdriver.Chrome:
         """Initialize a stealth-configured Chrome driver"""
@@ -207,7 +249,7 @@ class CarScraper:
 
         driver = webdriver.Chrome(options=options)
 
-        # Apply Stealth Library configurations
+        # Apply Stealth Library
         stealth(driver,
             languages=["en-US", "en"],
             vendor="Google Inc.",
@@ -219,57 +261,46 @@ class CarScraper:
 
         # Set timeouts
         driver.set_page_load_timeout(self.config.PAGE_LOAD_TIMEOUT)
-        driver.implicitly_wait(0)  # Use explicit waits
+        driver.implicitly_wait(0)
 
-        logging.info("Chrome driver initialized with stealth configuration")
+        logging.info(f"[W{self.worker_id}] Chrome driver initialized for {self.make}")
         return driver
 
     def restart_driver(self):
-        """Restart the browser driver to prevent memory leaks"""
-        logging.info("Restarting driver to clear memory and reset state...")
+        """Restart the browser driver for memory cleanup"""
+        logging.info(f"[W{self.worker_id}] Restarting driver for {self.make}...")
 
-        # Save current URL
-        current_url = self.driver.current_url if self.driver else self.config.get_base_url()
+        current_url = self.driver.current_url if self.driver else self.config.get_base_url(self.make)
 
-        # Cleanup old driver
         if self.driver:
             try:
                 self.driver.quit()
             except Exception as e:
-                logging.warning(f"Error during driver quit: {e}")
+                logging.warning(f"[W{self.worker_id}] Error during driver quit: {e}")
 
-        # Small delay to ensure cleanup
-        time.sleep(2)
+        time.sleep(1)
 
-        # Reinitialize driver
         self.driver = self.setup_driver()
 
-        # Enable CDP Network for API interception
         try:
             self.driver.execute_cdp_cmd("Network.enable", {})
         except Exception as e:
-            logging.warning(f"Could not enable Network CDP command: {e}")
+            logging.warning(f"[W{self.worker_id}] Could not enable Network CDP: {e}")
 
-        # Navigate back to current page
         self.driver.get(current_url)
         self._wait_for_page_load()
-
-        # Clear the unclickable buttons set as page state has reset
         self.unclickable_buttons.clear()
+        self.button_strike_counts.clear()
 
-        logging.info("✓ Driver restarted successfully")
+        logging.info(f"[W{self.worker_id}] Driver restarted for {self.make}")
 
     def _clear_performance_logs(self):
-        """
-        CRITICAL: Clear performance logs to prevent memory buildup
-        This prevents the 3x slowdown after 100+ iterations
-        """
+        """CRITICAL: Clear performance logs to prevent memory buildup"""
         try:
-            # Reading and discarding logs clears the buffer
             _ = self.driver.get_log("performance")
-            logging.debug("Performance logs cleared")
+            logging.debug(f"[W{self.worker_id}] Performance logs cleared")
         except Exception as e:
-            logging.warning(f"Failed to clear performance logs: {e}")
+            logging.warning(f"[W{self.worker_id}] Failed to clear performance logs: {e}")
 
     def _wait_for_page_load(self, timeout: int = 10) -> bool:
         """Wait for page to complete loading"""
@@ -279,7 +310,7 @@ class CarScraper:
             )
             return True
         except TimeoutException:
-            logging.warning('Timeout waiting for page load')
+            logging.warning(f'[W{self.worker_id}] Timeout waiting for page load')
             return False
 
     def _click_button(self, xpath: str, timeout: int = 30) -> bool:
@@ -289,11 +320,9 @@ class CarScraper:
                 EC.element_to_be_clickable((By.XPATH, xpath))
             )
 
-            # Scroll button into view
             self.driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", button)
             time.sleep(random.uniform(self.config.MIN_WAIT_AFTER_CLICK, self.config.MAX_WAIT_AFTER_CLICK))
 
-            # Try multiple click methods
             try:
                 button.click()
             except:
@@ -302,16 +331,13 @@ class CarScraper:
                 except:
                     self.driver.execute_script("arguments[0].click();", button)
 
-            # Wait for new content
             if self._wait_for_page_load(timeout):
-                logging.info("New content loaded successfully")
                 return True
             else:
-                logging.info("No new content detected after click")
                 return False
 
         except Exception as e:
-            logging.debug(f"Failed to click button: {e}")
+            logging.debug(f"[W{self.worker_id}] Failed to click button: {e}")
             return False
 
     def _handle_ribbon(self) -> bool:
@@ -334,14 +360,14 @@ class CarScraper:
                 )
                 return True
             except Exception as e:
-                logging.debug(f"Failed to dismiss ribbon: {e}")
+                logging.debug(f"[W{self.worker_id}] Failed to dismiss ribbon: {e}")
                 return False
 
         except TimeoutException:
             return False
 
     def _parse_performance_logs(self) -> List[Dict]:
-        """Extract car data from 'queue-results' API responses in performance logs"""
+        """Extract car data from 'queue-results' API responses"""
         rows = []
         try:
             logs = self.driver.get_log("performance")
@@ -352,7 +378,6 @@ class CarScraper:
                 except Exception:
                     continue
 
-                # Only process Network responses
                 if msg.get("method") != "Network.responseReceived":
                     continue
 
@@ -360,19 +385,16 @@ class CarScraper:
                 response = params.get("response", {})
                 url = response.get("url", "")
 
-                # Only process queue-results endpoints
                 if "queue-results" not in url:
                     continue
 
                 request_id = params.get("requestId")
 
-                # Skip if already processed
                 if not request_id or request_id in self.seen_api_request_ids:
                     continue
 
                 self.seen_api_request_ids.add(request_id)
 
-                # Get response body via CDP
                 try:
                     body = self.driver.execute_cdp_cmd("Network.getResponseBody", {"requestId": request_id})
                     text = body.get("body", "")
@@ -382,13 +404,13 @@ class CarScraper:
 
                     api_json = json.loads(text)
                     rows.extend(self._extract_rows_from_api_data(api_json))
-                    logging.info(f"Captured queue-results response (requestId={request_id})")
+                    logging.info(f"[W{self.worker_id}] Captured queue-results (requestId={request_id})")
 
                 except WebDriverException:
                     continue
 
         except Exception as e:
-            logging.error(f"Error reading performance logs: {e}")
+            logging.error(f"[W{self.worker_id}] Error reading performance logs: {e}")
 
         return rows
 
@@ -406,18 +428,34 @@ class CarScraper:
         ]
 
         for item in items:
-            row = {
-                "loaddate": date.today().isoformat()
+            row: Dict = {
+                "loaddate": date.today().isoformat(),
+                "scrape_make": self.make
             }
 
-            # Concatenate details columns
             details_short = item.get("detailsShort") or ""
             details_mid = item.get("detailsMid") or ""
             details_long = item.get("detailsLong") or ""
-            row["details"] = f"{details_short}{details_mid}{details_long}"
+            if details_short or details_mid or details_long:
+                row["details"] = f"{details_short}{details_mid}{details_long}"
+
+            img_value = item.get("img") or item.get("imgSource") or item.get("imgFallback")
+            row["img"] = img_value
 
             for field in fields_to_extract:
+                if field == "img":
+                    continue
                 value = item.get(field)
+                if field == "price":
+                    price_val = self._normalize_price(value)
+                    if price_val is not None:
+                        row[field] = price_val
+                    continue
+                if field == "mileage":
+                    mileage_val = self._normalize_mileage(value)
+                    if mileage_val is not None:
+                        row[field] = mileage_val
+                    continue
                 if isinstance(value, (list, dict)):
                     row[field] = json.dumps(value, ensure_ascii=False)
                 else:
@@ -427,29 +465,79 @@ class CarScraper:
 
         return rows
 
-    def run(self):
-        """Main execution loop for data collection"""
-        logging.info("="*60)
-        logging.info("Starting Car Data Acquisition")
-        logging.info("="*60)
+    @staticmethod
+    def _normalize_price(value):
+        if value is None:
+            return None
+        if isinstance(value, (int, float)):
+            return float(value)
+        text = str(value).replace("$", "").replace(",", "").strip()
+        if not text:
+            return None
+        try:
+            return float(text)
+        except ValueError:
+            return None
 
-        # Initialize driver
+    @staticmethod
+    def _normalize_mileage(value):
+        if value is None:
+            return None
+        if isinstance(value, (int, float)):
+            return int(value)
+        text = str(value).replace(",", "").strip()
+        if not text:
+            return None
+        try:
+            return int(float(text))
+        except ValueError:
+            return None
+
+    def _mark_button_exhausted(self, button_name: str, reason: str):
+        """Mark a button as exhausted"""
+        self.unclickable_buttons.add(button_name)
+        self.metrics.button_states[button_name] = f"exhausted ({reason})"
+        logging.info(f"[W{self.worker_id}] Button '{button_name}' marked exhausted: {reason}")
+
+    def _update_strike_count(self, button_name: str, rows_count: int) -> bool:
+        """Update strike count for a button. Returns True if exhausted."""
+        if rows_count == 0:
+            self.button_strike_counts[button_name] = self.button_strike_counts.get(button_name, 0) + 1
+            strikes = self.button_strike_counts[button_name]
+            logging.info(f"[W{self.worker_id}] Button '{button_name}': 0 rows (strike {strikes}/{self.config.EXHAUSTION_STRIKE_COUNT})")
+
+            if strikes >= self.config.EXHAUSTION_STRIKE_COUNT:
+                self._mark_button_exhausted(button_name, f"{self.config.EXHAUSTION_STRIKE_COUNT} zero-row clicks")
+                return True
+        else:
+            self.button_strike_counts[button_name] = 0
+            logging.info(f"[W{self.worker_id}] Button '{button_name}': {rows_count} rows (strike reset)")
+
+        return False
+
+    def run(self) -> MakeScrapingMetrics:
+        """Main execution loop for a single make"""
+        logging.info(f"\n{'='*60}")
+        logging.info(f"[W{self.worker_id}] Starting scrape for make={self.make}")
+        logging.info(f"{'='*60}")
+
         self.driver = self.setup_driver()
+        self.db = CarDatabase(self.db_path)
 
-        # Enable CDP Network
         try:
             self.driver.execute_cdp_cmd("Network.enable", {})
         except Exception as e:
-            logging.warning(f"Could not enable Network CDP command: {e}")
+            logging.warning(f"[W{self.worker_id}] Could not enable Network CDP: {e}")
 
         # Load existing VINs
-        logging.info("Loading existing VINs from database...")
+        logging.info(f"[W{self.worker_id}] Loading existing VINs from database...")
         self.seen_vins = self.db.get_seen_vins()
-        logging.info(f"Loaded {len(self.seen_vins)} existing VINs")
+        logging.info(f"[W{self.worker_id}] Loaded {len(self.seen_vins)} existing VINs")
 
-        # Navigate to search page
-        logging.info(f"Navigating to: {self.config.get_base_url()}")
-        self.driver.get(self.config.get_base_url())
+        # Navigate to make-specific search page
+        search_url = self.config.get_base_url(self.make)
+        logging.info(f"[W{self.worker_id}] Navigating to: {search_url}")
+        self.driver.get(search_url)
         self._wait_for_page_load()
 
         iteration = 1
@@ -457,59 +545,55 @@ class CarScraper:
         try:
             while True:
                 loop_start_time = time.time()
-                logging.info(f"\n{'='*60}")
-                logging.info(f"Starting iteration {iteration}")
-                logging.info(f"{'='*60}")
+                logging.info(f"\n[W{self.worker_id}] {self.make} iteration {iteration}")
 
-                # Periodic driver restart to prevent memory leaks
-                if (
-                    self.config.DRIVER_RESTART_INTERVAL
-                    and iteration > 1
-                    and iteration % self.config.DRIVER_RESTART_INTERVAL == 0
-                ):
+                # Check memory and restart driver if needed
+                if self.monitor.should_restart_driver():
+                    logging.warning(f"[W{self.worker_id}] Memory limit exceeded, restarting driver...")
                     self.restart_driver()
 
                 # Try to click load more buttons
                 any_button_clicked = False
 
                 for button_name, button_xpath in self.config.CONTINUE_BUTTONS_XPATH.items():
-                    # Skip buttons we know are unclickable
                     if button_name in self.unclickable_buttons:
                         continue
+
+                    # Safety check: don't exceed max clicks
+                    if self.metrics.total_clicks >= self.config.MAX_CLICKS_PER_MAKE:
+                        logging.info(f"[W{self.worker_id}] Reached max clicks ({self.config.MAX_CLICKS_PER_MAKE}) for {self.make}")
+                        break
 
                     retry_count = 0
                     while retry_count < self.config.MAX_RETRIES:
                         try:
-                            logging.info(f"Attempting to click '{button_name}' button...")
+                            logging.info(f"[W{self.worker_id}] Attempting to click '{button_name}'...")
 
-                            # Handle ribbon if present
                             if self._handle_ribbon():
-                                logging.info("Ribbon found and dismissed")
+                                logging.info(f"[W{self.worker_id}] Ribbon dismissed")
 
-                            # Try to click button
                             if self._click_button(button_xpath):
-                                logging.info(f"Successfully clicked '{button_name}' button")
-                                print(f"✓ Clicked '{button_name}' button")
+                                logging.info(f"[W{self.worker_id}] Clicked '{button_name}' successfully")
                                 any_button_clicked = True
+                                self.metrics.total_clicks += 1
                                 break
                             else:
-                                logging.info(f"Button '{button_name}' not found or not clickable")
-                                self.unclickable_buttons.add(button_name)
+                                logging.info(f"[W{self.worker_id}] Button '{button_name}' not clickable")
+                                self._mark_button_exhausted(button_name, "not found or not clickable")
                                 break
 
                         except (urllib3.exceptions.ReadTimeoutError, WebDriverException) as e:
-                            logging.error(f"Connection error during button click: {e}")
+                            logging.error(f"[W{self.worker_id}] Connection error: {e}")
                             self.cleanup()
-                            sys.exit(1)
+                            return self.metrics
 
                         except Exception as e:
                             retry_count += 1
-                            logging.warning(f"Error clicking '{button_name}' (attempt {retry_count}): {e}")
-
+                            logging.warning(f"[W{self.worker_id}] Error clicking '{button_name}' (attempt {retry_count}): {e}")
                             if retry_count >= self.config.MAX_RETRIES:
-                                logging.error(f"Failed to click '{button_name}' after {self.config.MAX_RETRIES} attempts")
+                                logging.error(f"[W{self.worker_id}] Failed to click '{button_name}' after retries")
 
-                # Parse API data from performance logs
+                # Parse API data
                 api_rows = []
                 try:
                     api_rows = self._parse_performance_logs()
@@ -519,70 +603,201 @@ class CarScraper:
                         for r in api_rows:
                             if r.get("vin"):
                                 self.seen_vins.add(r.get("vin"))
-                        logging.info(f"Processed {len(api_rows)} rows, inserted/updated {inserted} records")
-                        print(f"✓ Iteration {iteration}: Processed {len(api_rows)} rows, inserted {inserted} records")
+
+                        self.metrics.total_rows_processed += len(api_rows)
+                        self.metrics.total_rows_inserted += inserted
+                        logging.info(f"[W{self.worker_id}] Processed {len(api_rows)} rows, inserted {inserted}")
+                        print(f"[{self.make}] Iteration {iteration}: {len(api_rows)} rows, {inserted} inserted")
                     else:
-                        logging.info("No new data found in this iteration")
+                        logging.info(f"[W{self.worker_id}] No new data in this iteration")
 
                 except Exception as e:
-                    logging.error(f"Error collecting API data: {e}")
+                    logging.error(f"[W{self.worker_id}] Error collecting API data: {e}")
 
-                # CRITICAL: Clear performance logs to prevent memory buildup
+                # Check button exhaustion
+                if api_rows:
+                    for button_name in list(self.unclickable_buttons):
+                        if button_name in self.unclickable_buttons:
+                            continue
+
+                # Clear performance logs
                 if iteration % self.config.LOG_CLEANUP_INTERVAL == 0:
                     self._clear_performance_logs()
 
-                # Check if we should continue
+                # Check if done
                 if not any_button_clicked:
-                    logging.info("No more active 'load more' buttons found. Finishing...")
-                    print("\n✓ Scraping complete - no more data to load")
+                    logging.info(f"[W{self.worker_id}] No more active buttons for {self.make}")
+                    print(f"\n✓ {self.make}: Scraping complete")
                     break
 
-                # Log performance metrics
-                loop_duration = time.time() - loop_start_time
-                self.performance_monitor.log_iteration(iteration, loop_duration, len(api_rows))
+                # Monitor status
+                self.monitor.log_status(iteration, self.make)
 
-                # Random delay between iterations (stealth)
+                # Random delay
                 delay = random.uniform(
                     self.config.MIN_WAIT_BETWEEN_ITERATIONS,
                     self.config.MAX_WAIT_BETWEEN_ITERATIONS
                 )
-                logging.info(f"Waiting {delay:.2f}s before next iteration...")
+                logging.info(f"[W{self.worker_id}] Waiting {delay:.2f}s...")
                 time.sleep(delay)
 
                 iteration += 1
+                self.metrics.iterations = iteration
 
         except KeyboardInterrupt:
-            logging.info("\nScraping interrupted by user")
-            print("\n⚠ Scraping interrupted by user")
+            logging.info(f"[W{self.worker_id}] Interrupted by user")
 
         except Exception as e:
-            logging.error(f"Unexpected error in main loop: {e}", exc_info=True)
-            print(f"\n✗ Error: {e}")
+            logging.error(f"[W{self.worker_id}] Unexpected error: {e}", exc_info=True)
 
         finally:
             self.cleanup()
 
+        self.metrics.finalize()
+        return self.metrics
+
     def cleanup(self):
-        """Clean up resources"""
-        logging.info("Cleaning up resources...")
+        """Clean up resources for this make"""
+        logging.info(f"[W{self.worker_id}] Cleaning up for {self.make}...")
 
-        # Print performance summary
-        self.performance_monitor.print_summary()
-
-        # Close database connection
         if self.db:
             self.db.close()
 
-        # Quit driver
         if self.driver:
             try:
                 self.driver.quit()
-                logging.info("Browser driver closed")
+                logging.info(f"[W{self.worker_id}] Driver closed for {self.make}")
             except Exception as e:
-                logging.warning(f"Error closing driver: {e}")
+                logging.warning(f"[W{self.worker_id}] Error closing driver: {e}")
 
-        logging.info("Cleanup complete")
-        print(f"\nData collection finished. Output saved to {os.path.join(self.output_directory, 'CAR_DATA.db')}")
+
+# ============================================================================
+# PARALLEL ORCHESTRATOR
+# ============================================================================
+
+class ParallelScrapingOrchestrator:
+    """Orchestrates parallel scraping of multiple makes"""
+
+    def __init__(self, config: ParallelConfig = None):
+        self.config = config or ParallelConfig()
+        self.output_directory = os.path.join(
+            os.path.dirname(os.path.dirname(__file__)),
+            "CAR_DATA_OUTPUT"
+        )
+        os.makedirs(self.output_directory, exist_ok=True)
+
+        self.db_path = os.path.join(self.output_directory, "CAR_DATA.db")
+        self.metrics_by_make: Dict[str, MakeScrapingMetrics] = {}
+
+        self._setup_logging()
+
+        logging.info("ParallelScrapingOrchestrator initialized")
+
+    def _setup_logging(self):
+        """Configure global logging"""
+        log_path = os.path.join(self.output_directory, f'parallel_scraping_{date.today()}.log')
+
+        for handler in logging.root.handlers[:]:
+            logging.root.removeHandler(handler)
+
+        logging.basicConfig(
+            filename=log_path,
+            level=logging.INFO,
+            format='%(asctime)s - %(levelname)s - %(message)s',
+            force=True
+        )
+
+        console = logging.StreamHandler()
+        console.setLevel(logging.INFO)
+        logging.getLogger('').addHandler(console)
+
+    def run_single_make(self, worker_id: int, make: str) -> MakeScrapingMetrics:
+        """Run scraper for a single make (used by worker pool)"""
+        scraper = MakeScraper(
+            make=make,
+            worker_id=worker_id,
+            config=self.config,
+            db_path=self.db_path,
+            output_directory=self.output_directory
+        )
+        return scraper.run()
+
+    def run(self):
+        """Main execution: coordinate parallel scraping of all makes"""
+        logging.info("="*60)
+        logging.info("Starting Parallel Multi-Make Scraping")
+        logging.info("="*60)
+        logging.info(f"Makes to scrape: {', '.join(self.config.MAKES)}")
+        logging.info(f"Max workers: {self.config.MAX_WORKERS}")
+
+        start_time = time.time()
+
+        try:
+            # Use sequential approach with staggered starts for stealth
+            for idx, make in enumerate(self.config.MAKES):
+                if idx > 0:
+                    # Stagger worker starts
+                    logging.info(f"Staggering next worker start by {self.config.WORKER_STARTUP_STAGGER}s...")
+                    time.sleep(self.config.WORKER_STARTUP_STAGGER)
+
+                logging.info(f"\n[ORCHESTRATOR] Processing make {idx+1}/{len(self.config.MAKES)}: {make}")
+
+                metrics = self.run_single_make(worker_id=idx+1, make=make)
+                self.metrics_by_make[make] = metrics
+
+                # Print progress
+                print(metrics.log_summary())
+
+            # Print aggregate summary
+            self._print_aggregate_summary(start_time)
+
+        except KeyboardInterrupt:
+            logging.info("Parallel scraping interrupted by user")
+            print("\n⚠ Scraping interrupted by user")
+
+        except Exception as e:
+            logging.error(f"Unexpected error in orchestrator: {e}", exc_info=True)
+            print(f"\n✗ Error: {e}")
+
+        finally:
+            logging.info("Parallel scraping orchestrator finished")
+
+    def _print_aggregate_summary(self, start_time: float):
+        """Print aggregate summary of all makes"""
+        total_time = time.time() - start_time
+
+        summary_lines = [
+            "\n" + "="*60,
+            "AGGREGATE SCRAPING SUMMARY",
+            "="*60,
+            f"Total makes processed: {len(self.metrics_by_make)}",
+            f"Total elapsed time: {total_time:.2f}s ({total_time/60:.2f}m)",
+            ""
+        ]
+
+        total_clicks = 0
+        total_rows = 0
+        total_inserted = 0
+
+        for make, metrics in self.metrics_by_make.items():
+            summary_lines.append(
+                f"{make.upper():12} | Clicks: {metrics.total_clicks:4} | "
+                f"Rows: {metrics.total_rows_processed:6} | Inserted: {metrics.total_rows_inserted:6} | "
+                f"Time: {metrics.elapsed_time():.1f}s"
+            )
+            total_clicks += metrics.total_clicks
+            total_rows += metrics.total_rows_processed
+            total_inserted += metrics.total_rows_inserted
+
+        summary_lines.extend([
+            "="*60,
+            f"TOTALS: {total_clicks} clicks | {total_rows} rows processed | {total_inserted} inserted",
+            "="*60
+        ])
+
+        summary_text = "\n".join(summary_lines)
+        print(summary_text)
+        logging.info(summary_text)
 
 
 # ============================================================================
@@ -590,9 +805,10 @@ class CarScraper:
 # ============================================================================
 
 def main():
-    """Entry point for the scraper"""
-    scraper = CarScraper()
-    scraper.run()
+    """Entry point for parallel scraper"""
+    config = ParallelConfig()
+    orchestrator = ParallelScrapingOrchestrator(config)
+    orchestrator.run()
 
 
 if __name__ == "__main__":

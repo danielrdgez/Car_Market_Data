@@ -23,13 +23,13 @@ class CarDatabase:
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS listings (
                     vin TEXT,
-                    loaddate TEXT,
+                    loaddate DATE,
                     year INTEGER,
                     title TEXT,
                     details TEXT,
-                    price TEXT,
-                    mileage TEXT,
-                    date TEXT,
+                    price REAL,
+                    mileage INTEGER,
+                    date DATE,
                     location TEXT,
                     locationCode TEXT,
                     countryCode TEXT,
@@ -53,9 +53,9 @@ class CarDatabase:
                 CREATE TABLE IF NOT EXISTS price_history (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     vin TEXT,
-                    history_date TEXT,
-                    mileage TEXT,
-                    price TEXT,
+                    history_date DATE,
+                    mileage INTEGER,
+                    price REAL,
                     trend TEXT,
                     UNIQUE(vin, history_date, price),
                     FOREIGN KEY (vin) REFERENCES listings (vin)
@@ -67,7 +67,7 @@ class CarDatabase:
                 CREATE TABLE IF NOT EXISTS listing_history (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     vin TEXT,
-                    history_date TEXT,
+                    history_date DATE,
                     mileage REAL,
                     price REAL,
                     UNIQUE(vin, history_date, price, mileage),
@@ -181,7 +181,7 @@ class CarDatabase:
                     nhtsa_side_crash_rating TEXT,
                     nhtsa_total_recalls INTEGER,
                     nhtsa_recall_components TEXT,
-                    nhtsa_latest_recall_date TEXT,
+                    nhtsa_latest_recall_date DATE,
                     nhtsa_total_complaints INTEGER,
                     nhtsa_complaint_injuries INTEGER,
                     nhtsa_complaint_deaths INTEGER,
@@ -322,4 +322,3 @@ class CarDatabase:
                 logging.info("Database connection closed")
             except Exception as e:
                 logging.error(f"Error closing database connection: {e}")
-
