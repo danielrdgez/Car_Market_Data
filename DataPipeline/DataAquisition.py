@@ -753,7 +753,7 @@ class ParallelScrapingOrchestrator:
 
         except KeyboardInterrupt:
             logging.info("Parallel scraping interrupted by user")
-            print("\n⚠ Scraping interrupted by user")
+            print("\n Scraping interrupted by user")
 
         except Exception as e:
             logging.error(f"Unexpected error in orchestrator: {e}", exc_info=True)
