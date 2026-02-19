@@ -47,7 +47,7 @@ class ParallelConfig:
         "honda", "volvo", "maserati", "porsche", "acura", "lexus", "tesla",
         "kia", "bmw", "mercedes", "hyundai", "infiniti", "dodge", "lotus",
         "suzuki", "mazda", "fiat", "lincoln", "subaru", "gmc",
-        "genesis", "jeep", "volkswagen", "landrover"
+        "genesis", "jeep", "volkswagen", "landrover", "audi", "fiat"
     ])
 
     # Search parameters (shared across all makes)
