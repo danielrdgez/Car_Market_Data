@@ -1,6 +1,6 @@
 # Car Market Data Pipeline & Visualization
 
-A production-grade data pipeline that scrapes car listings from AutoTempest and enriches them with NHTSA specifications, safety ratings, recalls, and complaints. Features an interactive R Shiny dashboard for data visualization and analysis. The scraper uses Selenium with stealth configuration and captures JSON via CDP performance logs to avoid brittle HTML parsing.
+A production-grade data pipeline that scrapes car listings from AutoTempest and enriches them with NHTSA specifications, safety ratings, recalls, and complaints. The scraper uses per-button parallel browser instances with Selenium stealth configuration, capturing JSON via CDP performance log interception. Each source button (autotempest, hemmings, cars, etc.) runs in its own dedicated thread with an isolated browser, clicking until true exhaustion. A thread-safe VIN cache and locked database writes ensure data integrity across concurrent workers.
 
 For the full technical documentation, workflows, and detailed troubleshooting, see `PROJECT_SUMMARY.md`.
 
@@ -13,6 +13,17 @@ python Utilities\health_check.py
 python DataPipeline\DataAquisition.py
 python DataPipeline\NHTSA_enrichment.py
 ```
+
+### Notebook Troubleshooting
+
+If you see `Mime type rendering requires nbformat>=4.2.0 but it is not installed`, your notebook kernel is using a different interpreter than the project environment.
+
+```bash
+pip install -r requirements.txt
+python -m ipykernel install --user --name car-market-data --display-name "Python (car-market-data)"
+```
+
+Then select `Python (car-market-data)` as the kernel for `EDA/EDA_notebook.ipynb`.
 
 ### Shiny Dashboard (Visualization)
 
@@ -51,7 +62,7 @@ Car-Price-Data-Visualization-Learning/
 
 ## Configuration
 
-Update the `Config` class in `DataPipeline/DataAquisition.py` for ZIP, radius, and timing controls.
+Update the `ScrapingConfig` dataclass in `DataPipeline/DataAquisition.py` for ZIP, makes list, concurrent button workers, exhaustion thresholds, and timing controls.
 
 ## Common Operations
 
