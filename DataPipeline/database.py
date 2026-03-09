@@ -1,15 +1,25 @@
 import sqlite3
-import json
 import logging
+import threading
 from datetime import date
+from typing import Optional, List
 
 class CarDatabase:
-    def __init__(self, db_path):
+    def __init__(self, db_path, thread_safe=False):
         self.db_path = db_path
         self.conn = None
+        self._thread_safe = thread_safe
+        self._lock = threading.Lock() if thread_safe else None
+        self._local = threading.local() if thread_safe else None
         self._init_db()
 
     def _get_connection(self):
+        if self._thread_safe:
+            conn = getattr(self._local, 'conn', None)
+            if conn is None:
+                conn = sqlite3.connect(self.db_path, timeout=30)
+                self._local.conn = conn
+            return conn
         if self.conn is None:
             self.conn = sqlite3.connect(self.db_path, timeout=30)
         return self.conn
@@ -194,20 +204,42 @@ class CarDatabase:
             
             conn.commit()
 
-    def insert_rows(self, rows):
+    def insert_rows(self, rows, vin_cache=None):
         if not rows:
             return 0
-        
+
+        lock = self._lock if self._thread_safe else None
+        if lock:
+            lock.acquire()
+        try:
+            return self._insert_rows_impl(rows, vin_cache=vin_cache)
+        finally:
+            if lock:
+                lock.release()
+
+    def _insert_rows_impl(self, rows, vin_cache=None):
         inserted_count = 0
+        today = date.today().isoformat()
+
         with self._get_connection() as conn:
             cursor = conn.cursor()
+
             for row in rows:
                 vin = row.get('vin')
                 loaddate = row.get('loaddate')
                 if not vin or not loaddate:
                     continue
-                
-                # Insert listing snapshot
+
+                # Always process normalized history tables first. UNIQUE constraints
+                # + INSERT OR IGNORE prevent duplicates automatically.
+                self._insert_price_history(cursor, vin, row.get('priceHistory'))
+                self._insert_listing_history(cursor, vin, row.get('listingHistory'))
+
+                # Listing snapshot can be skipped for VINs already seen today,
+                # but history above is still preserved.
+                if vin_cache is not None and vin_cache.contains(vin, today):
+                    continue
+
                 try:
                     cursor.execute('''
                         INSERT OR REPLACE INTO listings (
@@ -230,38 +262,37 @@ class CarDatabase:
                         inserted_count += 1
                 except sqlite3.Error as e:
                     logging.error(f"Failed to insert listing for VIN {vin}, loaddate {loaddate}: {e}")
-                    continue
-
-                # Process priceHistory
-                price_history = row.get('priceHistory')
-                if price_history:
-                    try:
-                        history_data = json.loads(price_history) if isinstance(price_history, str) else price_history
-                        if isinstance(history_data, list):
-                            for h in history_data:
-                                cursor.execute('''
-                                    INSERT OR IGNORE INTO price_history (vin, history_date, mileage, price, trend)
-                                    VALUES (?, ?, ?, ?, ?)
-                                ''', (vin, h.get('date'), h.get('mileage'), h.get('price'), h.get('trend')))
-                    except Exception as e:
-                        logging.warning(f"Failed to parse priceHistory for VIN {vin}: {e}")
-
-                # Process listingHistory
-                listing_history = row.get('listingHistory')
-                if listing_history:
-                    try:
-                        history_data = json.loads(listing_history) if isinstance(listing_history, str) else listing_history
-                        if isinstance(history_data, list):
-                            for h in history_data:
-                                cursor.execute('''
-                                    INSERT OR IGNORE INTO listing_history (vin, history_date, mileage, price)
-                                    VALUES (?, ?, ?, ?)
-                                ''', (vin, h.get('date'), h.get('mileage'), h.get('price')))
-                    except Exception as e:
-                        logging.warning(f"Failed to parse listingHistory for VIN {vin}: {e}")
 
             conn.commit()
+
         return inserted_count
+
+    def _insert_price_history(self, cursor, vin: str, history: Optional[List]):
+        if not history or not isinstance(history, list):
+            return
+        for h in history:
+            try:
+                cursor.execute('''
+                               INSERT
+                               OR IGNORE INTO price_history (vin, history_date, mileage, price, trend)
+                    VALUES (?, ?, ?, ?, ?)
+                               ''', (vin, h.get('date'), h.get('mileage'), h.get('price'), h.get('trend')))
+            except sqlite3.Error as e:
+                logging.warning(f"Failed to insert priceHistory for VIN {vin}: {e}")
+
+    def _insert_listing_history(self, cursor, vin: str, history: Optional[List]):
+        if not history or not isinstance(history, list):
+            return
+        for h in history:
+            try:
+                cursor.execute('''
+                               INSERT
+                               OR IGNORE INTO listing_history (vin, history_date, mileage, price)
+                    VALUES (?, ?, ?, ?)
+                               ''', (vin, h.get('date'), h.get('mileage'), h.get('price')))
+            except sqlite3.Error as e:
+                logging.warning(f"Failed to insert listingHistory for VIN {vin}: {e}")
+
 
     def get_seen_vins(self):
         with self._get_connection() as conn:
@@ -315,10 +346,19 @@ class CarDatabase:
             conn.commit()
 
     def close(self):
-        """Close the database connection"""
+        """Close the database connection(s)"""
+        if self._thread_safe and self._local:
+            conn = getattr(self._local, 'conn', None)
+            if conn:
+                try:
+                    conn.close()
+                except Exception as e:
+                    logging.error(f"Error closing thread-local database connection: {e}")
+                self._local.conn = None
         if hasattr(self, 'conn') and self.conn:
             try:
                 self.conn.close()
                 logging.info("Database connection closed")
             except Exception as e:
                 logging.error(f"Error closing database connection: {e}")
+            self.conn = None

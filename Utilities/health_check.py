@@ -13,6 +13,7 @@ Run this script to ensure:
 import sys
 import os
 from pathlib import Path
+from importlib import metadata
 
 def colored(text, color):
     """Add color to terminal output"""
@@ -34,7 +35,9 @@ def check_dependencies():
         'selenium',
         'selenium_stealth',
         'pandas',
-        'urllib3'
+        'urllib3',
+        'nbformat',
+        'ipykernel'
     ]
 
     missing = []
@@ -46,9 +49,25 @@ def check_dependencies():
             print(f"  ✗ {package:20s} {colored('MISSING', 'red')}")
             missing.append(package)
 
-    if missing:
-        print(f"\n{colored('⚠️  Missing packages:', 'yellow')} {', '.join(missing)}")
-        print(f"   Run: pip install {' '.join(missing)}")
+    nbformat_ok = True
+    try:
+        nbformat_version = metadata.version("nbformat")
+        major, minor, *_ = [int(part) for part in nbformat_version.split(".")]
+        if (major, minor) < (4, 2):
+            nbformat_ok = False
+            print(f"  ✗ {'nbformat>=4.2.0':20s} {colored('TOO OLD', 'red')} (found {nbformat_version})")
+        else:
+            print(f"  ✓ {'nbformat version':20s} {colored('OK', 'green')} ({nbformat_version})")
+    except Exception as exc:
+        nbformat_ok = False
+        print(f"  ✗ {'nbformat version':20s} {colored('ERROR', 'red')} ({exc})")
+
+    if missing or not nbformat_ok:
+        missing_hints = list(missing)
+        if not nbformat_ok and 'nbformat' not in missing_hints:
+            missing_hints.append('nbformat>=4.2.0')
+        print(f"\n{colored('⚠️  Missing or invalid packages:', 'yellow')} {', '.join(missing_hints)}")
+        print("   Run: pip install -r requirements.txt")
         return False
     else:
         print(f"\n{colored('✓ All dependencies installed!', 'green')}")
@@ -138,14 +157,15 @@ def check_configuration():
     try:
         pipeline_path = Path(__file__).parent.parent / "DataPipeline"
         sys.path.insert(0, str(pipeline_path))
-        from DataAquisition import Config
+        from DataAquisition import ScrapingConfig
 
-        print(f"  ✓ Config loaded successfully")
-        print(f"     ZIP Code: {Config.INPUT_ZIP}")
-        print(f"     Radius: {Config.INPUT_RADIUS} miles")
-        print(f"     Headless: {Config.HEADLESS}")
-        print(f"     Driver restart: Every {Config.DRIVER_RESTART_INTERVAL} iterations")
-        print(f"     Log cleanup: Every {Config.LOG_CLEANUP_INTERVAL} iteration(s)")
+        config = ScrapingConfig()
+        print(f"  Config loaded successfully")
+        print(f"     ZIP Code: {config.INPUT_ZIP}")
+        print(f"     State: {config.INPUT_STATE}")
+        print(f"     Headless: {config.HEADLESS}")
+        print(f"     Max button workers: {config.MAX_BUTTON_WORKERS}")
+        print(f"     Log cleanup: Every {config.LOG_CLEANUP_INTERVAL} iteration(s)")
         return True
 
     except Exception as e:
