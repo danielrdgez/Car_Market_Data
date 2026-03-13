@@ -12,6 +12,7 @@ pip install -r requirements.txt
 python Utilities\health_check.py
 python DataPipeline\DataAquisition.py
 python DataPipeline\NHTSA_enrichment.py
+python DataPipeline\DataCleaning.py
 ```
 
 ### Notebook Troubleshooting
@@ -54,8 +55,10 @@ Car-Price-Data-Visualization-Learning/
 │   └── fix_database_schema.py
 ├── CAR_DATA_OUTPUT/
 │   ├── CAR_DATA.db
+│   ├── CAR_DATA_CLEANED.db
 │   ├── scraping_*.log
-│   └── nhtsa_enrichment_*.log
+│   ├── nhtsa_enrichment_*.log
+│   └── cleaning_*.log
 ├── PROJECT_SUMMARY.md
 └── README.md
 ```
@@ -70,6 +73,7 @@ Update the `ScrapingConfig` dataclass in `DataPipeline/DataAquisition.py` for ZI
 ```bash
 python DataPipeline\DataAquisition.py
 python DataPipeline\NHTSA_enrichment.py
+python DataPipeline\DataCleaning.py
 python Utilities\verify_schema.py
 python Utilities\fix_database_schema.py
 ```

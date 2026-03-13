@@ -1,5 +1,4 @@
 import requests
-import json
 import pandas as pd
 import logging
 import time
@@ -631,7 +630,7 @@ class NHTSAEnricher:
         try:
             df_enriched.to_csv(output_csv, index=False)
             logging.info(f"Enriched data saved to {output_csv}")
-            print(f"\n✓ Enriched data exported to: {output_csv}")
+            print(f"\nEnriched data exported to: {output_csv}")
         except Exception as e:
             logging.error(f"Error saving enriched CSV: {e}")
         
@@ -664,18 +663,16 @@ class NHTSAEnricher:
             Number of records enriched
         """
         logging.info("Starting NHTSA database enrichment pipeline")
-        print("\n" + "="*60)
-        print("NHTSA Database Data Enrichment Pipeline")
-        print("="*60)
-        
+        print("Running NHTSA enrichment pipeline...")
+
         try:
             count = self.enrich_database()
             logging.info(f"NHTSA enrichment pipeline completed successfully. Enriched {count} records.")
-            print(f"\n✓ Enrichment pipeline completed! Enriched {count} new records.")
+            print(f"\nEnrichment pipeline completed. Enriched {count} new records.")
             return count
         except Exception as e:
             logging.error(f"Pipeline failed: {e}")
-            print(f"\n✗ Pipeline failed: {e}")
+            print(f"\nPipeline failed: {e}")
             raise
 
 

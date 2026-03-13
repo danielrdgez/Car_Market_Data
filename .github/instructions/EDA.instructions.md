@@ -57,3 +57,6 @@ Construct these specific features to address the research questions:
 2.  **Memory Management:** When querying SQLite, select only necessary columns rather than `SELECT *`.
 3.  **Reproducibility:** Set random seeds for any ML/sampling tasks.
 4.  **Error Handling:** When parsing the JSON history columns, use `try/except` blocks to handle malformed strings.
+5.  **Professional Output:** Keep code/markdown professional and emoji-free; keep comments minimal and non-obvious only.
+6.  **Dependency Hygiene:** If a new package is introduced, update `requirements.txt` in the same change.
+7.  **Doc Hygiene:** Do not create extra markdown docs unless explicitly requested; update existing docs first.

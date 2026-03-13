@@ -11,7 +11,7 @@ Run this script to ensure:
 """
 
 import sys
-import os
+import importlib.util
 from pathlib import Path
 from importlib import metadata
 
@@ -34,7 +34,9 @@ def check_dependencies():
     required = [
         'selenium',
         'selenium_stealth',
+        'requests',
         'pandas',
+        'polars',
         'urllib3',
         'nbformat',
         'ipykernel'
@@ -44,9 +46,9 @@ def check_dependencies():
     for package in required:
         try:
             __import__(package)
-            print(f"  ✓ {package:20s} {colored('INSTALLED', 'green')}")
+            print(f"  OK    {package:20s} {colored('INSTALLED', 'green')}")
         except ImportError:
-            print(f"  ✗ {package:20s} {colored('MISSING', 'red')}")
+            print(f"  ERROR {package:20s} {colored('MISSING', 'red')}")
             missing.append(package)
 
     nbformat_ok = True
@@ -55,22 +57,22 @@ def check_dependencies():
         major, minor, *_ = [int(part) for part in nbformat_version.split(".")]
         if (major, minor) < (4, 2):
             nbformat_ok = False
-            print(f"  ✗ {'nbformat>=4.2.0':20s} {colored('TOO OLD', 'red')} (found {nbformat_version})")
+            print(f"  ERROR {'nbformat>=4.2.0':20s} {colored('TOO OLD', 'red')} (found {nbformat_version})")
         else:
-            print(f"  ✓ {'nbformat version':20s} {colored('OK', 'green')} ({nbformat_version})")
+            print(f"  OK    {'nbformat version':20s} {colored('OK', 'green')} ({nbformat_version})")
     except Exception as exc:
         nbformat_ok = False
-        print(f"  ✗ {'nbformat version':20s} {colored('ERROR', 'red')} ({exc})")
+        print(f"  ERROR {'nbformat version':20s} {colored('ERROR', 'red')} ({exc})")
 
     if missing or not nbformat_ok:
         missing_hints = list(missing)
         if not nbformat_ok and 'nbformat' not in missing_hints:
             missing_hints.append('nbformat>=4.2.0')
-        print(f"\n{colored('⚠️  Missing or invalid packages:', 'yellow')} {', '.join(missing_hints)}")
+        print(f"\n{colored('WARNING: Missing or invalid packages:', 'yellow')} {', '.join(missing_hints)}")
         print("   Run: pip install -r requirements.txt")
         return False
     else:
-        print(f"\n{colored('✓ All dependencies installed!', 'green')}")
+        print(f"\n{colored('OK: All dependencies installed', 'green')}")
         return True
 
 def check_database_schema():
@@ -82,7 +84,7 @@ def check_database_schema():
     db_path = Path(__file__).parent.parent / "CAR_DATA_OUTPUT" / "CAR_DATA.db"
 
     if not db_path.exists():
-        print(f"  {colored('ℹ️  Database does not exist yet', 'yellow')}")
+        print(f"  {colored('INFO: Database does not exist yet', 'yellow')}")
         print(f"     It will be created on first run")
         return True
 
@@ -98,20 +100,20 @@ def check_database_schema():
         missing = required - columns
 
         if missing:
-            print(f"  {colored('✗ Missing columns:', 'red')} {', '.join(missing)}")
+            print(f"  {colored('ERROR: Missing columns:', 'red')} {', '.join(missing)}")
             print(f"  {colored('   Run:', 'yellow')} python Utilities/fix_database_schema.py")
             conn.close()
             return False
         else:
             cursor.execute("SELECT COUNT(*) FROM listings")
             count = cursor.fetchone()[0]
-            print(f"  ✓ Schema valid - all required columns present")
-            print(f"  ✓ Database contains {count:,} records")
+            print(f"  OK: Schema valid - all required columns present")
+            print(f"  OK: Database contains {count:,} records")
             conn.close()
             return True
 
     except Exception as e:
-        print(f"  {colored('✗ Error checking schema:', 'red')} {e}")
+        print(f"  {colored('ERROR: Error checking schema:', 'red')} {e}")
         return False
 
 def check_files():
@@ -125,6 +127,7 @@ def check_files():
     required_files = [
         "DataPipeline/DataAquisition.py",
         "DataPipeline/database.py",
+        "DataPipeline/DataCleaning.py",
         "DataPipeline/NHTSA_enrichment.py",
         "Utilities/verify_schema.py",
         "Utilities/fix_database_schema.py",
@@ -136,16 +139,16 @@ def check_files():
     for file in required_files:
         file_path = base_path / file
         if file_path.exists():
-            print(f"  ✓ {file}")
+            print(f"  OK    {file}")
         else:
-            print(f"  {colored('✗ ' + file, 'red')} (MISSING)")
+            print(f"  {colored('ERROR ' + file, 'red')} (MISSING)")
             all_exist = False
 
     if all_exist:
-        print(f"\n{colored('✓ All required files present!', 'green')}")
+        print(f"\n{colored('OK: All required files present', 'green')}")
         return True
     else:
-        print(f"\n{colored('⚠️  Some files are missing', 'yellow')}")
+        print(f"\n{colored('WARNING: Some files are missing', 'yellow')}")
         return False
 
 def check_configuration():
@@ -156,10 +159,18 @@ def check_configuration():
 
     try:
         pipeline_path = Path(__file__).parent.parent / "DataPipeline"
+        module_path = Path(__file__).parent.parent / "DataPipeline" / "DataAquisition.py"
+        spec = importlib.util.spec_from_file_location("DataAquisition", module_path)
+        if spec is None or spec.loader is None:
+            raise RuntimeError("Could not load DataAquisition.py")
+        module = importlib.util.module_from_spec(spec)
         sys.path.insert(0, str(pipeline_path))
-        from DataAquisition import ScrapingConfig
-
-        config = ScrapingConfig()
+        try:
+            spec.loader.exec_module(module)
+        finally:
+            if sys.path and sys.path[0] == str(pipeline_path):
+                sys.path.pop(0)
+        config = module.ScrapingConfig()
         print(f"  Config loaded successfully")
         print(f"     ZIP Code: {config.INPUT_ZIP}")
         print(f"     State: {config.INPUT_STATE}")
@@ -169,7 +180,7 @@ def check_configuration():
         return True
 
     except Exception as e:
-        print(f"  {colored('✗ Error loading config:', 'red')} {e}")
+        print(f"  {colored('ERROR: Error loading config:', 'red')} {e}")
         return False
 
 def check_output_directory():
@@ -181,7 +192,7 @@ def check_output_directory():
     output_dir = Path(__file__).parent.parent / "CAR_DATA_OUTPUT"
 
     if not output_dir.exists():
-        print(f"  ℹ️  Creating output directory...")
+        print(f"  INFO: Creating output directory...")
         output_dir.mkdir(exist_ok=True)
 
     # Test write permission
@@ -189,15 +200,16 @@ def check_output_directory():
     try:
         test_file.write_text("test")
         test_file.unlink()
-        print(f"  ✓ Output directory: {output_dir}")
-        print(f"  ✓ Write permission: OK")
+        print(f"  OK: Output directory: {output_dir}")
+        print(f"  OK: Write permission")
         return True
     except Exception as e:
-        print(f"  {colored('✗ Cannot write to output directory:', 'red')} {e}")
+        print(f"  {colored('ERROR: Cannot write to output directory:', 'red')} {e}")
         return False
 
 def main():
     """Run all health checks"""
+    print("Running system health check...")
     print("\n" + "="*60)
     print("CAR DATA PIPELINE - SYSTEM HEALTH CHECK")
     print("="*60)
@@ -215,7 +227,7 @@ def main():
         try:
             results[name] = check_func()
         except Exception as e:
-            print(f"\n{colored('✗ Unexpected error in ' + name + ':', 'red')} {e}")
+            print(f"\n{colored('ERROR: Unexpected error in ' + name + ':', 'red')} {e}")
             results[name] = False
 
     # Summary
@@ -224,18 +236,18 @@ def main():
     print("="*60)
 
     for name, passed in results.items():
-        status = colored("✓ PASS", "green") if passed else colored("✗ FAIL", "red")
+        status = colored("PASS", "green") if passed else colored("FAIL", "red")
         print(f"  {name:25s} {status}")
 
     all_passed = all(results.values())
 
     print("\n" + "="*60)
     if all_passed:
-        print(colored("✓✓✓ ALL CHECKS PASSED - SYSTEM READY ✓✓✓", "green"))
+        print(colored("ALL CHECKS PASSED - SYSTEM READY", "green"))
         print("\nYou can now run:")
         print("  python DataPipeline/DataAquisition.py")
     else:
-        print(colored("⚠️  SOME CHECKS FAILED - PLEASE FIX BEFORE RUNNING", "yellow"))
+        print(colored("SOME CHECKS FAILED - PLEASE FIX BEFORE RUNNING", "yellow"))
         print("\nRecommended actions:")
         if not results.get("Dependencies"):
             print("  1. pip install -r requirements.txt")

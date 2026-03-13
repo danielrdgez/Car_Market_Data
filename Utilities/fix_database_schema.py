@@ -36,7 +36,7 @@ def backup_database():
     backup_path = DB_PATH.replace('.db', f'_backup_{datetime.now().strftime("%Y%m%d_%H%M%S")}.db')
     try:
         shutil.copy2(DB_PATH, backup_path)
-        logging.info(f"✓ Database backed up to: {backup_path}")
+        logging.info(f"Backup created: {backup_path}")
         return True
     except Exception as e:
         logging.error(f"Failed to backup database: {e}")
@@ -96,7 +96,7 @@ def add_missing_columns():
     missing_columns = set(required_columns.keys()) - existing_columns
 
     if not missing_columns:
-        logging.info("✓ All required columns exist")
+        logging.info("All required columns exist")
         conn.close()
         return True
 
@@ -110,7 +110,7 @@ def add_missing_columns():
             cursor.execute(sql)
 
         conn.commit()
-        logging.info("✓ Successfully added missing columns")
+        logging.info("Added missing columns successfully")
         return True
 
     except sqlite3.Error as e:
@@ -136,10 +136,10 @@ def verify_schema():
     conn.close()
 
     if missing:
-        logging.error(f"❌ Still missing columns: {missing}")
+        logging.error(f"Missing columns remain: {missing}")
         return False
     else:
-        logging.info("✓ Schema validation passed - all required columns present")
+        logging.info("Schema validation passed - all required columns present")
         return True
 
 
@@ -161,6 +161,7 @@ def get_stats():
 
 def main():
     """Main migration process"""
+    print("Running schema migration...")
     logging.info("="*60)
     logging.info("Database Schema Migration Tool")
     logging.info("="*60)
@@ -196,10 +197,10 @@ def main():
     # Step 6: Verify
     logging.info("\n--- Verifying schema ---")
     if verify_schema():
-        logging.info("\n✓✓✓ Migration completed successfully! ✓✓✓")
+        logging.info("\nMigration completed successfully")
         logging.info("The scraper should now work without insertion errors.")
     else:
-        logging.error("\n❌ Migration verification failed!")
+        logging.error("\nMigration verification failed")
 
 
 if __name__ == "__main__":
