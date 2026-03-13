@@ -9,6 +9,7 @@ import sqlite3
 DB_PATH = r"C:\Users\danie\Code\Car-Price-Data-Visualization-Learning\CAR_DATA_OUTPUT\CAR_DATA.db"
 
 def verify_schema():
+    print("Running schema verification...")
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
 
@@ -20,26 +21,26 @@ def verify_schema():
     cursor.execute("PRAGMA table_info(listings)")
     columns = cursor.fetchall()
 
-    print("\n📋 LISTINGS TABLE COLUMNS:")
+    print("\nLISTINGS TABLE COLUMNS:")
     print("-" * 60)
     for col in columns:
         col_id, name, dtype, notnull, default, pk = col
         pk_indicator = " [PK]" if pk else ""
         print(f"  {name:25s} {dtype:15s}{pk_indicator}")
 
-    print(f"\n✓ Total columns: {len(columns)}")
+    print(f"\nTotal columns: {len(columns)}")
 
     # Check for required columns
     required = ['vin', 'loaddate', 'year', 'title', 'details', 'price', 'mileage']
     column_names = [col[1] for col in columns]
     missing = [col for col in required if col not in column_names]
 
-    print("\n🔍 REQUIRED COLUMN CHECK:")
+    print("\nREQUIRED COLUMN CHECK:")
     print("-" * 60)
     if missing:
-        print(f"  ❌ Missing: {', '.join(missing)}")
+        print(f"  MISSING: {', '.join(missing)}")
     else:
-        print("  ✓ All required columns present!")
+        print("  OK: All required columns present")
 
     # Get stats
     cursor.execute("SELECT COUNT(*) FROM listings")
@@ -51,14 +52,14 @@ def verify_schema():
     cursor.execute("SELECT COUNT(DISTINCT loaddate) FROM listings")
     unique_dates = cursor.fetchone()[0]
 
-    print("\n📊 DATABASE STATISTICS:")
+    print("\nDATABASE STATISTICS:")
     print("-" * 60)
     print(f"  Total records:        {total:,}")
     print(f"  Unique VINs:          {unique_vins:,}")
     print(f"  Unique load dates:    {unique_dates}")
 
     # Check other tables
-    print("\n📚 OTHER TABLES:")
+    print("\nOTHER TABLES:")
     print("-" * 60)
     cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")
     tables = cursor.fetchall()
@@ -72,9 +73,9 @@ def verify_schema():
 
     print("\n" + "="*60)
     if not missing:
-        print("✓✓✓ Schema is READY for DataAquisition script! ✓✓✓")
+        print("SUCCESS: Schema is ready for DataAquisition.py")
     else:
-        print("⚠️  Schema needs migration - run fix_database_schema.py")
+        print("WARNING: Schema needs migration - run fix_database_schema.py")
     print("="*60)
 
 if __name__ == "__main__":

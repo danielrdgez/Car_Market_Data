@@ -36,9 +36,7 @@ import urllib3
 from database import CarDatabase
 
 
-# ============================================================================
-# CONFIGURATION
-# ============================================================================
+# Configuration
 
 BUTTON_ORDER: List[str] = [
     "autotempest", "hemmings", "carsoup", "carvana", "carmax",
@@ -96,9 +94,7 @@ class ScrapingConfig:
         )
 
 
-# ============================================================================
-# METRICS
-# ============================================================================
+# Metrics
 
 @dataclass
 class ButtonScrapingMetrics:
@@ -161,7 +157,7 @@ class MakeScrapingMetrics:
                 f"time={bm.elapsed():.1f}s | {status}"
             )
         lines.extend([
-            f"{'─'*70}",
+            f"{'-'*70}",
             f"  TOTALS: {self.total_clicks} clicks | "
             f"{self.total_rows_processed} processed | {self.total_rows_inserted} inserted | "
             f"{self.elapsed():.1f}s",
@@ -170,9 +166,7 @@ class MakeScrapingMetrics:
         return "\n".join(lines)
 
 
-# ============================================================================
-# VIN CACHE (thread-safe deduplication)
-# ============================================================================
+# VIN cache
 
 class VINCache:
     """Thread-safe in-memory VIN deduplication backed by a quick DB lookup"""
@@ -199,9 +193,7 @@ class VINCache:
             return len(self._seen)
 
 
-# ============================================================================
-# DRIVER FACTORY
-# ============================================================================
+# Driver factory
 
 def create_stealth_driver(config: ScrapingConfig) -> webdriver.Chrome:
     """Initialize a stealth-configured Chrome driver"""
@@ -237,9 +229,7 @@ def create_stealth_driver(config: ScrapingConfig) -> webdriver.Chrome:
     return driver
 
 
-# ============================================================================
-# DATA EXTRACTION HELPERS
-# ============================================================================
+# Data extraction helpers
 
 def normalize_price(value) -> Optional[float]:
     if value is None:
@@ -330,9 +320,7 @@ def extract_rows_from_api(api_data: Dict, make: str) -> List[Dict]:
         rows.append(row)
     return rows
 
-# ============================================================================
-# BUTTON SCRAPER (one browser, one button, run to exhaustion)
-# ============================================================================
+# Button scraper
 
 class ButtonScraper:
     """Dedicated browser instance that clicks a single button until exhausted"""
@@ -571,9 +559,7 @@ class ButtonScraper:
             pass
 
 
-# ============================================================================
-# BUTTON SCRAPING COORDINATOR (all buttons for one make)
-# ============================================================================
+# Button scraping coordinator
 
 class ButtonScrapingCoordinator:
     """Spawns parallel ButtonScraper threads for every button of a single make"""
@@ -645,9 +631,7 @@ class ButtonScrapingCoordinator:
         return self.metrics
 
 
-# ============================================================================
-# PARALLEL ORCHESTRATOR (iterates makes)
-# ============================================================================
+# Parallel orchestrator
 
 class ParallelScrapingOrchestrator:
     """Iterates makes sequentially, each make gets parallel button workers"""
@@ -750,11 +734,8 @@ class ParallelScrapingOrchestrator:
         logging.info(summary)
 
 
-# ============================================================================
-# MAIN ENTRY POINT
-# ============================================================================
-
 def main():
+    print("Running data acquisition pipeline...")
     config = ScrapingConfig()
     orchestrator = ParallelScrapingOrchestrator(config)
     orchestrator.run()

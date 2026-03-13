@@ -14,6 +14,12 @@ applyTo: "**/*.py"
 3.  **Intercept** the `queue-results` JSON response via CDP (Network logs) instead of scraping HTML.
 4.  **Save** data incrementally to prevent loss during crashes.
 
+### Style and Hygiene Rules
+1. Keep generated code professional and readable; do not use emojis.
+2. Keep comments minimal and only for non-obvious logic.
+3. Do not create extra markdown docs unless requested; prefer updating existing project docs.
+4. If you add a Python package, update `requirements.txt` in the same change.
+
 ---
 
 ## 2. Selenium Configuration (The "Stealth" Setup)
