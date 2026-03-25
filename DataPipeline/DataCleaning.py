@@ -37,6 +37,11 @@ NHTSA_DROP_COLUMNS = {
 PRICE_MIN = 1000
 PRICE_MAX = 1_000_000
 
+VIN_BLACKLIST = {
+    "1GCUY6ED0LF228114",
+    "1FTFW6L8XSFB63087",
+}
+
 
 class DataCleaningPipeline:
     """Builds a filtered SQLite clone for cleaned analysis output."""
@@ -175,13 +180,14 @@ class DataCleaningPipeline:
 
         listings = listings.select([c for c in LISTINGS_KEEP_COLUMNS if c in listings.columns])
         listings = self._filter_non_empty(listings, ["vin", "loaddate"])
+        listings = listings.filter(~pl.col("vin").is_in(VIN_BLACKLIST))
         listings = self._normalize_date_columns(listings, ["date", "loaddate"])
         listings = self._drop_null_dates(listings, ["date", "loaddate"])
         listings = self._normalize_numeric_to_int_ceil(listings, ["price", "mileage"])
         listings = self._filter_non_null_numeric(listings, ["price", "mileage"])
         listings = self._filter_price_range(listings, "price")
 
-        nhtsa = self._filter_non_empty(nhtsa, ["vin", "nhtsa_Make", "nhtsa_Model"]).with_columns(
+        nhtsa = self._filter_non_empty(nhtsa, ["vin", "nhtsa_Make", "nhtsa_Model", "nhtsa_ModelYear"]).with_columns(
             [
                 pl.col("nhtsa_Make").cast(pl.Utf8).str.strip_chars().str.to_uppercase().alias("nhtsa_Make"),
                 pl.col("nhtsa_Model").cast(pl.Utf8).str.strip_chars().str.to_uppercase().alias("nhtsa_Model"),
