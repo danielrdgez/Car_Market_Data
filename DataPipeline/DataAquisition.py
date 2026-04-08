@@ -173,20 +173,32 @@ class VINCache:
 
     def __init__(self, db: CarDatabase):
         self._lock = threading.Lock()
-        self._seen: Set[str] = db.get_seen_vins()
+        self._seen: Dict[str, Dict] = db.get_seen_vins()
         logging.info(f"VINCache initialized with {len(self._seen)} existing VINs")
 
     def contains(self, vin: str, _loaddate: str = None) -> bool:
         with self._lock:
             return vin in self._seen
 
+    def should_insert(self, vin: str, price: Optional[float], mileage: Optional[int]) -> bool:
+        with self._lock:
+            if vin not in self._seen:
+                return True
+            cached = self._seen[vin]
+            if cached.get("price") != price or cached.get("mileage") != mileage:
+                return True
+            return False
+
     def add(self, vin: str):
         with self._lock:
-            self._seen.add(vin)
+            if vin not in self._seen:
+                self._seen[vin] = {}
 
-    def add_batch(self, vins: List[str]):
+    def add_batch(self, rows: List[Dict]):
         with self._lock:
-            self._seen.update(vins)
+            for r in rows:
+                if r.get("vin"):
+                    self._seen[r["vin"]] = {"price": r.get("price"), "mileage": r.get("mileage")}
 
     def size(self) -> int:
         with self._lock:
@@ -409,9 +421,8 @@ class ButtonScraper:
             api_rows = self._parse_performance_logs()
 
             if api_rows:
-                new_vins = [r["vin"] for r in api_rows if r.get("vin")]
                 inserted = self.db.insert_rows(api_rows, vin_cache=self.vin_cache)
-                self.vin_cache.add_batch(new_vins)
+                self.vin_cache.add_batch(api_rows)
                 self.metrics.rows_processed += len(api_rows)
                 self.metrics.rows_inserted += inserted
                 self.metrics.strike_count = 0
