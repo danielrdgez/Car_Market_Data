@@ -29,9 +29,11 @@ NHTSA_DROP_COLUMNS = {
     "nhtsa_complaint_deaths", "nhtsa_complaint_crash_related", "nhtsa_complaint_fire_related",
     "nhtsa_complaint_injuries", "nhtsa_side_crash_rating", "nhtsa_rollover_rating",
     "nhtsa_front_crash_rating", "nhtsa_overall_rating", "nhtsa_safety_ratings_count",
-    "nhtsa_FuelTankMaterial", "nhtsa_FuelTankType", "nhtsa_BasePrice",
+    "nhtsa_FuelTankMaterial", "nhtsa_FuelTankType",
     "nhtsa_AdditionalErrorText", "nhtsa_DisplacementCC", "nhtsa_DisplacementCI",
-    "nhtsa_ModelID", "nhtsa_ManufacturerId", "nhtsa_MakeID",
+    "nhtsa_ModelID", "nhtsa_ManufacturerId", "nhtsa_MakeID", 'nhtsa_SemiautomaticHeadlampBeamSwitching',
+    'nhtsa_LowerBeamHeadlampLightSource', 'nhtsa_EntertainmentSystem', 'nhtsa_DestinationMarket',
+    'nhtsa_BrakeSystemDesc'
 }
 
 PRICE_MIN = 1000
@@ -74,7 +76,7 @@ class DataCleaningPipeline:
             if col in df.columns:
                 df = df.filter(
                     pl.col(col).is_not_null()
-                    & (pl.col(col).cast(pl.Utf8).str.strip_chars() != "")
+                    & (pl.col(col).cast(pl.String).str.strip_chars() != "")
                 )
         return df
 
@@ -82,20 +84,20 @@ class DataCleaningPipeline:
     def _normalize_date_columns(df: pl.DataFrame, columns: Iterable[str]) -> pl.DataFrame:
         for col in columns:
             if col in df.columns:
-                base = pl.col(col).cast(pl.Utf8).str.strip_chars()
+                base = pl.col(col).cast(pl.String).str.strip_chars()
                 df = df.with_columns(
                     pl.coalesce(
                         [
-                            base.str.strptime(pl.Date, "%Y-%m-%d", strict=False),
-                            base.str.strptime(pl.Date, "%m/%d/%Y", strict=False),
-                            base.str.strptime(pl.Date, "%Y/%m/%d", strict=False),
-                            base.str.strptime(pl.Date, "%b %d %Y", strict=False),
-                            base.str.strptime(pl.Date, "%B %d %Y", strict=False),
-                            base.str.strptime(pl.Datetime, "%Y-%m-%d %H:%M:%S", strict=False).dt.date(),
-                            base.str.strptime(pl.Datetime, "%Y-%m-%d %H:%M:%S%.f", strict=False).dt.date(),
-                            base.str.strptime(pl.Datetime, "%Y-%m-%dT%H:%M:%S", strict=False).dt.date(),
-                            base.str.strptime(pl.Datetime, "%Y-%m-%dT%H:%M:%S%.f", strict=False).dt.date(),
-                            base.str.strptime(pl.Datetime, "%Y-%m-%dT%H:%M:%SZ", strict=False).dt.date(),
+                            base.str.to_date("%Y-%m-%d", strict=False),
+                            base.str.to_date("%m/%d/%Y", strict=False),
+                            base.str.to_date("%Y/%m/%d", strict=False),
+                            base.str.to_date("%b %d %Y", strict=False),
+                            base.str.to_date("%B %d %Y", strict=False),
+                            base.str.to_datetime("%Y-%m-%d %H:%M:%S", strict=False).dt.date(),
+                            base.str.to_datetime("%Y-%m-%d %H:%M:%S%.f", strict=False).dt.date(),
+                            base.str.to_datetime("%Y-%m-%dT%H:%M:%S", strict=False).dt.date(),
+                            base.str.to_datetime("%Y-%m-%dT%H:%M:%S%.f", strict=False).dt.date(),
+                            base.str.to_datetime("%Y-%m-%dT%H:%M:%SZ", strict=False).dt.date(),
                         ]
                     ).alias(col)
                 )
@@ -114,7 +116,7 @@ class DataCleaningPipeline:
             if col in df.columns:
                 df = df.with_columns(
                     pl.col(col)
-                    .cast(pl.Utf8)
+                    .cast(pl.String)
                     .str.strip_chars()
                     .str.replace_all(r"[\$,]", "")
                     .cast(pl.Float64, strict=False)
@@ -142,6 +144,24 @@ class DataCleaningPipeline:
         return df
 
     @staticmethod
+    def _cast_to_int(df: pl.DataFrame, columns: Iterable[str]) -> pl.DataFrame:
+        for col in columns:
+            if col in df.columns:
+                df = df.with_columns(
+                    pl.col(col).cast(pl.String).str.strip_chars().cast(pl.Float64, strict=False).cast(pl.Int64, strict=False).alias(col)
+                )
+        return df
+
+    @staticmethod
+    def _cast_to_float(df: pl.DataFrame, columns: Iterable[str]) -> pl.DataFrame:
+        for col in columns:
+            if col in df.columns:
+                df = df.with_columns(
+                    pl.col(col).cast(pl.String).str.strip_chars().cast(pl.Float64, strict=False).alias(col)
+                )
+        return df
+
+    @staticmethod
     def _insert_dataframe(
         conn: sqlite3.Connection,
         table_name: str,
@@ -161,6 +181,30 @@ class DataCleaningPipeline:
         conn.executemany(sql, rows)
         return len(rows)
 
+    @staticmethod
+    def _create_tables_from_polars(conn: sqlite3.Connection, table_configs: dict[str, tuple[pl.DataFrame, list[str]]]) -> None:
+        type_str_map = {
+            pl.Int64: "INTEGER",
+            pl.Float64: "REAL",
+            pl.String: "TEXT",
+            pl.Boolean: "BOOLEAN",
+            pl.Date: "DATE",
+            pl.Datetime: "TIMESTAMP"
+        }
+        for table_name, (df, pks) in table_configs.items():
+            cols = []
+            for name, dtype in df.schema.items():
+                sql_type = type_str_map.get(type(dtype), "TEXT")
+                cols.append(f'"{name}" {sql_type}')
+
+            if pks:
+                pk_str = ", ".join(f'"{k}"' for k in pks)
+                cols.append(f"PRIMARY KEY ({pk_str})")
+
+            columns_sql = ",\n    ".join(cols)
+            conn.execute(f"DROP TABLE IF EXISTS {table_name}")
+            conn.execute(f"CREATE TABLE {table_name} (\n    {columns_sql}\n)")
+
     def run(self) -> None:
         if not self.source_db_path.exists():
             raise FileNotFoundError(f"Source database not found: {self.source_db_path}")
@@ -168,9 +212,6 @@ class DataCleaningPipeline:
         logging.info("Starting cleaned database build")
         logging.info("Source DB: %s", self.source_db_path)
         logging.info("Target DB: %s", self.target_db_path)
-
-        # Create target DB file and schema identical to CAR_DATA.db.
-        CarDatabase(str(self.target_db_path)).close()
 
         with sqlite3.connect(str(self.source_db_path)) as source_conn:
             listings = self._read_table(source_conn, "listings")
@@ -187,13 +228,29 @@ class DataCleaningPipeline:
         listings = self._filter_non_null_numeric(listings, ["price", "mileage"])
         listings = self._filter_price_range(listings, "price")
 
+        listings = self._cast_to_int(listings, ["locationCode"])
+
         nhtsa = self._filter_non_empty(nhtsa, ["vin", "nhtsa_Make", "nhtsa_Model", "nhtsa_ModelYear"]).with_columns(
             [
-                pl.col("nhtsa_Make").cast(pl.Utf8).str.strip_chars().str.to_uppercase().alias("nhtsa_Make"),
-                pl.col("nhtsa_Model").cast(pl.Utf8).str.strip_chars().str.to_uppercase().alias("nhtsa_Model"),
+                pl.col("nhtsa_Make").cast(pl.String).str.strip_chars().str.to_uppercase().alias("nhtsa_Make"),
+                pl.col("nhtsa_Model").cast(pl.String).str.strip_chars().str.to_uppercase().alias("nhtsa_Model"),
+                pl.col("nhtsa_ModelYear").cast(pl.String).str.strip_chars().cast(pl.Float64, strict=False).cast(pl.Int64, strict=False).alias("nhtsa_ModelYear"),
             ]
         )
         nhtsa = nhtsa.filter(pl.col("nhtsa_Make").is_in(MAKE_WHITELIST_UPPER))
+
+        nhtsa = self._cast_to_int(nhtsa, [
+            "nhtsa_Axles", "nhtsa_BedLengthIN", "nhtsa_BasePrice", "nhtsa_ChargerPowerKW", 
+            "nhtsa_CurbWeightLB", "nhtsa_Doors", "nhtsa_EngineCycles", "nhtsa_EngineCylinders", 
+            "nhtsa_EngineHP", "nhtsa_EngineHP_to", "nhtsa_EngineKW", "nhtsa_SAEAutomationLevel", 
+            "nhtsa_SeatRows", "nhtsa_Seats", "nhtsa_TopSpeedMPH", "nhtsa_TransmissionSpeeds", 
+            "nhtsa_WheelSizeFront", "nhtsa_WheelSizeRear", "nhtsa_Windows", "nhtsa_WheelBaseLong", 
+            "nhtsa_WheelBaseShort"
+        ])
+        
+        nhtsa = self._cast_to_float(nhtsa, [
+            "nhtsa_DisplacementL", "nhtsa_TrackWidth"
+        ])
 
         scoped_listings = listings.join(nhtsa.select("vin"), on="vin", how="inner")
         scoped_vins = scoped_listings.select("vin").unique()
@@ -219,15 +276,17 @@ class DataCleaningPipeline:
         price_history = price_history.join(scoped_vins, on="vin", how="inner")
 
         with sqlite3.connect(str(self.target_db_path)) as target_conn:
-            target_conn.execute("DELETE FROM listing_history")
-            target_conn.execute("DELETE FROM price_history")
-            target_conn.execute("DELETE FROM nhtsa_enrichment")
-            target_conn.execute("DELETE FROM listings")
+            self._create_tables_from_polars(target_conn, {
+                "listings": (scoped_listings, ["vin", "loaddate"]),
+                "nhtsa_enrichment": (scoped_nhtsa, ["vin"]),
+                "listing_history": (listing_history, ["vin", "history_date", "price", "mileage"]),
+                "price_history": (price_history, ["vin", "history_date", "price"]),
+            })
 
             inserted_listings = self._insert_dataframe(target_conn, "listings", scoped_listings, conflict_mode="REPLACE")
             inserted_nhtsa = self._insert_dataframe(target_conn, "nhtsa_enrichment", scoped_nhtsa, conflict_mode="REPLACE")
-            inserted_listing_hist = self._insert_dataframe(target_conn, "listing_history", listing_history)
-            inserted_price_hist = self._insert_dataframe(target_conn, "price_history", price_history)
+            inserted_listing_hist = self._insert_dataframe(target_conn, "listing_history", listing_history, conflict_mode="IGNORE")
+            inserted_price_hist = self._insert_dataframe(target_conn, "price_history", price_history, conflict_mode="IGNORE")
             target_conn.commit()
 
         logging.info("Finished cleaned database build")
@@ -256,6 +315,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
-
 

@@ -37,7 +37,7 @@ class CarDatabase:
                     year INTEGER,
                     title TEXT,
                     details TEXT,
-                    price REAL,
+                    price INTEGER,
                     mileage INTEGER,
                     date DATE,
                     location TEXT,
@@ -65,7 +65,7 @@ class CarDatabase:
                     vin TEXT,
                     history_date DATE,
                     mileage INTEGER,
-                    price REAL,
+                    price INTEGER,
                     trend TEXT,
                     UNIQUE(vin, history_date, price),
                     FOREIGN KEY (vin) REFERENCES listings (vin)
@@ -79,7 +79,7 @@ class CarDatabase:
                     vin TEXT,
                     history_date DATE,
                     mileage REAL,
-                    price REAL,
+                    price INTEGER,
                     UNIQUE(vin, history_date, price, mileage),
                     FOREIGN KEY (vin) REFERENCES listings (vin)
                 )
@@ -235,9 +235,11 @@ class CarDatabase:
                 self._insert_price_history(cursor, vin, row.get('priceHistory'))
                 self._insert_listing_history(cursor, vin, row.get('listingHistory'))
 
-                # Listing snapshot can be skipped for VINs already seen today,
-                # but history above is still preserved.
-                if vin_cache is not None and vin_cache.contains(vin, today):
+                # Skip listing snapshot if we have the VIN cached and its price/mileage hasn't changed.
+                if vin_cache is not None and hasattr(vin_cache, "should_insert"):
+                    if not vin_cache.should_insert(vin, row.get('price'), row.get('mileage')):
+                        continue
+                elif vin_cache is not None and hasattr(vin_cache, "contains") and vin_cache.contains(vin, today):
                     continue
 
                 try:
@@ -297,9 +299,9 @@ class CarDatabase:
     def get_seen_vins(self):
         with self._get_connection() as conn:
             cursor = conn.cursor()
-            # If we want to avoid duplicates in the current run based on what's in the DB for TODAY
-            cursor.execute('SELECT vin FROM listings WHERE loaddate = ?', (date.today().isoformat(),))
-            return set(row[0] for row in cursor.fetchall())
+            # Get the latest price and mileage for each VIN
+            cursor.execute('SELECT vin, price, mileage, MAX(loaddate) FROM listings GROUP BY vin')
+            return {row[0]: {'price': row[1], 'mileage': row[2]} for row in cursor.fetchall()}
 
     def get_vins_for_enrichment(self):
         with self._get_connection() as conn:
