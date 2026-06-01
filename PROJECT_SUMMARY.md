@@ -1,19 +1,20 @@
 # PROJECT SUMMARY
 ## Car Market Data Pipeline
 
-Last Updated: March 5, 2026
+Last Updated: June 1, 2026
 
 ---
 
 ## Executive Overview
 
-This repository implements a production-grade data pipeline that captures vehicle listings from AutoTempest using Selenium with stealth configuration and Chrome DevTools Protocol (CDP) network interception. The pipeline stores raw listings in SQLite, enriches records using the NHTSA vPIC API, and supports downstream cleaning and analysis. The system prioritizes data integrity, performance stability, and operational resilience.
+This repository implements a production-grade data pipeline that captures vehicle listings from AutoTempest using Selenium with stealth configuration and Chrome DevTools Protocol (CDP) network interception. The pipeline enriches records with official NHTSA specifications and incorporates YouTube sentiment analysis for market sentiment tracking. It features an automated machine learning pipeline for price prediction and comprehensive EDA tools to analyze vehicle depreciation.
 
 Key objectives:
 - Capture listing data via API interception rather than HTML parsing.
-- Maintain consistent iteration performance during long-running sessions.
+- Enrich vehicle metadata with NHTSA vPIC API (Specs, Safety, Recalls).
+- Integrate NLP/Sentiment analysis on vehicle reviews and listing descriptions.
+- Predict residual values using advanced ML models (Random Forest, HistGradientBoosting).
 - Preserve data integrity through schema validation and transactional inserts.
-- Provide a clear, operationally focused workflow for data acquisition and enrichment.
 
 ---
 
@@ -26,7 +27,16 @@ Car-Price-Data-Visualization-Learning/
 │   ├── database.py
 │   ├── DataCleaning.py
 │   ├── NHTSA_enrichment.py
+│   ├── SentimentAnalysis.py  # YouTube API integration
 │   └── migrate_to_db.py
+├── EDA/
+│   ├── EDA_notebook.ipynb    # Interactive Plotly analysis
+│   ├── Depreciation_Analysis.py
+│   └── EDA_r.R               # R/ggplot2 analysis
+├── ML/
+│   ├── Price_ML_Models.py    # Training pipelines
+│   └── Model_Output.ipynb    # Model validation
+├── MODELS_OUTPUT/            # Serialized models (.joblib)
 ├── Utilities/
 │   ├── health_check.py
 │   ├── verify_schema.py
@@ -34,13 +44,20 @@ Car-Price-Data-Visualization-Learning/
 ├── CAR_DATA_OUTPUT/
 │   ├── CAR_DATA.db
 │   ├── CAR_DATA_CLEANED.db
-│   ├── scraping_*.log
-│   ├── nhtsa_enrichment_*.log
-│   └── cleaning_*.log
+│   └── *.log
 ├── requirements.txt
 ├── PROJECT_SUMMARY.md
 └── README.md
 ```
+
+---
+
+## Research Objectives
+
+The project is guided by three core research questions:
+1. **Safety & Depreciation:** To what extent does active safety technology (ADAS) and official safety ratings mitigate depreciation rates?
+2. **High-Dimensional Prediction:** Can we improve 5-year residual value prediction using rich NHTSA vehicle attributes?
+3. **Sentiment Integration:** Does the integration of NLP on listing descriptions and consumer reviews (YouTube) improve price prediction accuracy?
 
 ---
 
@@ -52,19 +69,20 @@ python Utilities\health_check.py
 python DataPipeline\DataAquisition.py
 python DataPipeline\NHTSA_enrichment.py
 python DataPipeline\DataCleaning.py
+python DataPipeline\SentimentAnalysis.py --video-id [VIDEO_ID]
+python ML\Price_ML_Models.py
 ```
 
 ---
 
 ## Architecture and Data Flow
 
-1. For each vehicle make, the orchestrator launches a `ButtonScrapingCoordinator` that spawns one dedicated browser instance per source button (autotempest, hemmings, cars, etc.) in parallel threads.
-2. Each `ButtonScraper` thread clicks its assigned button repeatedly until exhaustion (3 consecutive zero-row responses or button no longer clickable).
-3. CDP performance logs are parsed per-button to capture `queue-results` API responses.
-4. A thread-safe `VINCache` prevents duplicate inserts across all concurrent button workers. The database layer uses thread-local connections with a shared write lock.
-5. Listings are normalized and inserted into SQLite via `database.py` with transactional batch writes.
-6. Unenriched VINs are sent to NHTSA vPIC endpoints for specifications, safety ratings, recalls, and complaints.
-7. Data cleaning provides normalization for price, mileage, location, and time fields for analysis.
+1. **Acquisition:** Orchestrator launches parallel `ButtonScrapers` with Selenium Stealth. API responses are intercepted via CDP.
+2. **Deduplication:** A thread-safe `VINCache` prevents duplicate inserts across concurrent workers.
+3. **Enrichment:** Unenriched VINs are processed through the NHTSA vPIC API for specs, safety ratings, and recalls.
+4. **Sentiment Analysis:** The `SentimentAnalysis.py` module fetches transcripts and comments for specific vehicle-related YouTube videos.
+5. **Cleaning:** `DataCleaning.py` (Polars-based) normalizes price, mileage, and location fields.
+6. **Modeling:** `Price_ML_Models.py` trains various regressors (Elastic Net, Random Forest, HGBR) to predict prices based on enriched specs.
 
 Button execution order places the slowest sources (cars, other) last in the FIFO queue so faster buttons finish while heavy buttons continue in parallel.
 
@@ -89,6 +107,7 @@ Supporting tables:
 - `price_history` for price trajectory.
 - `listing_history` for mileage and availability changes.
 - `nhtsa_enrichment` for static vehicle specifications and safety metadata.
+- YouTube data is currently exported to CSV in `CAR_DATA_OUTPUT/` for downstream sentiment processing.
 
 Schema validation:
 - Use `Utilities/verify_schema.py` to verify the current database structure.
@@ -96,21 +115,16 @@ Schema validation:
 
 ---
 
-## Performance Stabilization
+## Performance and Modeling
 
-Observed issue:
-- Single-browser button cycling caused slowdowns as DOM grew from repeated clicks across all sources. Buttons with large result sets (cars, other) degraded the shared browser instance.
+### Scraping Stabilization
+- Per-button browser isolation prevents DOM bloat.
+- Thread-safe write locks ensure database integrity during high-concurrency scraping.
 
-Fixes implemented:
-- Per-button browser isolation: each button runs in its own Chrome instance, preventing DOM bloat from affecting other buttons.
-- Parallel button execution via `ThreadPoolExecutor` with configurable concurrency (default 4 workers per make).
-- Clear CDP performance logs every iteration per button.
-- Thread-safe VIN cache with database-backed deduplication prevents redundant inserts across threads.
-- No artificial click limits; buttons run to true exhaustion (3 zero-row strikes).
-
-Result:
-- Consistent per-button iteration times regardless of other buttons' progress.
-- Faster overall completion since slow buttons (cars, other) no longer block fast buttons.
+### Machine Learning
+- **Models:** Elastic Net, Random Forest, Hist Gradient Boosting.
+- **Preprocessing:** Automatic handling of categorical features (OHE/Ordinal) and numeric scaling.
+- **Validation:** Grouped 80/20 train/test split (grouped by Make-Model-Year) to ensure robust evaluation.
 
 ---
 
@@ -129,6 +143,16 @@ python DataPipeline\NHTSA_enrichment.py
 ### Data Cleaning
 ```bash
 python DataPipeline\DataCleaning.py
+```
+
+### Sentiment Analysis
+```bash
+python DataPipeline\SentimentAnalysis.py --video-id [ID]
+```
+
+### Machine Learning Training
+```bash
+python ML\Price_ML_Models.py
 ```
 
 ### Schema Validation
@@ -186,9 +210,10 @@ Edit the `ScrapingConfig` dataclass inside `DataPipeline/DataAquisition.py` to a
 
 ## Change Log
 
-- Refactored DataAquisition.py to per-button parallel architecture: each source button gets a dedicated browser instance running in its own thread, eliminating DOM bloat slowdowns.
-- Added thread-safe VINCache and database write locking for concurrent button workers.
-- Removed click limits and driver restart logic; buttons now run to true exhaustion via strike counting.
-- Updated database.py with thread_safe mode using thread-local connections and a shared write lock.
-- Consolidated documentation into a single `PROJECT_SUMMARY.md` and a concise `README.md`.
-- Moved utility scripts to `Utilities/` for separation from pipeline code.
+- **June 1, 2026:** Integrated Sentiment Analysis and Machine Learning pipelines into core documentation.
+- **May 21, 2026:** Migrated DataCleaning to Polars/Pandas hybrid and updated NHTSA retry logic.
+- **Refactored DataAquisition.py** to per-button parallel architecture: each source button gets a dedicated browser instance running in its own thread, eliminating DOM bloat slowdowns.
+- **Added thread-safe VINCache** and database write locking for concurrent button workers.
+- **Updated database.py** with thread_safe mode using thread-local connections and a shared write lock.
+- **Consolidated documentation** into `PROJECT_SUMMARY.md` and `README.md`.
+- **Moved utility scripts** to `Utilities/`.

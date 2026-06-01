@@ -2,6 +2,8 @@ ipykernel>=6.0.0
 numpy>=2.1.0
 nbformat>=4.2.0
 pandas==2.3.2
+google-api-python-client>=2.100.0
+youtube-transcript-api>=0.6.2
 polars>=1.0.0
 plotly>=5.14.0
 requests==2.32.5
@@ -9,3 +11,5 @@ selenium==4.35.0
 selenium-stealth==1.0.6
 urllib3==2.5.0
 shap>=0.40.0
+scikit-learn>=1.0.0
+joblib>=1.1.0

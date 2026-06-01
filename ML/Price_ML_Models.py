@@ -186,51 +186,51 @@ def main():
     preprocessor_linear, preprocessor_tree, preprocessor_hgbr, num_len, hgbr_categorical_mask = build_pipelines(X_train)
 
     # 4. Hist Gradient Boosting
-    print("Tuning and Training Hist Gradient Boosting...")
+    #print("Tuning and Training Hist Gradient Boosting...")
     
-    hgb_net = Pipeline(steps=[
-        ('preprocessor', preprocessor_hgbr),
-        ('model', HistGradientBoostingRegressor(random_state=42, categorical_features=hgbr_categorical_mask))
-    ])
-    hgb_param_grid = {
-        'model__learning_rate': [0.01, 0.05, 0.1, 0.2],
-        'model__max_iter': [100, 250, 500, 1000],
-        'model__max_depth': [3, 5, 9, 15, None]
-    }
-    hgb_search = RandomizedSearchCV(hgb_net, hgb_param_grid, n_iter=15, cv=3, scoring='neg_root_mean_squared_error', n_jobs=-1, random_state=42, verbose=1)
-    hgb_search.fit(X_train, y_train)
-    print(f"Best HGBR params: {hgb_search.best_params_}")
-    evaluate_model("Hist Gradient Boosting", hgb_search.best_estimator_, X_test, y_test)
-    joblib.dump(hgb_search.best_estimator_, OUTPUT_DIR / 'Hist_Gradient_Boosting_Tuned.joblib')
+    #hgb_net = Pipeline(steps=[
+    #    ('preprocessor', preprocessor_hgbr),
+    #    ('model', HistGradientBoostingRegressor(random_state=42, categorical_features=hgbr_categorical_mask))
+    #])
+    #hgb_param_grid = {
+    #    'model__learning_rate': [0.01, 0.05, 0.1, 0.2],
+    #    'model__max_iter': [100, 250, 500, 1000],
+    #    'model__max_depth': [3, 5, 9, 15, None]
+    #}
+    #hgb_search = RandomizedSearchCV(hgb_net, hgb_param_grid, n_iter=15, cv=3, scoring='neg_root_mean_squared_error', n_jobs=-1, random_state=42, verbose=1)
+    #hgb_search.fit(X_train, y_train)
+    #print(f"Best HGBR params: {hgb_search.best_params_}")
+    #evaluate_model("Hist Gradient Boosting", hgb_search.best_estimator_, X_test, y_test)
+    #joblib.dump(hgb_search.best_estimator_, OUTPUT_DIR / 'Hist_Gradient_Boosting_Tuned.joblib')
 
     # 3. Random Forest
-    print("Tuning and Training Random Forest...")
-    rf_net = Pipeline(steps=[
-        ('preprocessor', preprocessor_tree),
-        ('model', RandomForestRegressor(random_state=42, n_jobs=-1))
-    ])
-    rf_param_grid = {
-        'model__n_estimators': [100, 200, 300],
-        'model__max_depth': [10, 20, 30, None],
-        'model__min_samples_split': [2, 5, 10]
-    }
+    #print("Tuning and Training Random Forest...")
+    #rf_net = Pipeline(steps=[
+    #    ('preprocessor', preprocessor_tree),
+    #    ('model', RandomForestRegressor(random_state=42, n_jobs=-1))
+    #])
+    #rf_param_grid = {
+    #    'model__n_estimators': [100, 200, 300],
+    #    'model__max_depth': [10, 20, 30, None],
+    #    'model__min_samples_split': [2, 5, 10]
+    #}
     # Using 5 iterations to save time, exhaustion balanced with computational limits
-    rf_search = RandomizedSearchCV(rf_net, rf_param_grid, n_iter=5, cv=3, scoring='neg_root_mean_squared_error', n_jobs=-1, random_state=42, verbose=1)
-    rf_search.fit(X_train, y_train)
-    print(f"Best Random Forest params: {rf_search.best_params_}")
-    evaluate_model("Random Forest", rf_search.best_estimator_, X_test, y_test)
-    joblib.dump(rf_search.best_estimator_, OUTPUT_DIR / 'Random_Forest_Tuned.joblib')
+    #rf_search = RandomizedSearchCV(rf_net, rf_param_grid, n_iter=5, cv=3, scoring='neg_root_mean_squared_error', n_jobs=-1, random_state=42, verbose=1)
+    #rf_search.fit(X_train, y_train)
+    #print(f"Best Random Forest params: {rf_search.best_params_}")
+    #evaluate_model("Random Forest", rf_search.best_estimator_, X_test, y_test)
+    #joblib.dump(rf_search.best_estimator_, OUTPUT_DIR / 'Random_Forest_Tuned.joblib')
 
 
     # 1. Multiple Linear Regression (Interpretability)
-    print("Training Multiple Linear Regression...")
-    ml_reg = Pipeline(steps=[
-        ('preprocessor', preprocessor_linear),
-        ('model', LinearRegression(n_jobs=-1))
-    ])
-    ml_reg.fit(X_train, y_train)
-    evaluate_model("Multiple Linear Regression", ml_reg, X_test, y_test)
-    joblib.dump(ml_reg, OUTPUT_DIR / 'Multiple_Linear_Regression.joblib')
+    #print("Training Multiple Linear Regression...")
+    #ml_reg = Pipeline(steps=[
+    #    ('preprocessor', preprocessor_linear),
+    #    ('model', LinearRegression(n_jobs=-1))
+    #])
+    #ml_reg.fit(X_train, y_train)
+    #evaluate_model("Multiple Linear Regression", ml_reg, X_test, y_test)
+    #joblib.dump(ml_reg, OUTPUT_DIR / 'Multiple_Linear_Regression.joblib')
 
     # 2. Elastic Net (Regularized MLR)
     print("Tuning and Training Elastic Net...")
@@ -240,7 +240,7 @@ def main():
     ])
     ela_param_grid = {
         'model__alpha': [0.1, 1.0, 10.0, 100.0],
-        'model__l1_ratio': [0.1, 0.5, 0.7, 0.9, 0.99]
+        'model__l1_ratio': [0.0001, 0.001, 0.1, 0.5]
     }
     ela_search = RandomizedSearchCV(ela_net, ela_param_grid, n_iter=10, cv=3, scoring='neg_root_mean_squared_error', n_jobs=-1, random_state=42, verbose=1)
     ela_search.fit(X_train, y_train)

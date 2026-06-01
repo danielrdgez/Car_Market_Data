@@ -84,7 +84,7 @@ class ScrapingConfig:
     MIN_WAIT_BETWEEN_ITERATIONS: float = 2.1
     MAX_WAIT_BETWEEN_ITERATIONS: float = 4.5
 
-    HEADLESS: bool = True
+    HEADLESS: bool = False
     PAGE_LOAD_TIMEOUT: int = 60
 
     def get_base_url(self, make: str) -> str:
