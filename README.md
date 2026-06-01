@@ -1,6 +1,6 @@
 # Car Market Data Pipeline & Visualization
 
-A production-grade data pipeline that scrapes car listings from AutoTempest and enriches them with NHTSA specifications, safety ratings, recalls, and complaints. The scraper uses per-button parallel browser instances with Selenium stealth configuration, capturing JSON via CDP performance log interception. Each source button (autotempest, hemmings, cars, etc.) runs in its own dedicated thread with an isolated browser, clicking until true exhaustion. A thread-safe VIN cache and locked database writes ensure data integrity across concurrent workers.
+A production-grade data pipeline that scrapes car listings from AutoTempest and enriches them with NHTSA specifications, safety ratings, recalls, and complaints. The project features sentiment analysis of YouTube reviews, machine learning for price prediction, and comprehensive exploratory data analysis.
 
 For the full technical documentation, workflows, and detailed troubleshooting, see `PROJECT_SUMMARY.md`.
 
@@ -13,6 +13,12 @@ python Utilities\health_check.py
 python DataPipeline\DataAquisition.py
 python DataPipeline\NHTSA_enrichment.py
 python DataPipeline\DataCleaning.py
+
+# Optional: Sentiment Analysis
+python DataPipeline\SentimentAnalysis.py --video-id [VIDEO_ID]
+
+# Optional: Machine Learning
+python ML\Price_ML_Models.py
 ```
 
 ### Notebook Troubleshooting
@@ -26,13 +32,11 @@ python -m ipykernel install --user --name car-market-data --display-name "Python
 
 Then select `Python (car-market-data)` as the kernel for `EDA/EDA_notebook.ipynb`.
 
-### Shiny Dashboard (Visualization)
+### Data Analysis & Visualization
 
-```r
-# In R or RStudio
-source("Visualizations/requirements.R")  # First time only
-shiny::runApp("EDA")
-```
+- **Python (Plotly):** Use `EDA/EDA_notebook.ipynb` for interactive exploratory data analysis.
+- **Python (Depreciation):** Use `EDA/Depreciation_Analysis.py` to calculate and visualize vehicle depreciation metrics.
+- **R (ggplot2):** Use `EDA/EDA_r.R` for statistical analysis and visualization in R.
 
 ## Repository Layout
 
@@ -43,22 +47,24 @@ Car-Price-Data-Visualization-Learning/
 │   ├── database.py
 │   ├── DataCleaning.py
 │   ├── NHTSA_enrichment.py
+│   ├── SentimentAnalysis.py
 │   └── migrate_to_db.py
-├── Visualizations/
-│   ├── app.R                 # Shiny dashboard application
-│   ├── requirements.R        # R package dependencies
-│   ├── README.md            # Dashboard documentation
-│   └── QUICKSTART.md        # Quick start guide
+├── EDA/
+│   ├── EDA_notebook.ipynb    # Main Python EDA
+│   ├── Depreciation_Analysis.py
+│   └── EDA_r.R               # R Analysis script
+├── ML/
+│   ├── Price_ML_Models.py    # Training pipelines
+│   └── Model_Output.ipynb    # Evaluation
+├── MODELS_OUTPUT/            # Trained model binaries (.joblib)
 ├── Utilities/
 │   ├── health_check.py
 │   ├── verify_schema.py
 │   └── fix_database_schema.py
 ├── CAR_DATA_OUTPUT/
-│   ├── CAR_DATA.db
-│   ├── CAR_DATA_CLEANED.db
-│   ├── scraping_*.log
-│   ├── nhtsa_enrichment_*.log
-│   └── cleaning_*.log
+│   ├── CAR_DATA.db           # Raw scraped data
+│   ├── CAR_DATA_CLEANED.db   # Cleaned & joined data
+│   └── *.log                 # Operation logs
 ├── PROJECT_SUMMARY.md
 └── README.md
 ```
@@ -74,23 +80,21 @@ Update the `ScrapingConfig` dataclass in `DataPipeline/DataAquisition.py` for ZI
 python DataPipeline\DataAquisition.py
 python DataPipeline\NHTSA_enrichment.py
 python DataPipeline\DataCleaning.py
+python DataPipeline\SentimentAnalysis.py --video-id [ID]
+python ML\Price_ML_Models.py
 python Utilities\verify_schema.py
 python Utilities\fix_database_schema.py
 ```
 
-### R Shiny Dashboard
+### R Analysis
 
 ```r
-# Install dependencies (first time only)
-source("Visualizations/requirements.R")
-
-# Run the dashboard
-shiny::runApp("EDA")
+# Load data and generate plots
+source("EDA/EDA_r.R")
 ```
-
-See `Visualizations/QUICKSTART.md` for detailed dashboard instructions.
 
 ## Notes
 
-- `PROJECT_SUMMARY.md` consolidates the previous documentation set.
+- `PROJECT_SUMMARY.md` consolidates the technical documentation for the entire pipeline.
+- Sentiment analysis requires a YouTube API key in a `.env` file or environment variable.
 - Utility scripts were moved to `Utilities/` to keep `DataPipeline/` focused on core pipeline code.
