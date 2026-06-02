@@ -9,6 +9,8 @@ import pandas as pd
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
+from database import YouTubeCommentsDatabase # Import YouTubeCommentsDatabase
+
 BASE_COLUMNS = [
     "video_id",
     "video_title",
@@ -44,24 +46,6 @@ DEFAULT_PLAYLIST_IDS: List[str] = ['PLdmWqCdsjCu4xf48gB1CvyGXHApkEj8ck', 'PLdmWq
                                    'PLuLtF2Rwd40U_7Tiia8CFUr62nXVrfQN-']
 DEFAULT_VIDEO_IDS: List[str] = []
 
-def resolve_output_path(
-    output_csv: Optional[str],
-    video_id: Optional[str] = None,
-    playlist_id: Optional[str] = None,
-) -> Path:
-    if output_csv:
-        return Path(output_csv)
-    repo_root = Path(__file__).resolve().parent.parent
-    output_dir = repo_root / "CAR_DATA_OUTPUT"
-    output_dir.mkdir(parents=True, exist_ok=True)
-    stamp = date.today().isoformat()
-    if playlist_id:
-        return output_dir / f"youtube_sentiment_playlist_{playlist_id}_{stamp}.csv"
-    if not video_id:
-        raise ValueError("Either video_id or playlist_id is required for output naming.")
-    return output_dir / f"youtube_sentiment_{video_id}_{stamp}.csv"
-
-
 def _read_key_from_env_file(env_path: Path) -> Optional[str]:
     try:
         for raw_line in env_path.read_text(encoding="utf-8").splitlines():
@@ -79,14 +63,17 @@ def _read_key_from_env_file(env_path: Path) -> Optional[str]:
 def load_api_key(api_key_file: Optional[str] = None) -> Optional[str]:
     key = os.getenv("YOUTUBE_API_KEY") or os.getenv("GOOGLE_API_KEY")
     if key:
+        logging.info("API key loaded from environment variable.")
         return key.strip()
 
     env_path = Path(__file__).resolve().parent.parent / ".env"
     env_key = _read_key_from_env_file(env_path)
     if env_key:
+        logging.info("API key loaded from .env file at: %s", env_path)
         return env_key
 
     if api_key_file:
+        logging.info("Attempting to load API key from file: %s", api_key_file)
         try:
             return Path(api_key_file).read_text(encoding="utf-8").strip() or None
         except FileNotFoundError:
@@ -96,7 +83,7 @@ def load_api_key(api_key_file: Optional[str] = None) -> Optional[str]:
 
 def fetch_comments(
     video_id: str,
-    api_key: str,
+    api_key: str, # api_key is now passed directly
     max_comments: int,
     order: str,
     video_title: Optional[str] = None,
@@ -149,7 +136,7 @@ def fetch_comments(
     return comments
 
 
-def fetch_video_title(video_id: str, api_key: str) -> Optional[str]:
+def fetch_video_title(video_id: str, api_key: str) -> Optional[str]: # api_key is now passed directly
     youtube = build("youtube", "v3", developerKey=api_key, cache_discovery=False)
     request = youtube.videos().list(part="snippet", id=video_id, maxResults=1)
     response = request.execute()
@@ -161,7 +148,7 @@ def fetch_video_title(video_id: str, api_key: str) -> Optional[str]:
 
 def fetch_playlist_videos(
     playlist_id: str,
-    api_key: str,
+    api_key: str, # api_key is now passed directly
     max_videos: int,
 ) -> List[Dict]:
     youtube = build("youtube", "v3", developerKey=api_key, cache_discovery=False)
@@ -209,26 +196,22 @@ def build_dataframe(rows: Iterable[Dict]) -> pd.DataFrame:
     return df
 
 
-def export_to_csv(df: pd.DataFrame, output_path: Path) -> None:
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    df.to_csv(output_path, index=False)
-
-
 def run_pipeline(
     video_id: str,
     max_comments: int,
     order: str,
-    output_csv: Optional[str],
-    api_key_file: Optional[str],
+    db_path: Path,
+    api_key: str, # api_key is now passed directly
 ) -> Path:
     extracted_at = datetime.now(timezone.utc).isoformat()
     rows: List[Dict] = []
 
-    api_key = load_api_key(api_key_file)
-    if not api_key:
-        raise ValueError(
-            "Missing API key. Set YOUTUBE_API_KEY/GOOGLE_API_KEY or use --api-key-file."
-        )
+    # Removed redundant load_api_key call
+    # api_key = load_api_key(api_key_file)
+    # if not api_key:
+    #     raise ValueError(
+    #         "Missing API key. Set YOUTUBE_API_KEY/GOOGLE_API_KEY or use --api-key-file."
+    #     )
 
     video_title = None
     try:
@@ -245,9 +228,14 @@ def run_pipeline(
         row["extracted_at"] = extracted_at
 
     df = build_dataframe(rows)
-    output_path = resolve_output_path(output_csv, video_id=video_id)
-    export_to_csv(df, output_path)
-    return output_path
+    
+    # Initialize database and insert data
+    db = YouTubeCommentsDatabase(str(db_path))
+    inserted_count = db.insert_sentiment_data(df, table_name='youtube_comments_sentiment')
+    db.close()
+
+    logging.info(f"Inserted {inserted_count} comments into {db_path}")
+    return db_path
 
 
 def run_playlist_pipeline(
@@ -255,14 +243,15 @@ def run_playlist_pipeline(
     max_videos: int,
     max_comments: int,
     order: str,
-    output_csv: Optional[str],
-    api_key_file: Optional[str],
+    db_path: Path,
+    api_key: str, # api_key is now passed directly
 ) -> Path:
-    api_key = load_api_key(api_key_file)
-    if not api_key:
-        raise ValueError(
-            "Missing API key. Set YOUTUBE_API_KEY/GOOGLE_API_KEY or use --api-key-file."
-        )
+    # Removed redundant load_api_key call
+    # api_key = load_api_key(api_key_file)
+    # if not api_key:
+    #     raise ValueError(
+    #         "Missing API key. Set YOUTUBE_API_KEY/GOOGLE_API_KEY or use --api-key-file."
+    #     )
 
     videos = fetch_playlist_videos(playlist_id, api_key, max_videos)
     if not videos:
@@ -289,14 +278,19 @@ def run_playlist_pipeline(
         row["extracted_at"] = extracted_at
 
     df = build_dataframe(rows)
-    output_path = resolve_output_path(output_csv, playlist_id=playlist_id)
-    export_to_csv(df, output_path)
-    return output_path
+
+    # Initialize database and insert data
+    db = YouTubeCommentsDatabase(str(db_path))
+    inserted_count = db.insert_sentiment_data(df, table_name='youtube_comments_sentiment')
+    db.close()
+
+    logging.info(f"Inserted {inserted_count} comments into {db_path}")
+    return db_path
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Fetch YouTube comments and save sentiment-ready CSV using the official API."
+        description="Fetch YouTube comments and save sentiment-ready data to a SQL database using the official API."
     )
     parser.add_argument("--video-id", help="YouTube video id")
     parser.add_argument("--playlist-id", help="YouTube playlist id")
@@ -319,62 +313,74 @@ def main() -> None:
         help="Ordering for comments",
     )
     parser.add_argument("--api-key-file", help="Path to API key file")
-    parser.add_argument("--output-csv", help="Output CSV path")
+    parser.add_argument(
+        "--output-db",
+        default=os.path.join(Path(__file__).resolve().parent.parent, "CAR_DATA_OUTPUT", "CAR_YOUTUBE_COMMENTS.db"),
+        help="Output SQLite database path (default: CAR_DATA_OUTPUT/CAR_YOUTUBE_COMMENTS.db)"
+    )
 
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(levelname)s - %(message)s")
+
+    db_path = Path(args.output_db) # Convert to Path object
+
+    # Load API key once at the beginning of main
+    api_key = load_api_key(args.api_key_file)
+    if not api_key:
+        raise ValueError(
+            "Missing API key. Set YOUTUBE_API_KEY/GOOGLE_API_KEY or use --api-key-file."
+        )
 
     if bool(args.video_id) == bool(args.playlist_id):
         if args.video_id or args.playlist_id:
             raise ValueError("Provide exactly one of --video-id or --playlist-id.")
         if DEFAULT_PLAYLIST_IDS:
             for playlist_id in DEFAULT_PLAYLIST_IDS:
-                output_path = run_playlist_pipeline(
+                output_target = run_playlist_pipeline(
                     playlist_id=playlist_id,
                     max_videos=args.max_videos,
                     max_comments=args.max_comments,
                     order=args.comment_order,
-                    output_csv=args.output_csv,
-                    api_key_file=args.api_key_file,
+                    db_path=db_path,
+                    api_key=api_key, # Pass the loaded API key
                 )
-                print(f"Wrote CSV: {output_path}")
+                print(f"Wrote data to DB: {output_target}")
             return
         if DEFAULT_VIDEO_IDS:
             for video_id in DEFAULT_VIDEO_IDS:
-                output_path = run_pipeline(
+                output_target = run_pipeline(
                     video_id=video_id,
                     max_comments=args.max_comments,
                     order=args.comment_order,
-                    output_csv=args.output_csv,
-                    api_key_file=args.api_key_file,
+                    db_path=db_path,
+                    api_key=api_key, # Pass the loaded API key
                 )
-                print(f"Wrote CSV: {output_path}")
+                print(f"Wrote data to DB: {output_target}")
             return
         raise ValueError(
             "Provide --video-id/--playlist-id or populate DEFAULT_PLAYLIST_IDS/DEFAULT_VIDEO_IDS."
         )
 
     if args.playlist_id:
-        output_path = run_playlist_pipeline(
+        output_target = run_playlist_pipeline(
             playlist_id=args.playlist_id,
             max_videos=args.max_videos,
             max_comments=args.max_comments,
             order=args.comment_order,
-            output_csv=args.output_csv,
-            api_key_file=args.api_key_file,
+            db_path=db_path,
+            api_key=api_key, # Pass the loaded API key
         )
     else:
-        output_path = run_pipeline(
+        output_target = run_pipeline(
             video_id=args.video_id,
             max_comments=args.max_comments,
             order=args.comment_order,
-            output_csv=args.output_csv,
-            api_key_file=args.api_key_file,
+            db_path=db_path,
+            api_key=api_key, # Pass the loaded API key
         )
 
-    print(f"Wrote CSV: {output_path}")
+    print(f"Wrote data to DB: {output_target}")
 
 
 if __name__ == "__main__":
     main()
-# Added a comment to force Git to recognize this file.

@@ -4,6 +4,8 @@ import threading
 from datetime import date
 from typing import Optional, List
 
+import pandas as pd # Import pandas for to_sql method
+
 class CarDatabase:
     def __init__(self, db_path, thread_safe=False):
         self.db_path = db_path
@@ -363,4 +365,88 @@ class CarDatabase:
                 logging.info("Database connection closed")
             except Exception as e:
                 logging.error(f"Error closing database connection: {e}")
+            self.conn = None
+
+
+class YouTubeCommentsDatabase:
+    def __init__(self, db_path: str):
+        self.db_path = db_path
+        self.conn = None
+        self._init_db()
+
+    def _get_connection(self):
+        if self.conn is None:
+            self.conn = sqlite3.connect(self.db_path, timeout=30)
+        return self.conn
+
+    def _init_db(self):
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS youtube_comments_sentiment (
+                    video_id TEXT,
+                    video_title TEXT,
+                    source TEXT,
+                    text TEXT,
+                    extracted_at TEXT,
+                    comment_id TEXT PRIMARY KEY,
+                    author TEXT,
+                    like_count INTEGER,
+                    reply_count INTEGER,
+                    published_at TEXT,
+                    updated_at TEXT
+                )
+            ''')
+            conn.commit()
+
+    def insert_sentiment_data(self, df: pd.DataFrame, table_name: str = 'youtube_comments_sentiment'):
+        """
+        Inserts a pandas DataFrame into the specified SQL table,
+        only adding new comments and avoiding duplicates based on comment_id.
+        """
+        if df.empty:
+            logging.info(f"No data to insert into {table_name}.")
+            return 0
+
+        with self._get_connection() as conn:
+            # Format date columns to MM-DD-YYYY for TEXT type
+            for col in ['extracted_at', 'published_at', 'updated_at']:
+                if col in df.columns and not df[col].empty:
+                    df[col] = pd.to_datetime(df[col], errors='coerce', utc=True).dt.strftime('%m-%d-%Y')
+
+            try:
+                # Fetch existing comment_ids
+                existing_comment_ids = pd.read_sql(f"SELECT comment_id FROM {table_name}", conn)['comment_id'].tolist()
+                
+                # Filter out comments that already exist in the database
+                new_comments_df = df[~df['comment_id'].isin(existing_comment_ids)]
+
+                if new_comments_df.empty:
+                    logging.info(f"No new comments to insert into {table_name}.")
+                    return 0
+
+                # Insert only new comments
+                new_comments_df.to_sql(table_name, conn, if_exists='append', index=False)
+                logging.info(f"Successfully inserted {len(new_comments_df)} new rows into {table_name}.")
+                return len(new_comments_df)
+            except pd.io.sql.DatabaseError as e:
+                # This error can occur if the table does not exist yet,
+                # which is handled by _init_db, but might happen if table was dropped externally.
+                # In this case, just append all data.
+                logging.warning(f"Table {table_name} might not exist or other DB error. Attempting full insert: {e}")
+                df.to_sql(table_name, conn, if_exists='append', index=False)
+                logging.info(f"Successfully inserted {len(df)} rows into {table_name} (full insert).")
+                return len(df)
+            except Exception as e:
+                logging.error(f"Failed to insert sentiment data into {table_name}: {e}")
+                return 0
+
+    def close(self):
+        """Close the database connection"""
+        if self.conn:
+            try:
+                self.conn.close()
+                logging.info("YouTube Comments Database connection closed")
+            except Exception as e:
+                logging.error(f"Error closing YouTube Comments Database connection: {e}")
             self.conn = None
