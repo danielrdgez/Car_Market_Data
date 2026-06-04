@@ -2,7 +2,7 @@ import sqlite3
 import logging
 import threading
 from datetime import date
-from typing import Optional, List
+from typing import Optional, List, Set
 
 import pandas as pd # Import pandas for to_sql method
 
@@ -385,6 +385,7 @@ class YouTubeCommentsDatabase:
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS youtube_comments_sentiment (
                     video_id TEXT,
+                    playlist_id TEXT, -- Added playlist_id column
                     video_title TEXT,
                     source TEXT,
                     text TEXT,
@@ -440,6 +441,24 @@ class YouTubeCommentsDatabase:
             except Exception as e:
                 logging.error(f"Failed to insert sentiment data into {table_name}: {e}")
                 return 0
+
+    def get_processed_video_ids(self, table_name: str = 'youtube_comments_sentiment') -> Set[str]:
+        """Retrieves a set of all video_ids already present in the sentiment table."""
+        with self._get_connection() as conn:
+            try:
+                return set(pd.read_sql(f"SELECT DISTINCT video_id FROM {table_name} WHERE video_id IS NOT NULL", conn)['video_id'].tolist())
+            except pd.io.sql.DatabaseError:
+                # Table might not exist yet, return empty set
+                return set()
+
+    def get_processed_playlist_ids(self, table_name: str = 'youtube_comments_sentiment') -> Set[str]:
+        """Retrieves a set of all playlist_ids already present in the sentiment table."""
+        with self._get_connection() as conn:
+            try:
+                return set(pd.read_sql(f"SELECT DISTINCT playlist_id FROM {table_name} WHERE playlist_id IS NOT NULL", conn)['playlist_id'].tolist())
+            except pd.io.sql.DatabaseError:
+                # Table might not exist yet, return empty set
+                return set()
 
     def close(self):
         """Close the database connection"""
