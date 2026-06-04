@@ -1,9 +1,11 @@
 import argparse
 import logging
 import os
+import time # Import time for sleep
 from datetime import date, datetime, timezone
+from functools import wraps # Import wraps for decorator
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional
+from typing import Dict, Iterable, List, Optional, Callable, Any
 
 import pandas as pd
 from googleapiclient.discovery import build
@@ -13,6 +15,7 @@ from database import YouTubeCommentsDatabase # Import YouTubeCommentsDatabase
 
 BASE_COLUMNS = [
     "video_id",
+    "playlist_id", # Added playlist_id to BASE_COLUMNS
     "video_title",
     "source",
     "text",
@@ -45,6 +48,32 @@ DEFAULT_PLAYLIST_IDS: List[str] = ['PLdmWqCdsjCu4xf48gB1CvyGXHApkEj8ck', 'PLdmWq
                                    'PLVa4b_Vn4gbBWaieOY6Z_zd37XlbHvsG6', 'PLVa4b_Vn4gbDD5IrxxVnYU7GVr_xjp9Zx', 'PLVa4b_Vn4gbCcL-FHtFY9837w0Hw5mAiG',
                                    'PLuLtF2Rwd40U_7Tiia8CFUr62nXVrfQN-']
 DEFAULT_VIDEO_IDS: List[str] = []
+
+def retry_with_exponential_backoff(max_retries: int = 5, base_delay: float = 1.0):
+    """
+    Decorator to retry a function with exponential backoff on HttpError (403 Forbidden).
+    """
+    def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
+        @wraps(func)
+        def wrapper(*args: Any, **kwargs: Any) -> Any:
+            for i in range(max_retries):
+                try:
+                    return func(*args, **kwargs)
+                except HttpError as e:
+                    if e.resp.status == 403: # Quota Exceeded
+                        delay = base_delay * (2 ** i)
+                        logging.warning(f"Quota exceeded for {func.__name__}. Retrying in {delay:.2f} seconds... (Attempt {i+1}/{max_retries})")
+                        time.sleep(delay)
+                    else:
+                        raise # Re-raise other HttpErrors
+                except Exception as e:
+                    logging.error(f"An unexpected error occurred in {func.__name__}: {e}")
+                    raise
+            logging.error(f"Max retries ({max_retries}) exceeded for {func.__name__}.")
+            raise HttpError(resp=None, content=b"Max retries exceeded for API call due to quota.") # Custom error if all retries fail
+        return wrapper
+    return decorator
+
 
 def _read_key_from_env_file(env_path: Path) -> Optional[str]:
     try:
@@ -81,12 +110,14 @@ def load_api_key(api_key_file: Optional[str] = None) -> Optional[str]:
     return None
 
 
+@retry_with_exponential_backoff()
 def fetch_comments(
     video_id: str,
-    api_key: str, # api_key is now passed directly
+    api_key: str,
     max_comments: int,
     order: str,
     video_title: Optional[str] = None,
+    playlist_id: Optional[str] = None, # Added playlist_id parameter
 ) -> List[Dict]:
     youtube = build("youtube", "v3", developerKey=api_key, cache_discovery=False)
     comments: List[Dict] = []
@@ -110,6 +141,7 @@ def fetch_comments(
             comments.append(
                 {
                     "video_id": video_id,
+                    "playlist_id": playlist_id, # Added playlist_id to comment data
                     "video_title": video_title,
                     "source": "comment",
                     "text": top_comment.get("textOriginal")
@@ -136,7 +168,8 @@ def fetch_comments(
     return comments
 
 
-def fetch_video_title(video_id: str, api_key: str) -> Optional[str]: # api_key is now passed directly
+@retry_with_exponential_backoff()
+def fetch_video_title(video_id: str, api_key: str) -> Optional[str]:
     youtube = build("youtube", "v3", developerKey=api_key, cache_discovery=False)
     request = youtube.videos().list(part="snippet", id=video_id, maxResults=1)
     response = request.execute()
@@ -146,9 +179,10 @@ def fetch_video_title(video_id: str, api_key: str) -> Optional[str]: # api_key i
     return items[0].get("snippet", {}).get("title")
 
 
+@retry_with_exponential_backoff()
 def fetch_playlist_videos(
     playlist_id: str,
-    api_key: str, # api_key is now passed directly
+    api_key: str,
     max_videos: int,
 ) -> List[Dict]:
     youtube = build("youtube", "v3", developerKey=api_key, cache_discovery=False)
@@ -201,26 +235,22 @@ def run_pipeline(
     max_comments: int,
     order: str,
     db_path: Path,
-    api_key: str, # api_key is now passed directly
+    api_key: str,
 ) -> Path:
     extracted_at = datetime.now(timezone.utc).isoformat()
     rows: List[Dict] = []
-
-    # Removed redundant load_api_key call
-    # api_key = load_api_key(api_key_file)
-    # if not api_key:
-    #     raise ValueError(
-    #         "Missing API key. Set YOUTUBE_API_KEY/GOOGLE_API_KEY or use --api-key-file."
-    #     )
 
     video_title = None
     try:
         video_title = fetch_video_title(video_id, api_key)
     except HttpError as exc:
         logging.warning("Unable to fetch title for %s: %s", video_id, exc)
+        # If title fetch fails, we can still try to fetch comments, but log it.
+        # For now, we'll continue with video_title=None
 
     try:
-        rows.extend(fetch_comments(video_id, api_key, max_comments, order, video_title))
+        # Pass playlist_id as None for video-only pipeline
+        rows.extend(fetch_comments(video_id, api_key, max_comments, order, video_title, playlist_id=None))
     except HttpError as exc:
         raise RuntimeError(f"YouTube API error: {exc}") from exc
 
@@ -229,7 +259,6 @@ def run_pipeline(
 
     df = build_dataframe(rows)
     
-    # Initialize database and insert data
     db = YouTubeCommentsDatabase(str(db_path))
     inserted_count = db.insert_sentiment_data(df, table_name='youtube_comments_sentiment')
     db.close()
@@ -244,15 +273,8 @@ def run_playlist_pipeline(
     max_comments: int,
     order: str,
     db_path: Path,
-    api_key: str, # api_key is now passed directly
+    api_key: str,
 ) -> Path:
-    # Removed redundant load_api_key call
-    # api_key = load_api_key(api_key_file)
-    # if not api_key:
-    #     raise ValueError(
-    #         "Missing API key. Set YOUTUBE_API_KEY/GOOGLE_API_KEY or use --api-key-file."
-    #     )
-
     videos = fetch_playlist_videos(playlist_id, api_key, max_videos)
     if not videos:
         raise ValueError(f"No videos found for playlist {playlist_id}.")
@@ -264,8 +286,9 @@ def run_playlist_pipeline(
         video_id = video["video_id"]
         video_title = video.get("title")
         try:
+            # Pass the current playlist_id to fetch_comments
             rows.extend(
-                fetch_comments(video_id, api_key, max_comments, order, video_title)
+                fetch_comments(video_id, api_key, max_comments, order, video_title, playlist_id=playlist_id)
             )
         except HttpError as exc:
             logging.warning(
@@ -279,7 +302,6 @@ def run_playlist_pipeline(
 
     df = build_dataframe(rows)
 
-    # Initialize database and insert data
     db = YouTubeCommentsDatabase(str(db_path))
     inserted_count = db.insert_sentiment_data(df, table_name='youtube_comments_sentiment')
     db.close()
@@ -331,11 +353,29 @@ def main() -> None:
             "Missing API key. Set YOUTUBE_API_KEY/GOOGLE_API_KEY or use --api-key-file."
         )
 
+    # --- Prioritization Logic ---
+    db = YouTubeCommentsDatabase(str(db_path))
+    processed_video_ids = db.get_processed_video_ids()
+    processed_playlist_ids = db.get_processed_playlist_ids()
+    db.close()
+
+    # Separate IDs into processed and unprocessed
+    unprocessed_playlist_ids = [pid for pid in DEFAULT_PLAYLIST_IDS if pid not in processed_playlist_ids]
+    processed_playlist_ids_to_recheck = [pid for pid in DEFAULT_PLAYLIST_IDS if pid in processed_playlist_ids]
+    
+    unprocessed_video_ids = [vid for vid in DEFAULT_VIDEO_IDS if vid not in processed_video_ids]
+    processed_video_ids_to_recheck = [vid for vid in DEFAULT_VIDEO_IDS if vid in processed_video_ids]
+
+    # Prioritize unprocessed IDs
+    prioritized_playlist_ids = unprocessed_playlist_ids + processed_playlist_ids_to_recheck
+    prioritized_video_ids = unprocessed_video_ids + processed_video_ids_to_recheck
+    # --- End Prioritization Logic ---
+
     if bool(args.video_id) == bool(args.playlist_id):
         if args.video_id or args.playlist_id:
             raise ValueError("Provide exactly one of --video-id or --playlist-id.")
-        if DEFAULT_PLAYLIST_IDS:
-            for playlist_id in DEFAULT_PLAYLIST_IDS:
+        if prioritized_playlist_ids: # Use prioritized list
+            for playlist_id in prioritized_playlist_ids:
                 output_target = run_playlist_pipeline(
                     playlist_id=playlist_id,
                     max_videos=args.max_videos,
@@ -346,8 +386,8 @@ def main() -> None:
                 )
                 print(f"Wrote data to DB: {output_target}")
             return
-        if DEFAULT_VIDEO_IDS:
-            for video_id in DEFAULT_VIDEO_IDS:
+        if prioritized_video_ids: # Use prioritized list
+            for video_id in prioritized_video_ids:
                 output_target = run_pipeline(
                     video_id=video_id,
                     max_comments=args.max_comments,
