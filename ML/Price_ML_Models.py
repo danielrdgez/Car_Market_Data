@@ -7,12 +7,12 @@ import warnings
 
 from sklearn.model_selection import RandomizedSearchCV, GroupShuffleSplit
 from sklearn.pipeline import Pipeline
-from sklearn.compose import ColumnTransformer
+from sklearn.compose import ColumnTransformer, TransformedTargetRegressor
 from sklearn.preprocessing import StandardScaler, OneHotEncoder
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import Ridge
 from sklearn.ensemble import HistGradientBoostingRegressor
-from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+from sklearn.metrics import mean_squared_error, mean_absolute_error, mean_absolute_percentage_error, r2_score
 from category_encoders import TargetEncoder
 from lightgbm import LGBMRegressor
 
@@ -22,6 +22,7 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 DB_PATH = BASE_DIR / "CAR_DATA_OUTPUT" / "CAR_DATA_CLEANED.db"
 OUTPUT_DIR = BASE_DIR / "MODELS_OUTPUT"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
 
 def load_and_split_data():
     """Load data and split 80/20 grouped by Make, Model, Year."""
@@ -37,7 +38,8 @@ def load_and_split_data():
         'nhtsa_latest_recall_date', 'nhtsa_complaint_injuries', 'nhtsa_complain_deaths',
         'nhtsa_complaint_crash_related', 'nhtsa_complaint_fire_related', 'nhtsa_common_complaint_areas',
         'nhtsa_ModelID', 'nhtsa_MakeID', 'nhtsa_BasePrice', 'loaddate',
-        'nhtsa_AdditionalErrorText', 'nhtsa_ManufacturerId', 'locationCode', 'nhtsa_OtherEngineInfo', 'nhtsa_DisplacementCC',
+        'nhtsa_AdditionalErrorText', 'nhtsa_ManufacturerId', 'locationCode', 'nhtsa_OtherEngineInfo',
+        'nhtsa_DisplacementCC',
         'nhtsa_DisplacementCI', 'countryCode', 'nhtsa_complaint_deaths'
     ]
 
@@ -108,6 +110,7 @@ def load_and_split_data():
 
     return X_train, y_train, X_test, y_test
 
+
 def build_pipelines(X_train):
     """Constructs preprocessing pipelines with Target Encoding for high-cardinality features."""
     numeric_features = X_train.select_dtypes(include=[np.number]).columns.tolist()
@@ -152,18 +155,22 @@ def build_pipelines(X_train):
 
     return preprocessor_with_target, preprocessor_linear, numeric_features, low_card_cols, high_card_cols
 
+
 def evaluate_model(name, model, X_test, y_test):
     """Evaluate pipeline on testing set."""
     preds = model.predict(X_test)
     rmse = np.sqrt(mean_squared_error(y_test, preds))
     mae = mean_absolute_error(y_test, preds)
+    mape = mean_absolute_percentage_error(y_test, preds)
     r2 = r2_score(y_test, preds)
 
     print(f"--- {name} Results ---")
     print(f"RMSE:  {rmse:.4f}")
     print(f"MAE:   {mae:.4f}")
+    print(f"MAPE:  {mape:.4f} ({mape * 100:.2f}%)")
     print(f"R2:    {r2:.4f}\n")
-    return rmse, mae, r2
+    return rmse, mae, mape, r2
+
 
 def tune_and_train(pipeline, param_grid, X_train, y_train, X_test, y_test, model_name):
     """Subsample training data for hyperparameter tuning, then train on full data."""
@@ -197,49 +204,68 @@ def tune_and_train(pipeline, param_grid, X_train, y_train, X_test, y_test, model
 
 def main():
     X_train, y_train, X_test, y_test = load_and_split_data()
-    preprocessor_with_target, preprocessor_linear, numeric_features, low_card_cols, high_card_cols = build_pipelines(X_train)
+    preprocessor_with_target, preprocessor_linear, numeric_features, low_card_cols, high_card_cols = build_pipelines(
+        X_train)
 
-    # 1. Ridge Regression (Fast Linear Model with regularization)
+    # 1. Ridge Regression (Fast Linear Model with regularization + Log Transform)
     print("Training Ridge Regression...")
+    ridge_regressor = TransformedTargetRegressor(
+        regressor=Ridge(solver='auto', random_state=42, alpha=1.0),
+        func=np.log1p,
+        inverse_func=np.expm1
+    )
     ridge_pipeline = Pipeline(steps=[
         ('preprocessor', preprocessor_linear),
-        ('model', Ridge(solver='auto', random_state=42, alpha=1.0))
+        ('model', ridge_regressor)
     ])
     ridge_pipeline.fit(X_train, y_train)
     evaluate_model("Ridge Regression", ridge_pipeline, X_test, y_test)
     joblib.dump(ridge_pipeline, OUTPUT_DIR / 'Ridge_Regression.joblib')
 
-    # 2. LightGBM (Highly scalable tree model)
+    # 2. LightGBM (Highly scalable tree model + Log Transform)
     print("\nTuning and Training LightGBM...")
+    lgbm_regressor = TransformedTargetRegressor(
+        regressor=LGBMRegressor(random_state=42, n_jobs=-1, verbose=-1),
+        func=np.log1p,
+        inverse_func=np.expm1
+    )
     lgbm_pipeline = Pipeline(steps=[
         ('preprocessor', preprocessor_with_target),
-        ('model', LGBMRegressor(random_state=42, n_jobs=-1, verbose=-1))
+        ('model', lgbm_regressor)
     ])
+
+    # Note: Because the model is now wrapped inside TransformedTargetRegressor,
+    # we must update the param_grid keys to point to 'model__regressor__'
     lgbm_param_grid = {
-        'model__num_leaves': [31, 50, 127],
-        'model__learning_rate': [0.01, 0.05, 0.1],
-        'model__n_estimators': [100, 300, 500],
-        'model__max_depth': [5, 10, 20, -1]
+        'model__regressor__num_leaves': [31, 50, 127],
+        'model__regressor__learning_rate': [0.01, 0.05, 0.1],
+        'model__regressor__n_estimators': [100, 300, 500],
+        'model__regressor__max_depth': [5, 10, 20, -1]
     }
     lgbm_model = tune_and_train(lgbm_pipeline, lgbm_param_grid, X_train, y_train, X_test, y_test, "LightGBM")
     joblib.dump(lgbm_model, OUTPUT_DIR / 'LightGBM_Tuned.joblib')
 
-    # 3. HistGradientBoosting (Also scalable)
+    # 3. HistGradientBoosting (Also scalable + Log Transform)
     print("\nTuning and Training HistGradientBoosting...")
+    hgb_regressor = TransformedTargetRegressor(
+        regressor=HistGradientBoostingRegressor(random_state=42),
+        func=np.log1p,
+        inverse_func=np.expm1
+    )
     hgb_pipeline = Pipeline(steps=[
         ('preprocessor', preprocessor_with_target),
-        ('model', HistGradientBoostingRegressor(random_state=42))
+        ('model', hgb_regressor)
     ])
     hgb_param_grid = {
-        'model__learning_rate': [0.01, 0.05, 0.1],
-        'model__max_iter': [100, 300, 500],
-        'model__max_depth': [5, 10, 15, None]
+        'model__regressor__learning_rate': [0.01, 0.05, 0.1],
+        'model__regressor__max_iter': [100, 300, 500],
+        'model__regressor__max_depth': [5, 10, 15, None]
     }
     hgb_model = tune_and_train(hgb_pipeline, hgb_param_grid, X_train, y_train, X_test, y_test, "HistGradientBoosting")
     joblib.dump(hgb_model, OUTPUT_DIR / 'HistGradientBoosting_Tuned.joblib')
 
     print(f"\n✓ All models saved successfully to {OUTPUT_DIR}")
 
+
 if __name__ == "__main__":
     main()
-
