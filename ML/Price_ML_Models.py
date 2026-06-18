@@ -1,7 +1,6 @@
 import sqlite3
 import pandas as pd
 import numpy as np
-import os
 import joblib
 from pathlib import Path
 import warnings
@@ -9,11 +8,13 @@ import warnings
 from sklearn.model_selection import RandomizedSearchCV, GroupShuffleSplit
 from sklearn.pipeline import Pipeline
 from sklearn.compose import ColumnTransformer
-from sklearn.preprocessing import StandardScaler, OneHotEncoder, OrdinalEncoder
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
 from sklearn.impute import SimpleImputer
-from sklearn.linear_model import LinearRegression, ElasticNet
-from sklearn.ensemble import RandomForestRegressor, HistGradientBoostingRegressor
+from sklearn.linear_model import Ridge
+from sklearn.ensemble import HistGradientBoostingRegressor
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+from category_encoders import TargetEncoder
+from lightgbm import LGBMRegressor
 
 warnings.filterwarnings('ignore')
 
@@ -108,65 +109,48 @@ def load_and_split_data():
     return X_train, y_train, X_test, y_test
 
 def build_pipelines(X_train):
-    """Constructs preprocessing pipelines for imputed and non-imputed models."""
-    # Identify col types
+    """Constructs preprocessing pipelines with Target Encoding for high-cardinality features."""
     numeric_features = X_train.select_dtypes(include=[np.number]).columns.tolist()
     categorical_features = X_train.select_dtypes(exclude=[np.number]).columns.tolist()
 
-    # Calculate mask for HGBR based on max cardinality of 255
-    hgbr_categorical_mask = [False] * len(numeric_features)
-    for cat_col in categorical_features:
-        if X_train[cat_col].nunique(dropna=False) <= 255:
-            hgbr_categorical_mask.append(True)
-        else:
-            hgbr_categorical_mask.append(False)
+    low_cardinality_threshold = 50
+    low_card_cols = [c for c in categorical_features if X_train[c].nunique() <= low_cardinality_threshold]
+    high_card_cols = [c for c in categorical_features if X_train[c].nunique() > low_cardinality_threshold]
 
-    # Imputation Strategy for standard models
-    numeric_transformer_impute = Pipeline(steps=[
+    numeric_transformer = Pipeline(steps=[
         ('imputer', SimpleImputer(strategy='median')),
         ('scaler', StandardScaler())
     ])
 
-    # Strategy for HGBR (No Imputation, handles NaN)
-    numeric_transformer_no_impute = Pipeline(steps=[
-        ('scaler', StandardScaler())
+    categorical_transformer_low = Pipeline(steps=[
+        ('imputer', SimpleImputer(strategy='constant', fill_value='UNKNOWN')),
+        ('onehot', OneHotEncoder(handle_unknown='ignore', sparse_output=False))
     ])
 
-    categorical_transformer_ohe = Pipeline(steps=[
+    categorical_transformer_high = Pipeline(steps=[
         ('imputer', SimpleImputer(strategy='constant', fill_value='UNKNOWN')),
-        ('onehot', OneHotEncoder(handle_unknown='ignore', sparse_output=True))
+        ('target', TargetEncoder())
     ])
 
-    categorical_transformer_ordinal = Pipeline(steps=[
-        ('imputer', SimpleImputer(strategy='constant', fill_value='UNKNOWN')),
-        ('ordinal', OrdinalEncoder(handle_unknown='use_encoded_value', unknown_value=-1))
-    ])
+    preprocessor_with_target = ColumnTransformer(
+        transformers=[
+            ('num', numeric_transformer, numeric_features),
+            ('cat_low', categorical_transformer_low, low_card_cols),
+            ('cat_high', categorical_transformer_high, high_card_cols)
+        ],
+        remainder='passthrough'
+    )
 
     preprocessor_linear = ColumnTransformer(
         transformers=[
-            ('num', numeric_transformer_impute, numeric_features),
-            ('cat', categorical_transformer_ohe, categorical_features)
+            ('num', numeric_transformer, numeric_features),
+            ('cat_low', categorical_transformer_low, low_card_cols),
+            ('cat_high', categorical_transformer_high, high_card_cols)
         ],
         remainder='passthrough'
     )
 
-    preprocessor_tree = ColumnTransformer(
-        transformers=[
-            ('num', numeric_transformer_impute, numeric_features),
-            ('cat', categorical_transformer_ohe, categorical_features)
-        ],
-        remainder='passthrough'
-    )
-
-    preprocessor_hgbr = ColumnTransformer(
-        transformers=[
-            ('num', numeric_transformer_no_impute, numeric_features),
-            ('cat', categorical_transformer_ordinal, categorical_features)
-        ],
-        remainder='passthrough'
-    )
-
-    return preprocessor_linear, preprocessor_tree, preprocessor_hgbr, len(numeric_features), hgbr_categorical_mask
+    return preprocessor_with_target, preprocessor_linear, numeric_features, low_card_cols, high_card_cols
 
 def evaluate_model(name, model, X_test, y_test):
     """Evaluate pipeline on testing set."""
@@ -181,74 +165,80 @@ def evaluate_model(name, model, X_test, y_test):
     print(f"R2:    {r2:.4f}\n")
     return rmse, mae, r2
 
+def tune_and_train(pipeline, param_grid, X_train, y_train, X_test, y_test, model_name):
+    """Subsample training data for hyperparameter tuning, then train on full data."""
+    subsample_size = min(100000, X_train.shape[0])
+    sample_idx = np.random.choice(X_train.shape[0], size=subsample_size, replace=False)
+    X_tune = X_train.iloc[sample_idx]
+    y_tune = y_train.iloc[sample_idx]
+
+    print(f"\nTuning {model_name} on {subsample_size:,} sample rows...")
+    search = RandomizedSearchCV(
+        pipeline,
+        param_distributions=param_grid,
+        n_iter=5,
+        cv=3,
+        scoring='neg_root_mean_squared_error',
+        n_jobs=-1,
+        random_state=42,
+        verbose=1
+    )
+
+    search.fit(X_tune, y_tune)
+    print(f"Best parameters for {model_name}: {search.best_params_}")
+
+    print(f"Training {model_name} on full dataset ({X_train.shape[0]:,} rows)...")
+    best_model = search.best_estimator_
+    best_model.fit(X_train, y_train)
+
+    evaluate_model(model_name, best_model, X_test, y_test)
+    return best_model
+
+
 def main():
     X_train, y_train, X_test, y_test = load_and_split_data()
-    preprocessor_linear, preprocessor_tree, preprocessor_hgbr, num_len, hgbr_categorical_mask = build_pipelines(X_train)
+    preprocessor_with_target, preprocessor_linear, numeric_features, low_card_cols, high_card_cols = build_pipelines(X_train)
 
-    # 4. Hist Gradient Boosting
-    #print("Tuning and Training Hist Gradient Boosting...")
-    
-    #hgb_net = Pipeline(steps=[
-    #    ('preprocessor', preprocessor_hgbr),
-    #    ('model', HistGradientBoostingRegressor(random_state=42, categorical_features=hgbr_categorical_mask))
-    #])
-    #hgb_param_grid = {
-    #    'model__learning_rate': [0.01, 0.05, 0.1, 0.2],
-    #    'model__max_iter': [100, 250, 500, 1000],
-    #    'model__max_depth': [3, 5, 9, 15, None]
-    #}
-    #hgb_search = RandomizedSearchCV(hgb_net, hgb_param_grid, n_iter=15, cv=3, scoring='neg_root_mean_squared_error', n_jobs=-1, random_state=42, verbose=1)
-    #hgb_search.fit(X_train, y_train)
-    #print(f"Best HGBR params: {hgb_search.best_params_}")
-    #evaluate_model("Hist Gradient Boosting", hgb_search.best_estimator_, X_test, y_test)
-    #joblib.dump(hgb_search.best_estimator_, OUTPUT_DIR / 'Hist_Gradient_Boosting_Tuned.joblib')
-
-    # 3. Random Forest
-    #print("Tuning and Training Random Forest...")
-    #rf_net = Pipeline(steps=[
-    #    ('preprocessor', preprocessor_tree),
-    #    ('model', RandomForestRegressor(random_state=42, n_jobs=-1))
-    #])
-    #rf_param_grid = {
-    #    'model__n_estimators': [100, 200, 300],
-    #    'model__max_depth': [10, 20, 30, None],
-    #    'model__min_samples_split': [2, 5, 10]
-    #}
-    # Using 5 iterations to save time, exhaustion balanced with computational limits
-    #rf_search = RandomizedSearchCV(rf_net, rf_param_grid, n_iter=5, cv=3, scoring='neg_root_mean_squared_error', n_jobs=-1, random_state=42, verbose=1)
-    #rf_search.fit(X_train, y_train)
-    #print(f"Best Random Forest params: {rf_search.best_params_}")
-    #evaluate_model("Random Forest", rf_search.best_estimator_, X_test, y_test)
-    #joblib.dump(rf_search.best_estimator_, OUTPUT_DIR / 'Random_Forest_Tuned.joblib')
-
-
-    # 1. Multiple Linear Regression (Interpretability)
-    #print("Training Multiple Linear Regression...")
-    #ml_reg = Pipeline(steps=[
-    #    ('preprocessor', preprocessor_linear),
-    #    ('model', LinearRegression(n_jobs=-1))
-    #])
-    #ml_reg.fit(X_train, y_train)
-    #evaluate_model("Multiple Linear Regression", ml_reg, X_test, y_test)
-    #joblib.dump(ml_reg, OUTPUT_DIR / 'Multiple_Linear_Regression.joblib')
-
-    # 2. Elastic Net (Regularized MLR)
-    print("Tuning and Training Elastic Net...")
-    ela_net = Pipeline(steps=[
+    # 1. Ridge Regression (Fast Linear Model with regularization)
+    print("Training Ridge Regression...")
+    ridge_pipeline = Pipeline(steps=[
         ('preprocessor', preprocessor_linear),
-        ('model', ElasticNet(random_state=42, max_iter=2000))
+        ('model', Ridge(solver='auto', random_state=42, alpha=1.0))
     ])
-    ela_param_grid = {
-        'model__alpha': [0.1, 1.0, 10.0, 100.0],
-        'model__l1_ratio': [0.0001, 0.001, 0.1, 0.5]
-    }
-    ela_search = RandomizedSearchCV(ela_net, ela_param_grid, n_iter=10, cv=3, scoring='neg_root_mean_squared_error', n_jobs=-1, random_state=42, verbose=1)
-    ela_search.fit(X_train, y_train)
-    print(f"Best Elastic Net params: {ela_search.best_params_}")
-    evaluate_model("Elastic Net", ela_search.best_estimator_, X_test, y_test)
-    joblib.dump(ela_search.best_estimator_, OUTPUT_DIR / 'Elastic_Net_Tuned.joblib')
+    ridge_pipeline.fit(X_train, y_train)
+    evaluate_model("Ridge Regression", ridge_pipeline, X_test, y_test)
+    joblib.dump(ridge_pipeline, OUTPUT_DIR / 'Ridge_Regression.joblib')
 
-    print(f"All models saved successfully to {OUTPUT_DIR}")
+    # 2. LightGBM (Highly scalable tree model)
+    print("\nTuning and Training LightGBM...")
+    lgbm_pipeline = Pipeline(steps=[
+        ('preprocessor', preprocessor_with_target),
+        ('model', LGBMRegressor(random_state=42, n_jobs=-1, verbose=-1))
+    ])
+    lgbm_param_grid = {
+        'model__num_leaves': [31, 50, 127],
+        'model__learning_rate': [0.01, 0.05, 0.1],
+        'model__n_estimators': [100, 300, 500],
+        'model__max_depth': [5, 10, 20, -1]
+    }
+    lgbm_model = tune_and_train(lgbm_pipeline, lgbm_param_grid, X_train, y_train, X_test, y_test, "LightGBM")
+    joblib.dump(lgbm_model, OUTPUT_DIR / 'LightGBM_Tuned.joblib')
+
+    # 3. HistGradientBoosting (Also scalable)
+    print("\nTuning and Training HistGradientBoosting...")
+    hgb_pipeline = Pipeline(steps=[
+        ('preprocessor', preprocessor_with_target),
+        ('model', HistGradientBoostingRegressor(random_state=42))
+    ])
+    hgb_param_grid = {
+        'model__learning_rate': [0.01, 0.05, 0.1],
+        'model__max_iter': [100, 300, 500],
+        'model__max_depth': [5, 10, 15, None]
+    }
+    hgb_model = tune_and_train(hgb_pipeline, hgb_param_grid, X_train, y_train, X_test, y_test, "HistGradientBoosting")
+    joblib.dump(hgb_model, OUTPUT_DIR / 'HistGradientBoosting_Tuned.joblib')
+
+    print(f"\n✓ All models saved successfully to {OUTPUT_DIR}")
 
 if __name__ == "__main__":
     main()

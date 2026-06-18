@@ -13,3 +13,5 @@ urllib3==2.5.0
 shap>=0.40.0
 scikit-learn>=1.0.0
 joblib>=1.1.0
+category-encoders>=2.9.0
+lightgbm>=4.0.0

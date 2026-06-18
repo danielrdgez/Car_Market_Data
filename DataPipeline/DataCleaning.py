@@ -1,10 +1,12 @@
 import logging
 import os
+import re
 import sqlite3
 from datetime import date
 from pathlib import Path
 from typing import Iterable
 
+import pandas as pd
 import polars as pl
 
 from database import CarDatabase
@@ -21,7 +23,7 @@ MAKE_WHITELIST_UPPER = {
 
 LISTINGS_KEEP_COLUMNS = [
     "vin", "date", "loaddate", "locationCode", "price", "mileage",
-    "title", "sourceName", "sellerType", "vehicleTitle",
+    "sourceName", "sellerType", "vehicleTitle",
 ]
 
 NHTSA_DROP_COLUMNS = {
@@ -33,7 +35,7 @@ NHTSA_DROP_COLUMNS = {
     "nhtsa_AdditionalErrorText", "nhtsa_DisplacementCC", "nhtsa_DisplacementCI",
     "nhtsa_ModelID", "nhtsa_ManufacturerId", "nhtsa_MakeID", 'nhtsa_SemiautomaticHeadlampBeamSwitching',
     'nhtsa_LowerBeamHeadlampLightSource', 'nhtsa_EntertainmentSystem', 'nhtsa_DestinationMarket',
-    'nhtsa_BrakeSystemDesc'
+    'nhtsa_BrakeSystemDesc', 'nhtsa_Trim', 'nhtsa_Trim2'
 }
 
 PRICE_MIN = 1000
@@ -43,6 +45,48 @@ VIN_BLACKLIST = {
     "1GCUY6ED0LF228114",
     "1FTFW6L8XSFB63087",
 }
+
+CARDINALITY_THRESHOLD = 0.005  # 0.5%
+
+
+def extract_clean_trim(make: str, model: str, title: str) -> str:
+    """Extract clean trim by removing Make, Model, and Year from title."""
+    if not title or pd.isna(title):
+        return ""
+
+    title = str(title).upper().strip()
+    make = str(make).upper().strip() if make else ""
+    model = str(model).upper().strip() if model else ""
+
+    if make:
+        title = title.replace(make, "")
+    if model:
+        title = title.replace(model, "")
+
+    title = re.sub(r"^\s*20\d{2}\s+", "", title)
+
+    return title.strip()
+
+
+def reduce_cardinality(df: pl.DataFrame, columns: list[str], threshold: float = CARDINALITY_THRESHOLD) -> pl.DataFrame:
+    """Replace rare categories with 'Other' for specified columns."""
+    for col in columns:
+        if col in df.columns:
+            value_counts = df.select(col).value_counts()
+            total = df.shape[0]
+            rare_values = value_counts.filter(
+                pl.col("counts") / total < threshold
+            ).select(col).to_series().to_list()
+            
+            if rare_values:
+                df = df.with_columns(
+                    pl.when(pl.col(col).is_in(rare_values))
+                    .then(pl.lit("Other"))
+                    .otherwise(pl.col(col))
+                    .alias(col)
+                )
+    
+    return df
 
 
 class DataCleaningPipeline:
@@ -258,6 +302,10 @@ class DataCleaningPipeline:
         keep_nhtsa_columns = [c for c in nhtsa.columns if c not in NHTSA_DROP_COLUMNS]
         scoped_nhtsa = nhtsa.join(scoped_vins, on="vin", how="inner").select(keep_nhtsa_columns)
 
+        cardinality_cols = [c for c in ['nhtsa_Make', 'nhtsa_Model'] if c in scoped_listings.columns]
+        if cardinality_cols:
+            scoped_listings = reduce_cardinality(scoped_listings, cardinality_cols, CARDINALITY_THRESHOLD)
+        
         listing_history = listing_history.select([c for c in listing_history.columns if c != "id"])
         price_history = price_history.select([c for c in price_history.columns if c != "id"])
 
