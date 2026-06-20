@@ -1,16 +1,10 @@
 """
-Per-Button Parallel Car Data Acquisition Module (Playwright Edition)
+Global Queue Parallel Car Data Acquisition Module (Playwright Edition)
 =====================================================================
-Each source button (autotempest, hemmings, cars, etc.) gets its own dedicated
-browser instance running in a separate thread. Buttons are clicked until true
-exhaustion (3 consecutive zero-row responses). A shared thread-safe VIN cache
-prevents duplicate inserts across all concurrent button workers.
-
-Architecture:
-    ButtonScraper         - One Playwright browser, one button, clicks until exhausted
-    VINCache              - Thread-safe in-memory VIN deduplication
-    ButtonScrapingCoordinator - Manages all button threads for a single make
-    ParallelScrapingOrchestrator - Iterates makes sequentially with stagger
+This architecture utilizes a Global Task Queue. It generates a master list of
+ALL (Make, Button) combinations and feeds them into a single ThreadPoolExecutor.
+This guarantees that the maximum number of concurrent browsers are ALWAYS running,
+eliminating "tail-end latency" where workers wait for a slow make to finish.
 """
 
 import logging
@@ -24,9 +18,7 @@ from datetime import date
 from dataclasses import dataclass, field
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# --- PLAYWRIGHT REPLACES SELENIUM ---
 from playwright.sync_api import sync_playwright
-
 from database import CarDatabase
 
 # --- CONFIGURATION ---
@@ -48,7 +40,6 @@ BUTTON_XPATHS: Dict[str, str] = {
     "other": '//*[@id="ot-results"]/section/button',
 }
 
-
 @dataclass
 class ScrapingConfig:
     """Central configuration for all scraping operations"""
@@ -64,8 +55,13 @@ class ScrapingConfig:
     INPUT_ZIP: str = "33186"
     INPUT_STATE: str = "country"
 
-    MAX_BUTTON_WORKERS: int = 9
-    WORKER_STARTUP_STAGGER: float = 3.0
+    # --- GLOBAL CONCURRENCY SETTING ---
+    # This dictates the exact number of browsers that will ALWAYS be running across all makes.
+    MAX_GLOBAL_CONCURRENT_BROWSERS: int = 9
+
+    # Safely staggers browser launches so your CPU/Network doesn't crash from spiking
+    GLOBAL_STARTUP_STAGGER: float = 2.0
+
     MAX_RETRIES: int = 3
     EXHAUSTION_STRIKE_COUNT: int = 3
 
@@ -74,7 +70,7 @@ class ScrapingConfig:
     MIN_WAIT_BETWEEN_ITERATIONS: float = 2.1
     MAX_WAIT_BETWEEN_ITERATIONS: float = 4.5
 
-    HEADLESS: bool = True
+    HEADLESS: bool = True  # Set to True for optimal background/server running
     PAGE_LOAD_TIMEOUT: int = 60
 
     def get_base_url(self, make: str) -> str:
@@ -84,7 +80,7 @@ class ScrapingConfig:
         )
 
 
-# --- METRICS (Untouched for Log Parity) ---
+# --- METRICS ---
 
 @dataclass
 class ButtonScrapingMetrics:
@@ -105,7 +101,6 @@ class ButtonScrapingMetrics:
 
     def finalize(self):
         self.end_time = time.time()
-
 
 @dataclass
 class MakeScrapingMetrics:
@@ -132,27 +127,6 @@ class MakeScrapingMetrics:
     def finalize(self):
         self.end_time = time.time()
 
-    def log_summary(self) -> str:
-        lines = [
-            f"\n{'=' * 70}",
-            f"MAKE: {self.make.upper()}",
-            f"{'=' * 70}",
-        ]
-        for name, bm in self.button_metrics.items():
-            status = "EXHAUSTED" if bm.exhausted else ("ERROR" if bm.error else "ACTIVE")
-            lines.append(
-                f"  {name:14} | clicks={bm.clicks:5} | rows={bm.rows_inserted:6} | "
-                f"time={bm.elapsed():.1f}s | {status}"
-            )
-        lines.extend([
-            f"{'-' * 70}",
-            f"  TOTALS: {self.total_clicks} clicks | "
-            f"{self.total_rows_processed} processed | {self.total_rows_inserted} inserted | "
-            f"{self.elapsed():.1f}s",
-            f"{'=' * 70}",
-        ])
-        return "\n".join(lines)
-
 
 # --- VIN CACHE ---
 
@@ -175,11 +149,6 @@ class VINCache:
                 return True
             return False
 
-    def add(self, vin: str):
-        with self._lock:
-            if vin not in self._seen:
-                self._seen[vin] = {}
-
     def add_batch(self, rows: List[Dict]):
         with self._lock:
             for r in rows:
@@ -191,27 +160,21 @@ class VINCache:
             return len(self._seen)
 
 
-# --- DATA EXTRACTION (Untouched for DB Parity) ---
+# --- DATA EXTRACTION ---
 
 def normalize_price(value) -> Optional[float]:
     if value is None: return None
     if isinstance(value, (int, float)): return float(value)
     text = str(value).replace("$", "").replace(",", "").strip()
-    try:
-        return float(text) if text else None
-    except ValueError:
-        return None
-
+    try: return float(text) if text else None
+    except ValueError: return None
 
 def normalize_mileage(value) -> Optional[int]:
     if value is None: return None
     if isinstance(value, (int, float)): return int(value)
     text = str(value).replace(",", "").strip()
-    try:
-        return int(float(text)) if text else None
-    except ValueError:
-        return None
-
+    try: return int(float(text)) if text else None
+    except ValueError: return None
 
 _FIELDS_TO_EXTRACT = [
     "date", "location", "locationCode", "countryCode",
@@ -223,7 +186,6 @@ _FIELDS_TO_EXTRACT = [
 
 _HISTORY_FIELDS = {"priceHistory", "listingHistory"}
 
-
 def _parse_history_field(value) -> Optional[List]:
     if value is None: return None
     if isinstance(value, list): return value
@@ -231,10 +193,8 @@ def _parse_history_field(value) -> Optional[List]:
         try:
             parsed = json.loads(value)
             return parsed if isinstance(parsed, list) else None
-        except:
-            return None
+        except: return None
     return None
-
 
 def extract_rows_from_api(api_data: Dict, make: str) -> List[Dict]:
     rows = []
@@ -272,12 +232,12 @@ def extract_rows_from_api(api_data: Dict, make: str) -> List[Dict]:
     return rows
 
 
-# --- BUTTON SCRAPER (The New Playwright Core) ---
+# --- BUTTON SCRAPER ---
 
 class ButtonScraper:
     def __init__(
-            self, make: str, button_name: str, button_xpath: str,
-            config: ScrapingConfig, db: CarDatabase, vin_cache: VINCache, worker_tag: str
+        self, make: str, button_name: str, button_xpath: str,
+        config: ScrapingConfig, db: CarDatabase, vin_cache: VINCache, worker_tag: str
     ):
         self.make = make
         self.button_name = button_name
@@ -287,7 +247,6 @@ class ButtonScraper:
         self.vin_cache = vin_cache
         self.tag = worker_tag
 
-        # Thread-safe storage for the background wiretap
         self.accumulated_rows: List[Dict] = []
         self._rows_lock = threading.Lock()
 
@@ -298,7 +257,6 @@ class ButtonScraper:
         self.metrics = ButtonScrapingMetrics(button_name=button_name, make=make)
 
     def run(self) -> ButtonScrapingMetrics:
-        logging.info(f"[{self.tag}] Starting Playwright scraper for '{self.button_name}'")
         try:
             with sync_playwright() as p:
                 self.p = p
@@ -306,7 +264,7 @@ class ButtonScraper:
                 self._navigate()
                 self._scrape_loop()
         except Exception as e:
-            logging.error(f"[{self.tag}] Unexpected error: {e}", exc_info=True)
+            logging.error(f"[{self.tag}] Unexpected error: {e}")
             self.metrics.error = str(e)
         finally:
             self._cleanup()
@@ -322,11 +280,7 @@ class ButtonScraper:
         )
         self.page = self.context.new_page()
 
-        # SIMPLIFICATION: Block assets for speed, preserving layout rendering
-        self.page.route("**/*", lambda route: route.abort() if route.request.resource_type in ["image", "media",
-                                                                                               "font"] else route.continue_())
-
-        # SIMPLIFICATION: The Network Wiretap (Replaces 40+ lines of CDP parsing)
+        self.page.route("**/*", lambda route: route.abort() if route.request.resource_type in ["image", "media", "font"] else route.continue_())
         self.page.on("response", self._handle_response)
 
     def _handle_response(self, response):
@@ -343,17 +297,15 @@ class ButtonScraper:
 
     def _navigate(self):
         url = self.config.get_base_url(self.make)
-        logging.info(f"[{self.tag}] Navigating to {url}")
         self.page.goto(url, wait_until="domcontentloaded", timeout=self.config.PAGE_LOAD_TIMEOUT * 1000)
-        time.sleep(10)  # Initial aggregator load
+        time.sleep(10)
 
     def _cleanup(self):
         if self.browser:
             try:
                 self.browser.close()
-            except Exception as e:
-                logging.warning(f"[{self.tag}] Error closing browser: {e}")
-        logging.info(f"[{self.tag}] Cleaned up '{self.button_name}'")
+            except Exception:
+                pass
 
     def _scrape_loop(self):
         iteration = 0
@@ -365,16 +317,12 @@ class ButtonScraper:
 
             clicked = self._attempt_click()
             if not clicked:
-                logging.info(f"[{self.tag}] Button no longer clickable/visible. Exhausted.")
                 self.metrics.exhausted = True
                 break
 
             self.metrics.clicks += 1
-
-            # Give wiretap time to catch the asynchronous background payloads
             time.sleep(2.5)
 
-            # Atomically pull the intercepted cars
             with self._rows_lock:
                 api_rows = list(self.accumulated_rows)
                 self.accumulated_rows.clear()
@@ -385,14 +333,10 @@ class ButtonScraper:
                 self.metrics.rows_processed += len(api_rows)
                 self.metrics.rows_inserted += inserted
                 self.metrics.strike_count = 0
-                logging.info(f"[{self.tag}] +{len(api_rows)} rows, {inserted} inserted")
-                print(f"[{self.make}/{self.button_name}] iter={iteration} rows={len(api_rows)} inserted={inserted}")
+                print(f"[{self.tag}] iter={iteration} rows={len(api_rows)} inserted={inserted}")
             else:
                 self.metrics.strike_count += 1
-                logging.info(
-                    f"[{self.tag}] 0 rows (strike {self.metrics.strike_count}/{self.config.EXHAUSTION_STRIKE_COUNT})")
                 if self.metrics.strike_count >= self.config.EXHAUSTION_STRIKE_COUNT:
-                    logging.info(f"[{self.tag}] Exhausted after {self.config.EXHAUSTION_STRIKE_COUNT} zero-row strikes")
                     self.metrics.exhausted = True
                     break
 
@@ -401,15 +345,13 @@ class ButtonScraper:
     def _attempt_click(self) -> bool:
         for attempt in range(1, self.config.MAX_RETRIES + 1):
             try:
-                # SIMPLIFICATION: Playwright's native locator replaces complex ActionChains
                 button = self.page.locator(f"xpath={self.button_xpath}")
                 button.wait_for(state="visible", timeout=4000)
                 button.scroll_into_view_if_needed()
                 time.sleep(random.uniform(self.config.MIN_WAIT_AFTER_CLICK, self.config.MAX_WAIT_AFTER_CLICK))
                 button.click(timeout=5000)
                 return True
-            except Exception as e:
-                logging.debug(f"[{self.tag}] Click attempt {attempt} failed: {e}")
+            except Exception:
                 time.sleep(1)
         return False
 
@@ -419,66 +361,13 @@ class ButtonScraper:
             if ribbon_dismiss.is_visible():
                 ribbon_dismiss.click(timeout=2000)
                 self.page.wait_for_timeout(1000)
-                logging.info(f"[{self.tag}] Ribbon dismissed")
                 return True
         except Exception:
             pass
         return False
 
 
-# --- COORDINATOR & ORCHESTRATOR (Untouched) ---
-
-class ButtonScrapingCoordinator:
-    def __init__(self, make: str, config: ScrapingConfig, db_path: str, output_dir: str):
-        self.make = make
-        self.config = config
-        self.db_path = db_path
-        self.output_dir = output_dir
-        self.metrics = MakeScrapingMetrics(make=make)
-
-    def run(self) -> MakeScrapingMetrics:
-        db = CarDatabase(self.db_path, thread_safe=True)
-        vin_cache = VINCache(db)
-
-        ordered_buttons = [
-            (name, BUTTON_XPATHS[name]) for name in BUTTON_ORDER
-            if name in BUTTON_XPATHS
-        ]
-
-        logging.info(
-            f"[{self.make.upper()}] Launching {len(ordered_buttons)} button workers (max {self.config.MAX_BUTTON_WORKERS} concurrent)")
-
-        futures = {}
-        with ThreadPoolExecutor(max_workers=self.config.MAX_BUTTON_WORKERS, thread_name_prefix=f"{self.make}") as pool:
-            for idx, (btn_name, btn_xpath) in enumerate(ordered_buttons):
-                tag = f"{self.make}/{btn_name}"
-                scraper = ButtonScraper(
-                    make=self.make, button_name=btn_name, button_xpath=btn_xpath,
-                    config=self.config, db=db, vin_cache=vin_cache, worker_tag=tag,
-                )
-                future = pool.submit(scraper.run)
-                futures[future] = btn_name
-                if idx < len(ordered_buttons) - 1:
-                    time.sleep(random.uniform(1.5, 3.0))
-
-            for future in as_completed(futures):
-                btn_name = futures[future]
-                try:
-                    bm = future.result()
-                    self.metrics.button_metrics[btn_name] = bm
-                    status = "EXHAUSTED" if bm.exhausted else "ERROR"
-                    logging.info(
-                        f"[{self.make}/{btn_name}] Finished: {status} | clicks={bm.clicks} rows={bm.rows_inserted} time={bm.elapsed():.1f}s")
-                except Exception as e:
-                    logging.error(f"[{self.make}/{btn_name}] Thread error: {e}")
-                    err_metrics = ButtonScrapingMetrics(button_name=btn_name, make=self.make, error=str(e))
-                    err_metrics.finalize()
-                    self.metrics.button_metrics[btn_name] = err_metrics
-
-        db.close()
-        self.metrics.finalize()
-        return self.metrics
-
+# --- GLOBAL TASK ORCHESTRATOR ---
 
 class ParallelScrapingOrchestrator:
     def __init__(self, config: ScrapingConfig = None):
@@ -503,37 +392,79 @@ class ParallelScrapingOrchestrator:
 
     def run(self):
         logging.info("=" * 70)
-        logging.info("Starting Per-Button Parallel Scraping")
+        logging.info("Starting GLOBAL QUEUE Parallel Scraping (Playwright)")
         logging.info("=" * 70)
-        logging.info(f"Makes: {', '.join(self.config.MAKES)}")
-        logging.info(f"Buttons per make: {len(BUTTON_ORDER)}")
-        logging.info(f"Max concurrent buttons: {self.config.MAX_BUTTON_WORKERS}")
+
+        db = CarDatabase(self.db_path, thread_safe=True)
+        vin_cache = VINCache(db)
+
+        # 1. GENERATE THE MASTER QUEUE
+        master_queue = []
+        for make in self.config.MAKES:
+            self.metrics_by_make[make] = MakeScrapingMetrics(make=make)
+            for btn_name in BUTTON_ORDER:
+                if btn_name in BUTTON_XPATHS:
+                    master_queue.append((make, btn_name, BUTTON_XPATHS[btn_name]))
+
+        total_tasks = len(master_queue)
+        completed_tasks = 0
+
+        logging.info(f"Total Makes: {len(self.config.MAKES)}")
+        logging.info(f"Total Buttons: {len(BUTTON_ORDER)}")
+        logging.info(f"Master Queue Size: {total_tasks} isolated tasks generated.")
+        logging.info(f"Max Concurrent Browsers: {self.config.MAX_GLOBAL_CONCURRENT_BROWSERS}")
 
         start_time = time.time()
+
+        # 2. CREATE A STARTUP LOCK
+        # This prevents 9 browsers from trying to allocate RAM/CPU at the exact same millisecond.
+        startup_lock = threading.Lock()
+
+        def worker_task(task_info):
+            make, btn_name, btn_xpath = task_info
+            tag = f"{make}/{btn_name}"
+
+            # Acquire lock -> Sleep 2 seconds -> Release lock -> Start Browser
+            with startup_lock:
+                time.sleep(self.config.GLOBAL_STARTUP_STAGGER)
+
+            scraper = ButtonScraper(
+                make=make, button_name=btn_name, button_xpath=btn_xpath,
+                config=self.config, db=db, vin_cache=vin_cache, worker_tag=tag,
+            )
+            return make, btn_name, scraper.run()
+
+        # 3. FEED THE MASTER QUEUE TO THE POOL
         try:
-            for idx, make in enumerate(self.config.MAKES):
-                if idx > 0:
-                    stagger = self.config.WORKER_STARTUP_STAGGER
-                    logging.info(f"Staggering next make by {stagger}s...")
-                    time.sleep(stagger)
+            with ThreadPoolExecutor(max_workers=self.config.MAX_GLOBAL_CONCURRENT_BROWSERS) as pool:
+                futures = {pool.submit(worker_task, task): task for task in master_queue}
 
-                logging.info(f"\n[ORCHESTRATOR] Make {idx + 1}/{len(self.config.MAKES)}: {make.upper()}")
+                for future in as_completed(futures):
+                    make, btn_name, _ = futures[future]
+                    completed_tasks += 1
+                    try:
+                        res_make, res_btn, bm = future.result()
 
-                coordinator = ButtonScrapingCoordinator(
-                    make=make, config=self.config, db_path=self.db_path, output_dir=self.output_directory,
-                )
-                metrics = coordinator.run()
-                self.metrics_by_make[make] = metrics
-                print(metrics.log_summary())
+                        # Save metrics for this specific button back to its parent make
+                        self.metrics_by_make[res_make].button_metrics[res_btn] = bm
+                        status = "EXHAUSTED" if bm.exhausted else "ERROR"
+
+                        progress = f"[{completed_tasks}/{total_tasks}]"
+                        logging.info(f"{progress} [{res_make.upper()}/{res_btn}] Finished: {status} | clicks={bm.clicks} rows={bm.rows_inserted} time={bm.elapsed():.1f}s")
+
+                    except Exception as e:
+                        logging.error(f"[{make}/{btn_name}] Task completely failed: {e}")
+                        err_metrics = ButtonScrapingMetrics(button_name=btn_name, make=make, error=str(e))
+                        err_metrics.finalize()
+                        self.metrics_by_make[make].button_metrics[btn_name] = err_metrics
 
             self._print_aggregate_summary(start_time)
 
         except KeyboardInterrupt:
             logging.info("Scraping interrupted by user")
             print("\nScraping interrupted by user")
-        except Exception as e:
-            logging.error(f"Orchestrator error: {e}", exc_info=True)
         finally:
+            db.close()
             logging.info("Orchestrator finished")
 
     def _print_aggregate_summary(self, start_time: float):
@@ -544,10 +475,10 @@ class ParallelScrapingOrchestrator:
 
         lines = [
             "\n" + "=" * 70,
-            "AGGREGATE SCRAPING SUMMARY",
+            "AGGREGATE GLOBAL SCRAPING SUMMARY",
             "=" * 70,
-            f"Makes processed: {len(self.metrics_by_make)}",
-            f"Elapsed: {elapsed:.1f}s ({elapsed / 60:.1f}m)",
+            f"Makes fully processed: {len(self.metrics_by_make)}",
+            f"Elapsed Time: {elapsed:.1f}s ({elapsed/60:.1f}m)",
             "",
         ]
         for make, m in self.metrics_by_make.items():
@@ -567,11 +498,10 @@ class ParallelScrapingOrchestrator:
 
 
 def main():
-    print("Running data acquisition pipeline...")
+    print("Running GLOBAL Playwright Data Acquisition Pipeline...")
     config = ScrapingConfig()
     orchestrator = ParallelScrapingOrchestrator(config)
     orchestrator.run()
-
 
 if __name__ == "__main__":
     main()
