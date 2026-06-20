@@ -1,9 +1,9 @@
 import argparse
 import logging
 import os
-import time # Import time for sleep
+import time  # Import time for sleep
 from datetime import date, datetime, timezone
-from functools import wraps # Import wraps for decorator
+from functools import wraps  # Import wraps for decorator
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Callable, Any
 
@@ -11,11 +11,11 @@ import pandas as pd
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
-from database import YouTubeCommentsDatabase # Import YouTubeCommentsDatabase
+from database import YouTubeCommentsDatabase  # Import YouTubeCommentsDatabase
 
 BASE_COLUMNS = [
     "video_id",
-    "playlist_id", # Added playlist_id to BASE_COLUMNS
+    "playlist_id",  # Added playlist_id to BASE_COLUMNS
     "video_title",
     "source",
     "text",
@@ -29,30 +29,49 @@ BASE_COLUMNS = [
 ]
 
 # Playlists from channels: Auto Buyers Guide, The Car Care Nut, Doug Demuro, Out of Spec Reviews, Throttle House
-DEFAULT_PLAYLIST_IDS: List[str] = ['PLdmWqCdsjCu4xf48gB1CvyGXHApkEj8ck', 'PLdmWqCdsjCu6XXTGcfwQE-v-8qZKOUbPv', 'PLdmWqCdsjCu4IAZtt7cFYCI-5wLOu-W5v',
-                                   'PLdmWqCdsjCu6vdUJzxywmjNa9IMv9E4bP', 'PLdmWqCdsjCu4Ikxn-hvSiATgUkX5qo2iI', 'PLdmWqCdsjCu6sCNmmkITTmDBGJ1CRJ_ML',
-                                   'PLdmWqCdsjCu7ZFuv4M5QZYPHwnK9Da-lG', 'PLdmWqCdsjCu7Y-UCY7jFP1f86lI-IFBES', 'PLdmWqCdsjCu7PO4TJSdIgdIrhAHWGwHvj',
-                                   'PLeFzfl0Q8rQXWBaEZdyV1v5u1VIuESa-P', 'PLeFzfl0Q8rQX1NvPXH_Y9OgXqdYNT2TZ-', 'PLeFzfl0Q8rQWfHoQ9mKURykiclndxTn1_',
-                                   'PLeFzfl0Q8rQVV48qGZhzQWpapc_F8elah', 'PLeFzfl0Q8rQUy9XXwsTDP44mSCssiNlui', 'PLeFzfl0Q8rQWTHQJQhG_p4yQrseZ9J0wd',
-                                   'PLeFzfl0Q8rQW8DEc8TwYyc3LHqwATkHEl', 'PLeFzfl0Q8rQUIskEOInB1h4fUMuNa5P_Y', 'PLeFzfl0Q8rQWY5m2ivI9l6gk_PnkOYA_3',
-                                   'PLeFzfl0Q8rQXo-oi6JoPtJNibDi39zj7I', 'PLeFzfl0Q8rQXkSiT50RyVAkC_JIHXw318', 'PLeFzfl0Q8rQUdQRUQJ6qBSn_kwvY3jCDz',
-                                   'PLeFzfl0Q8rQVaJp_JfzPZm7oufiqv7yfS', 'PLeFzfl0Q8rQVkkMCL6YhpCO_zjSNhH0Er', 'PLeFzfl0Q8rQXIyh70R-2dKBuSlnFattem',
-                                   'PLeFzfl0Q8rQWLwOtDhDNGtdZwgMPAZiQa', 'PLeFzfl0Q8rQXfwL5Nfy3EfNnmxhf6oX1P', 'PLRsapyZqDs1o2_cfJNIxQzb-X1-mpYbdA',
-                                   'PLRsapyZqDs1ouavnWh8mpUBZsEjJYSCQI', 'PLRsapyZqDs1ptElTMW3o3PByTZLh4aHmO', 'PLRsapyZqDs1pmgg5rl2ox68CeUm72yG5-',
-                                   'PLRsapyZqDs1pC9lvVceSwqUrqx1u8UJ8d', 'PLRsapyZqDs1qzeBRxL7cgjzAY6QEcAaZe', 'PLRsapyZqDs1r0rPWDqedN2NfnSi6BvnTz',
-                                   'PLRsapyZqDs1rBVc5yES2M5cJY7sD2nrwN', 'PLRsapyZqDs1rCXGVr98GDWhf6xbHeCjDr', 'PLRsapyZqDs1qq65E6sWXSJELHGVqEeB_0',
-                                   'PLRsapyZqDs1psCURs8OOvaxPk-e2WiJZ1', 'PLRsapyZqDs1od8oRXNJvrrINjYPLJ4XUL', 'PLRsapyZqDs1oWFpAszIPLBAggO3i7MynT',
-                                   'PLRsapyZqDs1oRf6s2gk6qF0BN_kGKXSKZ', 'PLRsapyZqDs1paxezbET0LJ00M1IHesv0u', 'PLRsapyZqDs1oS4H-h-7PMeNF3bC1Df60q',
-                                   'PLRsapyZqDs1oMzw7_bLfVPpHQgefNsxvC', 'PLRsapyZqDs1qjJB9zPXM5gFVCZ3NDUWLH', 'PLRsapyZqDs1oitmbWCluObhfUGQ3ZuvzC',
-                                   'PLRsapyZqDs1ryftnOF61p1ez4K576556G', 'PLRsapyZqDs1r3sjTDWALSNHFuzejXk9vf', 'PLRsapyZqDs1rWoLJB2miI4tx_Q4_nAOXe',
-                                   'PLVa4b_Vn4gbBWaieOY6Z_zd37XlbHvsG6', 'PLVa4b_Vn4gbDD5IrxxVnYU7GVr_xjp9Zx', 'PLVa4b_Vn4gbCcL-FHtFY9837w0Hw5mAiG',
+DEFAULT_PLAYLIST_IDS: List[str] = ['PLdmWqCdsjCu4xf48gB1CvyGXHApkEj8ck', 'PLdmWqCdsjCu6XXTGcfwQE-v-8qZKOUbPv',
+                                   'PLdmWqCdsjCu4IAZtt7cFYCI-5wLOu-W5v',
+                                   'PLdmWqCdsjCu6vdUJzxywmjNa9IMv9E4bP', 'PLdmWqCdsjCu4Ikxn-hvSiATgUkX5qo2iI',
+                                   'PLdmWqCdsjCu6sCNmmkITTmDBGJ1CRJ_ML',
+                                   'PLdmWqCdsjCu7ZFuv4M5QZYPHwnK9Da-lG', 'PLdmWqCdsjCu7Y-UCY7jFP1f86lI-IFBES',
+                                   'PLdmWqCdsjCu7PO4TJSdIgdIrhAHWGwHvj',
+                                   'PLeFzfl0Q8rQXWBaEZdyV1v5u1VIuESa-P', 'PLeFzfl0Q8rQX1NvPXH_Y9OgXqdYNT2TZ-',
+                                   'PLeFzfl0Q8rQWfHoQ9mKURykiclndxTn1_',
+                                   'PLeFzfl0Q8rQVV48qGZhzQWpapc_F8elah', 'PLeFzfl0Q8rQUy9XXwsTDP44mSCssiNlui',
+                                   'PLeFzfl0Q8rQWTHQJQhG_p4yQrseZ9J0wd',
+                                   'PLeFzfl0Q8rQW8DEc8TwYyc3LHqwATkHEl', 'PLeFzfl0Q8rQUIskEOInB1h4fUMuNa5P_Y',
+                                   'PLeFzfl0Q8rQWY5m2ivI9l6gk_PnkOYA_3',
+                                   'PLeFzfl0Q8rQXo-oi6JoPtJNibDi39zj7I', 'PLeFzfl0Q8rQXkSiT50RyVAkC_JIHXw318',
+                                   'PLeFzfl0Q8rQUdQRUQJ6qBSn_kwvY3jCDz',
+                                   'PLeFzfl0Q8rQVaJp_JfzPZm7oufiqv7yfS', 'PLeFzfl0Q8rQVkkMCL6YhpCO_zjSNhH0Er',
+                                   'PLeFzfl0Q8rQXIyh70R-2dKBuSlnFattem',
+                                   'PLeFzfl0Q8rQWLwOtDhDNGtdZwgMPAZiQa', 'PLeFzfl0Q8rQXfwL5Nfy3EfNnmxhf6oX1P',
+                                   'PLRsapyZqDs1o2_cfJNIxQzb-X1-mpYbdA',
+                                   'PLRsapyZqDs1ouavnWh8mpUBZsEjJYSCQI', 'PLRsapyZqDs1ptElTMW3o3PByTZLh4aHmO',
+                                   'PLRsapyZqDs1pmgg5rl2ox68CeUm72yG5-',
+                                   'PLRsapyZqDs1pC9lvVceSwqUrqx1u8UJ8d', 'PLRsapyZqDs1qzeBRxL7cgjzAY6QEcAaZe',
+                                   'PLRsapyZqDs1r0rPWDqedN2NfnSi6BvnTz',
+                                   'PLRsapyZqDs1rBVc5yES2M5cJY7sD2nrwN', 'PLRsapyZqDs1rCXGVr98GDWhf6xbHeCjDr',
+                                   'PLRsapyZqDs1qq65E6sWXSJELHGVqEeB_0',
+                                   'PLRsapyZqDs1psCURs8OOvaxPk-e2WiJZ1', 'PLRsapyZqDs1od8oRXNJvrrINjYPLJ4XUL',
+                                   'PLRsapyZqDs1oWFpAszIPLBAggO3i7MynT',
+                                   'PLRsapyZqDs1oRf6s2gk6qF0BN_kGKXSKZ', 'PLRsapyZqDs1paxezbET0LJ00M1IHesv0u',
+                                   'PLRsapyZqDs1oS4H-h-7PMeNF3bC1Df60q',
+                                   'PLRsapyZqDs1oMzw7_bLfVPpHQgefNsxvC', 'PLRsapyZqDs1qjJB9zPXM5gFVCZ3NDUWLH',
+                                   'PLRsapyZqDs1oitmbWCluObhfUGQ3ZuvzC',
+                                   'PLRsapyZqDs1ryftnOF61p1ez4K576556G', 'PLRsapyZqDs1r3sjTDWALSNHFuzejXk9vf',
+                                   'PLRsapyZqDs1rWoLJB2miI4tx_Q4_nAOXe',
+                                   'PLVa4b_Vn4gbBWaieOY6Z_zd37XlbHvsG6', 'PLVa4b_Vn4gbDD5IrxxVnYU7GVr_xjp9Zx',
+                                   'PLVa4b_Vn4gbCcL-FHtFY9837w0Hw5mAiG',
                                    'PLuLtF2Rwd40U_7Tiia8CFUr62nXVrfQN-']
 DEFAULT_VIDEO_IDS: List[str] = []
+
 
 def retry_with_exponential_backoff(max_retries: int = 5, base_delay: float = 1.0):
     """
     Decorator to retry a function with exponential backoff on HttpError (403 Forbidden).
     """
+
     def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
         @wraps(func)
         def wrapper(*args: Any, **kwargs: Any) -> Any:
@@ -60,18 +79,22 @@ def retry_with_exponential_backoff(max_retries: int = 5, base_delay: float = 1.0
                 try:
                     return func(*args, **kwargs)
                 except HttpError as e:
-                    if e.resp.status == 403: # Quota Exceeded
+                    if e.resp.status == 403:  # Quota Exceeded
                         delay = base_delay * (2 ** i)
-                        logging.warning(f"Quota exceeded for {func.__name__}. Retrying in {delay:.2f} seconds... (Attempt {i+1}/{max_retries})")
+                        logging.warning(
+                            f"Quota exceeded for {func.__name__}. Retrying in {delay:.2f} seconds... (Attempt {i + 1}/{max_retries})")
                         time.sleep(delay)
                     else:
-                        raise # Re-raise other HttpErrors
+                        raise  # Re-raise other HttpErrors
                 except Exception as e:
                     logging.error(f"An unexpected error occurred in {func.__name__}: {e}")
                     raise
             logging.error(f"Max retries ({max_retries}) exceeded for {func.__name__}.")
-            raise HttpError(resp=None, content=b"Max retries exceeded for API call due to quota.") # Custom error if all retries fail
+            raise HttpError(resp=None,
+                            content=b"Max retries exceeded for API call due to quota.")  # Custom error if all retries fail
+
         return wrapper
+
     return decorator
 
 
@@ -112,12 +135,12 @@ def load_api_key(api_key_file: Optional[str] = None) -> Optional[str]:
 
 @retry_with_exponential_backoff()
 def fetch_comments(
-    video_id: str,
-    api_key: str,
-    max_comments: int,
-    order: str,
-    video_title: Optional[str] = None,
-    playlist_id: Optional[str] = None, # Added playlist_id parameter
+        video_id: str,
+        api_key: str,
+        max_comments: int,
+        order: str,
+        video_title: Optional[str] = None,
+        playlist_id: Optional[str] = None,  # Added playlist_id parameter
 ) -> List[Dict]:
     youtube = build("youtube", "v3", developerKey=api_key, cache_discovery=False)
     comments: List[Dict] = []
@@ -141,12 +164,12 @@ def fetch_comments(
             comments.append(
                 {
                     "video_id": video_id,
-                    "playlist_id": playlist_id, # Added playlist_id to comment data
+                    "playlist_id": playlist_id,  # Added playlist_id to comment data
                     "video_title": video_title,
                     "source": "comment",
                     "text": top_comment.get("textOriginal")
-                    or top_comment.get("textDisplay")
-                    or "",
+                            or top_comment.get("textDisplay")
+                            or "",
                     "comment_id": item.get("id"),
                     "author": top_comment.get("authorDisplayName"),
                     "like_count": top_comment.get("likeCount"),
@@ -181,9 +204,9 @@ def fetch_video_title(video_id: str, api_key: str) -> Optional[str]:
 
 @retry_with_exponential_backoff()
 def fetch_playlist_videos(
-    playlist_id: str,
-    api_key: str,
-    max_videos: int,
+        playlist_id: str,
+        api_key: str,
+        max_videos: int,
 ) -> List[Dict]:
     youtube = build("youtube", "v3", developerKey=api_key, cache_discovery=False)
     videos: List[Dict] = []
@@ -231,11 +254,11 @@ def build_dataframe(rows: Iterable[Dict]) -> pd.DataFrame:
 
 
 def run_pipeline(
-    video_id: str,
-    max_comments: int,
-    order: str,
-    db_path: Path,
-    api_key: str,
+        video_id: str,
+        max_comments: int,
+        order: str,
+        db_path: Path,
+        api_key: str,
 ) -> Path:
     extracted_at = datetime.now(timezone.utc).isoformat()
     rows: List[Dict] = []
@@ -258,7 +281,7 @@ def run_pipeline(
         row["extracted_at"] = extracted_at
 
     df = build_dataframe(rows)
-    
+
     db = YouTubeCommentsDatabase(str(db_path))
     inserted_count = db.insert_sentiment_data(df, table_name='youtube_comments_sentiment')
     db.close()
@@ -268,12 +291,12 @@ def run_pipeline(
 
 
 def run_playlist_pipeline(
-    playlist_id: str,
-    max_videos: int,
-    max_comments: int,
-    order: str,
-    db_path: Path,
-    api_key: str,
+        playlist_id: str,
+        max_videos: int,
+        max_comments: int,
+        order: str,
+        db_path: Path,
+        api_key: str,
 ) -> Path:
     videos = fetch_playlist_videos(playlist_id, api_key, max_videos)
     if not videos:
@@ -325,7 +348,7 @@ def main() -> None:
     parser.add_argument(
         "--max-comments",
         type=int,
-        default=0, # Defaulted to 0 to pull all by default, adjust as needed
+        default=0,  # Defaulted to 0 to pull all by default, adjust as needed
         help="Max comments to fetch per video (0 for all)",
     )
     parser.add_argument(
@@ -344,7 +367,7 @@ def main() -> None:
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(levelname)s - %(message)s")
 
-    db_path = Path(args.output_db) # Convert to Path object
+    db_path = Path(args.output_db)  # Convert to Path object
 
     # Load API key once at the beginning of main
     api_key = load_api_key(args.api_key_file)
@@ -362,7 +385,7 @@ def main() -> None:
     # Separate IDs into processed and unprocessed
     unprocessed_playlist_ids = [pid for pid in DEFAULT_PLAYLIST_IDS if pid not in processed_playlist_ids]
     processed_playlist_ids_to_recheck = [pid for pid in DEFAULT_PLAYLIST_IDS if pid in processed_playlist_ids]
-    
+
     unprocessed_video_ids = [vid for vid in DEFAULT_VIDEO_IDS if vid not in processed_video_ids]
     processed_video_ids_to_recheck = [vid for vid in DEFAULT_VIDEO_IDS if vid in processed_video_ids]
 
@@ -374,7 +397,7 @@ def main() -> None:
     if bool(args.video_id) == bool(args.playlist_id):
         if args.video_id or args.playlist_id:
             raise ValueError("Provide exactly one of --video-id or --playlist-id.")
-        if prioritized_playlist_ids: # Use prioritized list
+        if prioritized_playlist_ids:  # Use prioritized list
             for playlist_id in prioritized_playlist_ids:
                 output_target = run_playlist_pipeline(
                     playlist_id=playlist_id,
@@ -382,18 +405,18 @@ def main() -> None:
                     max_comments=args.max_comments,
                     order=args.comment_order,
                     db_path=db_path,
-                    api_key=api_key, # Pass the loaded API key
+                    api_key=api_key,  # Pass the loaded API key
                 )
                 print(f"Wrote data to DB: {output_target}")
             return
-        if prioritized_video_ids: # Use prioritized list
+        if prioritized_video_ids:  # Use prioritized list
             for video_id in prioritized_video_ids:
                 output_target = run_pipeline(
                     video_id=video_id,
                     max_comments=args.max_comments,
                     order=args.comment_order,
                     db_path=db_path,
-                    api_key=api_key, # Pass the loaded API key
+                    api_key=api_key,  # Pass the loaded API key
                 )
                 print(f"Wrote data to DB: {output_target}")
             return
@@ -408,7 +431,7 @@ def main() -> None:
             max_comments=args.max_comments,
             order=args.comment_order,
             db_path=db_path,
-            api_key=api_key, # Pass the loaded API key
+            api_key=api_key,  # Pass the loaded API key
         )
     else:
         output_target = run_pipeline(
@@ -416,7 +439,7 @@ def main() -> None:
             max_comments=args.max_comments,
             order=args.comment_order,
             db_path=db_path,
-            api_key=api_key, # Pass the loaded API key
+            api_key=api_key,  # Pass the loaded API key
         )
 
     print(f"Wrote data to DB: {output_target}")
