@@ -9,6 +9,7 @@ database. Use ``--sample-size 0`` only when you intentionally want a full pass.
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import sqlite3
 import warnings
@@ -20,6 +21,7 @@ from typing import Any
 import joblib
 import numpy as np
 import pandas as pd
+import scipy.sparse as sp
 from category_encoders import TargetEncoder
 from lightgbm import LGBMClassifier, LGBMRegressor
 from sklearn.base import BaseEstimator, RegressorMixin, clone
@@ -35,7 +37,7 @@ from sklearn.metrics import (
 )
 from sklearn.model_selection import GroupKFold, GroupShuffleSplit, RandomizedSearchCV
 from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.preprocessing import FunctionTransformer, OneHotEncoder, StandardScaler
 
 warnings.filterwarnings("ignore")
 
@@ -51,6 +53,11 @@ DEFAULT_SAMPLE_SIZE = 200_000
 DEFAULT_SAMPLE_STRATEGY = "recent"
 DEFAULT_TUNING_SAMPLE_SIZE = 200_000
 MAX_PARALLEL_TUNING_ROWS = 500_000
+DEFAULT_FEATURE_PROFILE_ROWS = 200_000
+RANDOM_FOREST_FULL_FIT_MAX_ROWS = 300_000
+RANDOM_FOREST_MAX_CATEGORIES_PER_FEATURE = 25
+RANDOM_FOREST_MAX_LEAF_NODES = 32_768
+MAX_MODEL_WEIGHT_ROWS = 40
 
 DROP_FEATURE_COLUMNS = {
     "price",
@@ -483,6 +490,11 @@ def make_feature_matrix(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series, pd.D
     return feature_df, y, df[["vin", "price", "price_band", "nhtsa_Make", "nhtsa_ModelYear"]].copy()
 
 
+def to_float32(X: Any) -> Any:
+    """Cast transformed numeric blocks to float32 to reduce full-fit memory."""
+    return X.astype(np.float32)
+
+
 def build_preprocessors(X_train: pd.DataFrame) -> tuple[ColumnTransformer, Pipeline, dict[str, Any]]:
     numeric_features = X_train.select_dtypes(include=[np.number, "bool"]).columns.tolist()
     categorical_features = X_train.select_dtypes(exclude=[np.number, "bool"]).columns.tolist()
@@ -502,17 +514,33 @@ def build_preprocessors(X_train: pd.DataFrame) -> tuple[ColumnTransformer, Pipel
         if c in forced_target_cols or X_train[c].nunique(dropna=True) > low_cardinality_threshold
     ]
 
-    numeric_pipeline = Pipeline([("imputer", SimpleImputer(strategy="median"))])
+    float32_cast = FunctionTransformer(to_float32, feature_names_out="one-to-one")
+    numeric_pipeline = Pipeline(
+        [
+            ("imputer", SimpleImputer(strategy="median")),
+            ("float32", float32_cast),
+        ]
+    )
     categorical_low = Pipeline(
         [
             ("imputer", SimpleImputer(strategy="constant", fill_value="UNKNOWN")),
-            ("onehot", OneHotEncoder(handle_unknown="ignore", sparse_output=True)),
+            (
+                "onehot",
+                OneHotEncoder(
+                    handle_unknown="infrequent_if_exist",
+                    min_frequency=10,
+                    max_categories=RANDOM_FOREST_MAX_CATEGORIES_PER_FEATURE,
+                    sparse_output=True,
+                    dtype=np.float32,
+                ),
+            ),
         ]
     )
     categorical_high = Pipeline(
         [
             ("imputer", SimpleImputer(strategy="constant", fill_value="UNKNOWN")),
-            ("target", TargetEncoder()),
+            ("target", TargetEncoder(min_samples_leaf=20, smoothing=10)),
+            ("float32", float32_cast),
         ]
     )
 
@@ -682,8 +710,11 @@ def model_candidates(tree_preprocessor: ColumnTransformer, linear_preprocessor: 
                     regressor=RandomForestRegressor(
                         n_estimators=250,
                         min_samples_leaf=5,
+                        max_depth=24,
+                        max_leaf_nodes=RANDOM_FOREST_MAX_LEAF_NODES,
+                        max_samples=0.5,
                         max_features="sqrt",
-                        n_jobs=-1,
+                        n_jobs=2,
                         random_state=RANDOM_STATE,
                     ),
                     func=np.log1p,
@@ -721,7 +752,8 @@ def model_candidates(tree_preprocessor: ColumnTransformer, linear_preprocessor: 
             random_forest,
             {
                 "model__regressor__n_estimators": [150, 250],
-                "model__regressor__min_samples_leaf": [3, 5, 10],
+                "model__regressor__min_samples_leaf": [10, 25, 50],
+                "model__regressor__max_leaf_nodes": [16_384, RANDOM_FOREST_MAX_LEAF_NODES],
                 "model__regressor__max_features": ["sqrt", 0.5],
             },
         ),
@@ -823,6 +855,104 @@ def stratified_tuning_sample_positions(
     return np.sort(sampled.astype(int))
 
 
+def transformed_matrix_memory_mb(matrix: Any) -> float:
+    if sp.issparse(matrix):
+        bytes_used = matrix.data.nbytes + matrix.indices.nbytes + matrix.indptr.nbytes
+    else:
+        bytes_used = matrix.nbytes
+    return float(bytes_used / 1024**2)
+
+
+def profile_feature_space(
+    X_train: pd.DataFrame,
+    y_train: pd.Series,
+    train_segments: pd.DataFrame,
+    tree_preprocessor: ColumnTransformer,
+    max_rows: int = DEFAULT_FEATURE_PROFILE_ROWS,
+) -> dict[str, Any]:
+    """Profile the transformed feature matrix on a bounded training sample."""
+    positions = stratified_tuning_sample_positions(train_segments, max_rows)
+    X_profile = X_train.iloc[positions]
+    y_profile = y_train.iloc[positions]
+    transformed = clone(tree_preprocessor).fit_transform(X_profile, y_profile)
+    sample_memory_mb = transformed_matrix_memory_mb(transformed)
+    projected_memory_mb = sample_memory_mb * (X_train.shape[0] / max(1, X_profile.shape[0]))
+    categorical_cardinality = (
+        X_train.select_dtypes(exclude=[np.number, "bool"])
+        .nunique(dropna=True)
+        .sort_values(ascending=False)
+    )
+    return {
+        "profile_rows": int(X_profile.shape[0]),
+        "training_rows": int(X_train.shape[0]),
+        "raw_pandas_training_frame_mb": float(X_train.memory_usage(deep=True).sum() / 1024**2),
+        "transformed_type": type(transformed).__name__,
+        "transformed_dtype": str(transformed.dtype),
+        "transformed_shape_on_profile": [int(transformed.shape[0]), int(transformed.shape[1])],
+        "transformed_sample_memory_mb": sample_memory_mb,
+        "projected_full_training_matrix_memory_mb": projected_memory_mb,
+        "is_sparse": bool(sp.issparse(transformed)),
+        "nonzero_entries": int(transformed.nnz) if sp.issparse(transformed) else None,
+        "top_categorical_cardinality": [
+            {"feature": str(feature), "unique_values": int(count)}
+            for feature, count in categorical_cardinality.head(25).items()
+        ],
+    }
+
+
+def final_fit_positions_for_model(
+    name: str,
+    train_segments: pd.DataFrame,
+    row_count: int,
+) -> np.ndarray:
+    if name != "Tree_RandomForest" or row_count <= RANDOM_FOREST_FULL_FIT_MAX_ROWS:
+        return np.arange(row_count)
+    return stratified_tuning_sample_positions(train_segments, RANDOM_FOREST_FULL_FIT_MAX_ROWS)
+
+
+def get_preprocessor_feature_names(preprocessor: Any, expected_count: int | None = None) -> list[str]:
+    try:
+        names = list(preprocessor.get_feature_names_out())
+    except Exception:
+        names = []
+    if expected_count is not None and len(names) != expected_count:
+        names = [f"feature_{idx}" for idx in range(expected_count)]
+    return [str(name) for name in names]
+
+
+def extract_model_feature_weights(model: Pipeline, top_n: int = MAX_MODEL_WEIGHT_ROWS) -> list[dict[str, Any]]:
+    """Return coefficient or feature-importance rows for fitted sklearn pipelines."""
+    if "preprocessor" not in model.named_steps or "model" not in model.named_steps:
+        return []
+
+    model_step = model.named_steps["model"]
+    estimator = getattr(model_step, "regressor_", model_step)
+    weight_type = "feature_importance"
+
+    if hasattr(estimator, "coef_"):
+        weights = np.ravel(estimator.coef_).astype("float64")
+        weight_type = "coefficient"
+    elif hasattr(estimator, "feature_importances_"):
+        weights = np.ravel(estimator.feature_importances_).astype("float64")
+    elif hasattr(estimator, "global_regressor_") and hasattr(estimator.global_regressor_, "feature_importances_"):
+        weights = np.ravel(estimator.global_regressor_.feature_importances_).astype("float64")
+        weight_type = "global_feature_importance"
+    else:
+        return []
+
+    feature_names = get_preprocessor_feature_names(model.named_steps["preprocessor"], len(weights))
+    rows = [
+        {
+            "feature": feature,
+            "weight": float(weight),
+            "abs_weight": float(abs(weight)),
+            "weight_type": weight_type,
+        }
+        for feature, weight in zip(feature_names, weights)
+    ]
+    return sorted(rows, key=lambda row: row["abs_weight"], reverse=True)[:top_n]
+
+
 def tune_and_fit(
     name: str,
     pipeline: Pipeline,
@@ -832,18 +962,45 @@ def tune_and_fit(
     groups: pd.Series,
     train_segments: pd.DataFrame,
     tuning_sample_size: int = DEFAULT_TUNING_SAMPLE_SIZE,
-) -> Pipeline:
+) -> tuple[Pipeline, dict[str, Any]]:
+    fit_metadata: dict[str, Any] = {
+        "tuned": False,
+        "max_tuning_rows": int(tuning_sample_size),
+        "final_fit_rows": int(X_train.shape[0]),
+        "final_fit_strategy": "full_training_split",
+    }
+
+    def fit_final(candidate: Pipeline, params: dict[str, Any] | None = None) -> Pipeline:
+        final_positions = final_fit_positions_for_model(name, train_segments, X_train.shape[0])
+        X_fit = X_train.iloc[final_positions]
+        y_fit = y_train.iloc[final_positions]
+        fit_metadata["final_fit_rows"] = int(X_fit.shape[0])
+        fit_metadata["final_fit_strategy"] = (
+            "representative_bounded_fit" if X_fit.shape[0] < X_train.shape[0] else "full_training_split"
+        )
+        if params:
+            fit_metadata["best_params"] = params
+        if X_fit.shape[0] < X_train.shape[0]:
+            fit_metadata["full_training_rows"] = int(X_train.shape[0])
+            fit_metadata["reason"] = (
+                f"{name} is sample-bounded to avoid multi-million-row tree-node memory growth."
+            )
+            print(
+                f"Fitting {name} on {X_fit.shape[0]:,} representative rows "
+                f"instead of {X_train.shape[0]:,} full rows to bound memory."
+            )
+        candidate.fit(X_fit, y_fit)
+        return candidate
+
     if not param_grid or X_train.shape[0] < 1_000 or groups.nunique() < 3:
-        pipeline.fit(X_train, y_train)
-        return pipeline
+        return fit_final(pipeline), fit_metadata
 
     tuning_positions = stratified_tuning_sample_positions(train_segments, tuning_sample_size)
     X_tune = X_train.iloc[tuning_positions]
     y_tune = y_train.iloc[tuning_positions]
     groups_tune = groups.iloc[tuning_positions]
     if groups_tune.nunique() < 3:
-        pipeline.fit(X_train, y_train)
-        return pipeline
+        return fit_final(pipeline), fit_metadata
 
     total_param_combinations = prod(len(values) for values in param_grid.values())
     cv = GroupKFold(n_splits=min(3, int(groups_tune.nunique())))
@@ -866,12 +1023,21 @@ def tune_and_fit(
         )
     search.fit(X_tune, y_tune, groups=groups_tune)
     print(f"Best parameters for {name}: {search.best_params_}")
+    fit_metadata.update(
+        {
+            "tuned": True,
+            "tuning_rows": int(X_tune.shape[0]),
+            "cv_folds": int(cv.n_splits),
+            "candidate_count": int(min(8, total_param_combinations)),
+            "best_params": search.best_params_,
+        }
+    )
     if X_tune.shape[0] < X_train.shape[0]:
-        print(f"Refitting {name} with tuned parameters on {X_train.shape[0]:,} training rows...")
+        print(f"Refitting {name} with tuned parameters after tuning...")
         tuned_model = clone(pipeline).set_params(**search.best_params_)
-        tuned_model.fit(X_train, y_train)
-        return tuned_model
-    return search.best_estimator_
+        return fit_final(tuned_model, search.best_params_), fit_metadata
+    fit_metadata["final_fit_rows"] = int(X_tune.shape[0])
+    return search.best_estimator_, fit_metadata
 
 
 def train_current_price_models(
@@ -901,14 +1067,22 @@ def train_current_price_models(
     X_train, y_train, train_segments = make_feature_matrix(train_df)
     X_test, y_test, test_segments = make_feature_matrix(test_df)
     tree_preprocessor, linear_preprocessor, feature_metadata = build_preprocessors(X_train)
+    feature_space_profile = profile_feature_space(
+        X_train,
+        y_train,
+        train_segments,
+        tree_preprocessor,
+    )
 
     metrics: dict[str, Any] = {}
+    model_fit_metadata: dict[str, Any] = {}
+    model_feature_weights: dict[str, list[dict[str, Any]]] = {}
     best_name = ""
     best_model: Pipeline | None = None
     best_mae = float("inf")
 
     for name, (pipeline, param_grid) in model_candidates(tree_preprocessor, linear_preprocessor).items():
-        model = tune_and_fit(
+        model, fit_metadata = tune_and_fit(
             name,
             pipeline,
             param_grid,
@@ -917,11 +1091,14 @@ def train_current_price_models(
             train_df["vin"].fillna("UNKNOWN"),
             train_segments,
         )
+        model_fit_metadata[name] = fit_metadata
         predictions = model.predict(X_test)
         model_metrics = evaluate_predictions(y_test, predictions)
         model_metrics["segment_metrics"] = segment_metrics(y_test, predictions, test_segments)
         metrics[name] = model_metrics
+        model_feature_weights[name] = extract_model_feature_weights(model)
         joblib.dump(model, output_dir / f"{name}.joblib")
+        gc.collect()
 
         if model_metrics["mae"] < best_mae:
             best_mae = model_metrics["mae"]
@@ -959,8 +1136,11 @@ def train_current_price_models(
         "tuning": {
             "max_tuning_rows": DEFAULT_TUNING_SAMPLE_SIZE,
             "sampling_strategy": "deterministic stratified sample by diagnostic price band, NHTSA make, and model year",
-            "final_fit": "best hyperparameters are refit on the full training split before evaluation",
+            "final_fit": "best hyperparameters are refit before evaluation; memory-heavy models can use a documented representative fit cap",
         },
+        "model_fit_metadata": model_fit_metadata,
+        "feature_space_profile": feature_space_profile,
+        "model_feature_weights": model_feature_weights,
         "leakage_controls": {
             "dropped_answer_derived_columns": ["price", "price_band"],
             "price_band_usage": "diagnostic segmentation only; never included in model inputs",
@@ -972,6 +1152,7 @@ def train_current_price_models(
             "Training defaults to the latest listing row per VIN to avoid duplicate VIN overweighting.",
             "Price bands are created only after observing price and are kept out of the feature matrix to avoid target leakage.",
             "Hyperparameters are tuned on a representative bounded sample, then refit on the full training split.",
+            "RandomForest is sample-bounded and leaf-bounded on large full-database runs because scikit-learn stores every fitted tree node in memory.",
             "The high-value router is useful only if it improves the >$150k segment without hurting global MAE/RMSLE.",
             "CatBoost remains a strong future candidate for categorical-heavy modeling but is not required for this dependency set.",
         ],
@@ -1000,6 +1181,9 @@ def write_reports(output_dir: Path, report: dict[str, Any]) -> None:
         f"- Train/test rows: {report['row_counts']['train_rows']:,} / {report['row_counts']['test_rows']:,}",
         f"- Split strategy: {report['split']['split_strategy']}",
         f"- VIN overlap: {report['split']['vin_overlap']}",
+        f"- Feature matrix profile: {report['feature_space_profile']['transformed_shape_on_profile'][1]:,} transformed columns on "
+        f"{report['feature_space_profile']['profile_rows']:,} profiled rows; projected full training matrix "
+        f"{report['feature_space_profile']['projected_full_training_matrix_memory_mb'] / 1024:,.2f} GB",
         "",
         "## Best Model Metrics",
         f"- MAE: ${best_metrics['mae']:,.2f}",
@@ -1014,6 +1198,19 @@ def write_reports(output_dir: Path, report: dict[str, Any]) -> None:
         md.append(
             f"- {name}: MAE ${metrics['mae']:,.2f}, RMSE ${metrics['rmse']:,.2f}, R2 {metrics['r2']:.4f}"
         )
+    md.extend(["", "## Fit Safeguards"])
+    for name, metadata in report.get("model_fit_metadata", {}).items():
+        md.append(
+            f"- {name}: {metadata.get('final_fit_strategy', 'unknown')} on "
+            f"{metadata.get('final_fit_rows', 0):,} rows"
+        )
+    weights = report.get("model_feature_weights", {}).get(best_name, [])
+    if weights:
+        md.extend(["", "## Top Feature Weights For Best Model"])
+        for row in weights[:12]:
+            md.append(
+                f"- {row['feature']}: {row['weight']:.4g} ({row['weight_type']})"
+            )
     md.extend(
         [
             "",

@@ -1,7 +1,7 @@
 import sqlite3
 import logging
 import threading
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 from typing import Optional, List, Set
 
 import pandas as pd  # Import pandas for to_sql method
@@ -439,6 +439,14 @@ class CarDatabase:
 
 
 class YouTubeCommentsDatabase:
+    FETCH_STATUS_PENDING = "pending"
+    FETCH_STATUS_COMPLETE = "complete"
+    FETCH_STATUS_ZERO_COMMENTS = "zero_comments"
+    FETCH_STATUS_COMMENTS_DISABLED = "comments_disabled"
+    FETCH_STATUS_QUOTA_EXHAUSTED = "quota_exhausted"
+    FETCH_STATUS_API_ERROR = "api_error"
+    RETRYABLE_STATUSES = {FETCH_STATUS_PENDING, FETCH_STATUS_QUOTA_EXHAUSTED, FETCH_STATUS_API_ERROR}
+
     def __init__(self, db_path: str):
         self.db_path = db_path
         self.conn = None
@@ -448,6 +456,55 @@ class YouTubeCommentsDatabase:
         if self.conn is None:
             self.conn = sqlite3.connect(self.db_path, timeout=30)
         return self.conn
+
+    def _ensure_columns(self, table_name: str, required_columns: dict[str, str]) -> None:
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            existing_columns = {
+                row[1]
+                for row in cursor.execute(f"PRAGMA table_info({table_name})").fetchall()
+            }
+            missing_columns = [
+                (column_name, column_type)
+                for column_name, column_type in required_columns.items()
+                if column_name not in existing_columns
+            ]
+            for column_name, column_type in missing_columns:
+                cursor.execute(
+                    f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_type}"
+                )
+            if missing_columns:
+                conn.commit()
+
+    def _ensure_unique_index(self, table_name: str, column_name: str, index_name: str) -> None:
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            existing_indexes = {
+                row[1]
+                for row in cursor.execute(f"PRAGMA index_list({table_name})").fetchall()
+            }
+            if index_name in existing_indexes:
+                return
+
+            duplicate_row = cursor.execute(
+                f'''
+                SELECT {column_name}, COUNT(*)
+                FROM {table_name}
+                GROUP BY {column_name}
+                HAVING COUNT(*) > 1 OR {column_name} IS NULL
+                LIMIT 1
+                '''
+            ).fetchone()
+            if duplicate_row is not None:
+                raise sqlite3.IntegrityError(
+                    f"Cannot create unique index {index_name} on {table_name}({column_name}) "
+                    "because duplicate or NULL values already exist."
+                )
+
+            cursor.execute(
+                f"CREATE UNIQUE INDEX IF NOT EXISTS {index_name} ON {table_name}({column_name})"
+            )
+            conn.commit()
 
     def _init_db(self):
         with self._get_connection() as conn:
@@ -483,7 +540,132 @@ class YouTubeCommentsDatabase:
                                TEXT
                            )
                            ''')
+            cursor.execute(
+                '''
+                CREATE TABLE IF NOT EXISTS youtube_playlist_fetch_state
+                (
+                    playlist_id TEXT PRIMARY KEY,
+                    last_discovered_at TEXT,
+                    last_status TEXT,
+                    last_error TEXT
+                )
+                '''
+            )
+            cursor.execute(
+                '''
+                CREATE TABLE IF NOT EXISTS youtube_video_fetch_state
+                (
+                    video_id TEXT PRIMARY KEY,
+                    playlist_id TEXT,
+                    video_title TEXT,
+                    discovered_at TEXT,
+                    last_attempted_at TEXT,
+                    last_succeeded_at TEXT,
+                    last_status TEXT,
+                    last_error TEXT,
+                    comments_seen_count INTEGER DEFAULT 0,
+                    next_eligible_at TEXT
+                )
+                '''
+            )
+            cursor.execute(
+                '''
+                CREATE TABLE IF NOT EXISTS youtube_comments_scored
+                (
+                    video_id TEXT,
+                    playlist_id TEXT,
+                    video_title TEXT,
+                    source TEXT,
+                    text TEXT,
+                    extracted_at TEXT,
+                    comment_id TEXT PRIMARY KEY,
+                    author TEXT,
+                    like_count REAL,
+                    reply_count INTEGER,
+                    published_at TEXT,
+                    updated_at TEXT,
+                    Vehicle_Entity TEXT,
+                    original_text TEXT,
+                    reliability_sentiment REAL,
+                    reliability_mentioned INTEGER,
+                    reliability_confidence REAL,
+                    value_sentiment REAL,
+                    value_mentioned INTEGER,
+                    value_confidence REAL,
+                    performance_sentiment REAL,
+                    performance_mentioned INTEGER,
+                    performance_confidence REAL,
+                    comfort_sentiment REAL,
+                    comfort_mentioned INTEGER,
+                    comfort_confidence REAL,
+                    consensus_weight REAL,
+                    word_count INTEGER,
+                    depth_weight REAL,
+                    comment_weight REAL,
+                    Weighted_Reliability_Score REAL,
+                    Weighted_Value_Score REAL,
+                    Weighted_Performance_Score REAL,
+                    Weighted_Comfort_Score REAL,
+                    processed_at TEXT,
+                    model_name TEXT,
+                    aspect_version TEXT
+                )
+                '''
+            )
+            cursor.execute(
+                "CREATE INDEX IF NOT EXISTS idx_youtube_video_fetch_state_status ON youtube_video_fetch_state(last_status)"
+            )
+            cursor.execute(
+                "CREATE INDEX IF NOT EXISTS idx_youtube_video_fetch_state_next_eligible ON youtube_video_fetch_state(next_eligible_at)"
+            )
+            cursor.execute(
+                "CREATE INDEX IF NOT EXISTS idx_youtube_video_fetch_state_playlist ON youtube_video_fetch_state(playlist_id)"
+            )
             conn.commit()
+        self._ensure_columns(
+            "youtube_comments_sentiment",
+            {
+                "playlist_id": "TEXT",
+            },
+        )
+        self._ensure_columns(
+            "youtube_comments_scored",
+            {
+                "processed_at": "TEXT",
+                "model_name": "TEXT",
+                "aspect_version": "TEXT",
+            },
+        )
+        self._ensure_unique_index(
+            "youtube_comments_scored",
+            "comment_id",
+            "idx_youtube_comments_scored_comment_id_unique",
+        )
+
+    @staticmethod
+    def _utcnow_iso() -> str:
+        return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+    @staticmethod
+    def _coerce_int(value: object, default: int = 0) -> int:
+        try:
+            return int(value) if value is not None else default
+        except (TypeError, ValueError):
+            return default
+
+    @classmethod
+    def _next_eligible_timestamp(
+        cls,
+        status: str,
+        refresh_days: int = 30,
+        backoff_hours: int = 6,
+    ) -> str:
+        now = datetime.now(timezone.utc).replace(microsecond=0)
+        if status in {cls.FETCH_STATUS_COMPLETE, cls.FETCH_STATUS_ZERO_COMMENTS, cls.FETCH_STATUS_COMMENTS_DISABLED}:
+            return (now + timedelta(days=max(refresh_days, 0))).isoformat()
+        if status in {cls.FETCH_STATUS_QUOTA_EXHAUSTED, cls.FETCH_STATUS_API_ERROR}:
+            return (now + timedelta(hours=max(backoff_hours, 0))).isoformat()
+        return now.isoformat()
 
     def insert_sentiment_data(self, df: pd.DataFrame, table_name: str = 'youtube_comments_sentiment'):
         """
@@ -533,6 +715,350 @@ class YouTubeCommentsDatabase:
             except Exception as e:
                 logging.error(f"Failed to insert sentiment data into {table_name}: {e}")
                 return 0
+
+    def ensure_video_fetch_state(
+        self,
+        video_id: str,
+        playlist_id: Optional[str] = None,
+        video_title: Optional[str] = None,
+        discovered_at: Optional[str] = None,
+    ) -> None:
+        discovered_at = discovered_at or self._utcnow_iso()
+        with self._get_connection() as conn:
+            conn.execute(
+                '''
+                INSERT INTO youtube_video_fetch_state (
+                    video_id,
+                    playlist_id,
+                    video_title,
+                    discovered_at,
+                    last_status,
+                    comments_seen_count,
+                    next_eligible_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(video_id) DO UPDATE SET
+                    playlist_id = COALESCE(excluded.playlist_id, youtube_video_fetch_state.playlist_id),
+                    video_title = COALESCE(excluded.video_title, youtube_video_fetch_state.video_title),
+                    discovered_at = COALESCE(youtube_video_fetch_state.discovered_at, excluded.discovered_at),
+                    next_eligible_at = COALESCE(youtube_video_fetch_state.next_eligible_at, excluded.next_eligible_at)
+                ''',
+                (
+                    video_id,
+                    playlist_id,
+                    video_title,
+                    discovered_at,
+                    self.FETCH_STATUS_PENDING,
+                    0,
+                    discovered_at,
+                ),
+            )
+            conn.commit()
+
+    def upsert_playlist_discovery(
+        self,
+        playlist_id: str,
+        videos: List[dict],
+        status: str = FETCH_STATUS_COMPLETE,
+        error: Optional[str] = None,
+    ) -> None:
+        discovered_at = self._utcnow_iso()
+        with self._get_connection() as conn:
+            conn.execute(
+                '''
+                INSERT INTO youtube_playlist_fetch_state (
+                    playlist_id,
+                    last_discovered_at,
+                    last_status,
+                    last_error
+                )
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(playlist_id) DO UPDATE SET
+                    last_discovered_at = excluded.last_discovered_at,
+                    last_status = excluded.last_status,
+                    last_error = excluded.last_error
+                ''',
+                (playlist_id, discovered_at, status, error),
+            )
+            for video in videos:
+                conn.execute(
+                    '''
+                    INSERT INTO youtube_video_fetch_state (
+                        video_id,
+                        playlist_id,
+                        video_title,
+                        discovered_at,
+                        last_status,
+                        comments_seen_count,
+                        next_eligible_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(video_id) DO UPDATE SET
+                        playlist_id = COALESCE(excluded.playlist_id, youtube_video_fetch_state.playlist_id),
+                        video_title = COALESCE(excluded.video_title, youtube_video_fetch_state.video_title),
+                        discovered_at = COALESCE(youtube_video_fetch_state.discovered_at, excluded.discovered_at)
+                    ''',
+                    (
+                        video.get("video_id"),
+                        playlist_id,
+                        video.get("title"),
+                        discovered_at,
+                        self.FETCH_STATUS_PENDING,
+                        0,
+                        discovered_at,
+                    ),
+                )
+            conn.commit()
+
+    def mark_playlist_discovery_error(self, playlist_id: str, status: str, error: str) -> None:
+        with self._get_connection() as conn:
+            conn.execute(
+                '''
+                INSERT INTO youtube_playlist_fetch_state (
+                    playlist_id,
+                    last_discovered_at,
+                    last_status,
+                    last_error
+                )
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(playlist_id) DO UPDATE SET
+                    last_discovered_at = excluded.last_discovered_at,
+                    last_status = excluded.last_status,
+                    last_error = excluded.last_error
+                ''',
+                (playlist_id, self._utcnow_iso(), status, error),
+            )
+            conn.commit()
+
+    def update_video_fetch_outcome(
+        self,
+        video_id: str,
+        status: str,
+        comments_seen_count: Optional[int] = None,
+        error: Optional[str] = None,
+        refresh_days: int = 30,
+        backoff_hours: int = 6,
+        playlist_id: Optional[str] = None,
+        video_title: Optional[str] = None,
+    ) -> None:
+        attempted_at = self._utcnow_iso()
+        succeeded_at = attempted_at if status in {
+            self.FETCH_STATUS_COMPLETE,
+            self.FETCH_STATUS_ZERO_COMMENTS,
+            self.FETCH_STATUS_COMMENTS_DISABLED,
+        } else None
+        next_eligible_at = self._next_eligible_timestamp(
+            status=status,
+            refresh_days=refresh_days,
+            backoff_hours=backoff_hours,
+        )
+        with self._get_connection() as conn:
+            conn.execute(
+                '''
+                INSERT INTO youtube_video_fetch_state (
+                    video_id,
+                    playlist_id,
+                    video_title,
+                    discovered_at,
+                    last_attempted_at,
+                    last_succeeded_at,
+                    last_status,
+                    last_error,
+                    comments_seen_count,
+                    next_eligible_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(video_id) DO UPDATE SET
+                    playlist_id = COALESCE(excluded.playlist_id, youtube_video_fetch_state.playlist_id),
+                    video_title = COALESCE(excluded.video_title, youtube_video_fetch_state.video_title),
+                    last_attempted_at = excluded.last_attempted_at,
+                    last_succeeded_at = COALESCE(excluded.last_succeeded_at, youtube_video_fetch_state.last_succeeded_at),
+                    last_status = excluded.last_status,
+                    last_error = excluded.last_error,
+                    comments_seen_count = COALESCE(excluded.comments_seen_count, youtube_video_fetch_state.comments_seen_count),
+                    next_eligible_at = excluded.next_eligible_at
+                ''',
+                (
+                    video_id,
+                    playlist_id,
+                    video_title,
+                    attempted_at,
+                    attempted_at,
+                    succeeded_at,
+                    status,
+                    error,
+                    comments_seen_count,
+                    next_eligible_at,
+                ),
+            )
+            conn.commit()
+
+    def get_video_fetch_state(self, video_id: str) -> Optional[dict]:
+        with self._get_connection() as conn:
+            row = conn.execute(
+                '''
+                SELECT video_id, playlist_id, video_title, discovered_at, last_attempted_at,
+                       last_succeeded_at, last_status, last_error, comments_seen_count, next_eligible_at
+                FROM youtube_video_fetch_state
+                WHERE video_id = ?
+                ''',
+                (video_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        columns = [
+            "video_id",
+            "playlist_id",
+            "video_title",
+            "discovered_at",
+            "last_attempted_at",
+            "last_succeeded_at",
+            "last_status",
+            "last_error",
+            "comments_seen_count",
+            "next_eligible_at",
+        ]
+        return dict(zip(columns, row))
+
+    def get_candidate_videos(
+        self,
+        refresh_days: int = 30,
+        force_recheck: bool = False,
+        limit: Optional[int] = None,
+        playlist_ids: Optional[List[str]] = None,
+        video_ids: Optional[List[str]] = None,
+        now_iso: Optional[str] = None,
+    ) -> List[dict]:
+        now_iso = now_iso or self._utcnow_iso()
+        filters = []
+        params: List[object] = [self.FETCH_STATUS_PENDING, now_iso, now_iso, 1 if force_recheck else 0]
+
+        if playlist_ids:
+            placeholders = ", ".join("?" for _ in playlist_ids)
+            filters.append(f"playlist_id IN ({placeholders})")
+            params.extend(playlist_ids)
+        if video_ids:
+            placeholders = ", ".join("?" for _ in video_ids)
+            filters.append(f"video_id IN ({placeholders})")
+            params.extend(video_ids)
+
+        where_sql = f"WHERE {' AND '.join(filters)}" if filters else ""
+        query = f'''
+            SELECT
+                video_id,
+                playlist_id,
+                video_title,
+                discovered_at,
+                last_attempted_at,
+                last_succeeded_at,
+                last_status,
+                last_error,
+                comments_seen_count,
+                next_eligible_at,
+                CASE
+                    WHEN last_status IS NULL OR last_status = ? THEN 1
+                    WHEN last_status IN ('quota_exhausted', 'api_error')
+                         AND (next_eligible_at IS NULL OR next_eligible_at <= ?) THEN 2
+                    WHEN last_status IN ('complete', 'zero_comments', 'comments_disabled')
+                         AND (next_eligible_at IS NULL OR next_eligible_at <= ?) THEN 3
+                    WHEN ? = 1 THEN 4
+                    ELSE 99
+                END AS priority_bucket
+            FROM youtube_video_fetch_state
+            {where_sql}
+            ORDER BY priority_bucket ASC,
+                     COALESCE(next_eligible_at, discovered_at, '') ASC,
+                     COALESCE(last_attempted_at, discovered_at, '') ASC,
+                     video_id ASC
+        '''
+
+        with self._get_connection() as conn:
+            rows = conn.execute(query, params).fetchall()
+
+        columns = [
+            "video_id",
+            "playlist_id",
+            "video_title",
+            "discovered_at",
+            "last_attempted_at",
+            "last_succeeded_at",
+            "last_status",
+            "last_error",
+            "comments_seen_count",
+            "next_eligible_at",
+            "priority_bucket",
+        ]
+        candidates = [dict(zip(columns, row)) for row in rows if row[-1] < 99]
+        if not force_recheck:
+            candidates = [row for row in candidates if row["priority_bucket"] < 4]
+        if limit is not None:
+            return candidates[:limit]
+        return candidates
+
+    def load_comments_for_absa(self, force_reprocess: bool = False, limit: Optional[int] = None) -> pd.DataFrame:
+        query = '''
+            SELECT raw.*
+            FROM youtube_comments_sentiment AS raw
+        '''
+        if not force_reprocess:
+            query += '''
+                LEFT JOIN youtube_comments_scored AS scored
+                    ON raw.comment_id = scored.comment_id
+                WHERE scored.comment_id IS NULL
+            '''
+        query += ' ORDER BY raw.published_at ASC, raw.comment_id ASC'
+        if limit is not None:
+            query += f' LIMIT {int(limit)}'
+        with self._get_connection() as conn:
+            return pd.read_sql_query(query, conn)
+
+    def upsert_scored_comments(self, df: pd.DataFrame) -> int:
+        if df.empty:
+            return 0
+        rows = df.drop_duplicates(subset=["comment_id"]).to_dict(orient="records")
+        if not rows:
+            return 0
+        columns = list(rows[0].keys())
+        placeholders = ", ".join("?" for _ in columns)
+        update_assignments = ", ".join(
+            f"{column}=excluded.{column}" for column in columns if column != "comment_id"
+        )
+        values = [tuple(row.get(column) for column in columns) for row in rows]
+        with self._get_connection() as conn:
+            conn.executemany(
+                f'''
+                INSERT INTO youtube_comments_scored ({", ".join(columns)})
+                VALUES ({placeholders})
+                ON CONFLICT(comment_id) DO UPDATE SET
+                    {update_assignments}
+                ''',
+                values,
+            )
+            conn.commit()
+        return len(rows)
+
+    def summarize_playlist_completion(self, playlist_id: str) -> dict:
+        with self._get_connection() as conn:
+            row = conn.execute(
+                '''
+                SELECT
+                    COUNT(*) AS total_videos,
+                    SUM(CASE WHEN last_status IS NULL OR last_status = 'pending' THEN 1 ELSE 0 END) AS pending_videos,
+                    SUM(CASE WHEN last_status IN ('complete', 'zero_comments', 'comments_disabled') THEN 1 ELSE 0 END) AS completed_videos,
+                    SUM(CASE WHEN last_status IN ('quota_exhausted', 'api_error') THEN 1 ELSE 0 END) AS retryable_videos
+                FROM youtube_video_fetch_state
+                WHERE playlist_id = ?
+                ''',
+                (playlist_id,),
+            ).fetchone()
+        total, pending, completed, retryable = row or (0, 0, 0, 0)
+        return {
+            "playlist_id": playlist_id,
+            "total_videos": self._coerce_int(total),
+            "pending_videos": self._coerce_int(pending),
+            "completed_videos": self._coerce_int(completed),
+            "retryable_videos": self._coerce_int(retryable),
+        }
 
     def get_processed_video_ids(self, table_name: str = 'youtube_comments_sentiment') -> Set[str]:
         """Retrieves a set of all video_ids already present in the sentiment table."""

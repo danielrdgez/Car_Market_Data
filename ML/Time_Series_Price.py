@@ -58,6 +58,7 @@ DEFAULT_MAX_PRICE = 250_000
 MIN_MODEL_ROWS = 50
 MIN_TEMPORAL_TRAIN_ROWS = 2
 MIN_TEMPORAL_TEST_ROWS = 2
+MAX_FEATURE_IMPORTANCE_ROWS = 40
 
 COHORT_COLUMNS = ["make", "model", "model_year", "trim_proxy"]
 
@@ -883,6 +884,36 @@ def evaluate_predictions(
     }
 
 
+def extract_pipeline_feature_importance(model: Pipeline, top_n: int = MAX_FEATURE_IMPORTANCE_ROWS) -> list[dict[str, Any]]:
+    """Return model-native feature importances for fitted cohort pipelines."""
+    if "preprocessor" not in model.named_steps or "model" not in model.named_steps:
+        return []
+
+    estimator = model.named_steps["model"]
+    if not hasattr(estimator, "feature_importances_"):
+        return []
+
+    try:
+        feature_names = list(model.named_steps["preprocessor"].get_feature_names_out())
+    except Exception:
+        feature_names = [f"feature_{idx}" for idx in range(len(estimator.feature_importances_))]
+
+    weights = np.ravel(estimator.feature_importances_).astype("float64")
+    if len(feature_names) != len(weights):
+        feature_names = [f"feature_{idx}" for idx in range(len(weights))]
+
+    rows = [
+        {
+            "feature": str(feature),
+            "importance": float(weight),
+            "abs_weight": float(abs(weight)),
+            "weight_type": "feature_importance",
+        }
+        for feature, weight in zip(feature_names, weights)
+    ]
+    return sorted(rows, key=lambda row: row["abs_weight"], reverse=True)[:top_n]
+
+
 def forecast_latest_cohorts(
     latest_features: pd.DataFrame,
     model: Pipeline,
@@ -1092,6 +1123,7 @@ def train_cohort_models(
         artifact_name = f"Cohort_Depreciation_{horizon}d.joblib"
         joblib.dump(final_model, output_dir / artifact_name)
         fitted_horizon_models[int(horizon)] = final_model
+        feature_importance = extract_pipeline_feature_importance(final_model)
         report["models"][target_col] = {
             "artifact": artifact_name,
             "validation_model_type": model_name,
@@ -1108,6 +1140,7 @@ def train_cohort_models(
             "tuning": tuning_metadata,
             "validation_warning": validation_warning,
             "metrics": metrics,
+            "feature_importance": feature_importance,
         }
 
     future_forecast_frames: list[pd.DataFrame] = []
@@ -1231,6 +1264,10 @@ def write_reports(output_dir: Path, report: dict[str, Any]) -> None:
                 artifact_model=model_report["artifact_model_type"],
             )
         )
+        importance = model_report.get("feature_importance", [])
+        if importance:
+            top_features = ", ".join(row["feature"] for row in importance[:6])
+            lines.append(f"  - Top model-native importance: {top_features}")
     lines.extend(
         [
             "",

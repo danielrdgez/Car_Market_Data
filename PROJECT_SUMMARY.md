@@ -114,15 +114,17 @@ The cleaned database is the preferred input for EDA and modeling.
 
 ### Sentiment and Aspect-Based NLP
 
-`DataPipeline/SentimentAnalysis.py` uses the YouTube Data API to collect comments from configured videos or playlists. It writes deduplicated comments to `CAR_DATA_OUTPUT/CAR_YOUTUBE_COMMENTS.db`.
+`DataPipeline/SentimentAnalysis.py` uses the YouTube Data API to collect comments from configured videos or playlists. It now persists playlist discovery plus per-video fetch state in `CAR_DATA_OUTPUT/CAR_YOUTUBE_COMMENTS.db`, prioritizes unseen videos first, and refreshes completed videos on a bounded schedule instead of restarting every playlist from the top on each run.
 
 `DataPipeline/absa_pipeline.py` performs aspect-based sentiment analysis:
 
 - Extracts vehicle entities from video titles.
 - Cleans comments and filters spam-like or low-information messages.
 - Uses zero-shot classification for reliability, value, performance, and comfort aspects.
+- Splits longer comments into smaller chunks before scoring to reduce mixed-topic dilution.
 - Applies comment weights based on likes and text depth.
-- Writes `vehicle_sentiment_index` and detailed scored comments to SQLite.
+- Scores only comments whose `comment_id` has not already been processed unless forced.
+- Rebuilds `vehicle_sentiment_index` from the persistent `youtube_comments_scored` table after each run.
 
 Sentiment features are intended to support the capstone question about whether consumer perception improves price or depreciation models.
 
@@ -182,6 +184,13 @@ python -m py_compile DataPipeline\Playwright_test.py DataPipeline\DataAquisition
 - Current-price train/test splitting has no VIN overlap.
 - Price-history gap loading correctly labels duplicate-like trajectories.
 
+`tests/test_sentiment_incremental.py` checks:
+
+- Video queue prioritization for unseen, stale, and partially completed playlist entries.
+- Zero-comment and quota-exhausted resume behavior.
+- Incremental ABSA loading by `comment_id`.
+- Scored-comment upserts and aggregate rebuild behavior.
+
 ## Operational Runbook
 
 Health check:
@@ -209,7 +218,9 @@ Sentiment ingestion:
 
 ```powershell
 python DataPipeline\SentimentAnalysis.py --playlist-id PLAYLIST_ID --max-videos 10 --max-comments 100
+python DataPipeline\SentimentAnalysis.py --refresh-days 30 --force-recheck
 python DataPipeline\absa_pipeline.py --run-all --limit 1000
+python DataPipeline\absa_pipeline.py --run-all --force-reprocess
 ```
 
 Current-price modeling:

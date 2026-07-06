@@ -1,23 +1,43 @@
-import os
-import re
 import argparse
 import logging
-import pandas as pd
+import os
+import re
+from datetime import datetime, timezone
+
 import numpy as np
+import pandas as pd
 
-# Database Import
-from database import CarDatabase
+try:
+    from database import CarDatabase, YouTubeCommentsDatabase
+except ImportError:  # pragma: no cover - used when imported as a package in tests
+    from DataPipeline.database import CarDatabase, YouTubeCommentsDatabase
 
-# Configure Logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
-# ==========================================
-# CONSTANTS & PRE-COMPILED PATTERNS
-# ==========================================
+ASPECT_VERSION = "v2_zero_shot_sentence_chunks"
+DEFAULT_MODEL_NAME = "facebook/bart-large-mnli"
+ASPECTS = ["reliability", "value", "performance", "comfort"]
+ASPECT_LABELS = {
+    "reliability": {
+        "positive": "positive owner sentiment about vehicle reliability, durability, or long-term dependability",
+        "negative": "negative owner sentiment about vehicle reliability, durability, breakdowns, or costly repairs",
+    },
+    "value": {
+        "positive": "positive sentiment about vehicle value, affordability, fair pricing, or cost of ownership",
+        "negative": "negative sentiment about vehicle value, overpricing, poor resale value, or expensive ownership",
+    },
+    "performance": {
+        "positive": "positive sentiment about vehicle performance, power, acceleration, handling, or driving dynamics",
+        "negative": "negative sentiment about vehicle performance, weak power, poor handling, or disappointing driving dynamics",
+    },
+    "comfort": {
+        "positive": "positive sentiment about vehicle comfort, interior quality, cabin space, ride quality, or features",
+        "negative": "negative sentiment about vehicle comfort, interior quality, cramped space, harsh ride, or poor features",
+    },
+}
+HYPOTHESIS_TEMPLATE = "This vehicle comment expresses {}."
+SENTENCE_SPLIT_PATTERN = re.compile(r"(?<=[.!?])\s+|\n+")
 
 MAKES_LIST = [
     "Toyota", "Lexus", "Honda", "Acura", "Ford", "Lincoln", "Chevrolet", "Chevy", "Cadillac", "GMC", "Buick",
@@ -33,7 +53,7 @@ MAKE_NORM_MAP = {
     "mercedes-benz": "Mercedes-Benz"
 }
 
-YEAR_PATTERN = re.compile(r'\b(19[89]\d|20[0-2]\d)\b')  # Matches 1980 - 2029
+YEAR_PATTERN = re.compile(r"\b(19[89]\d|20[0-2]\d)\b")
 
 MODEL_STOP_WORDS = {
     "review", "reviews", "vs", "versus", "comparison", "walkaround", "interior", "exterior",
@@ -46,63 +66,51 @@ MODEL_STOP_WORDS = {
     "owner", "owners", "ownership", "mile", "miles", "k", "years", "year", "month", "months"
 }
 
-# Pre-compiled Regex Patterns for Performance Optimization
-URL_PATTERN = re.compile(r'https?://\S+|www\.\S+')
-HTML_PATTERN = re.compile(r'<.*?>')
+URL_PATTERN = re.compile(r"https?://\S+|www\.\S+")
+HTML_PATTERN = re.compile(r"<.*?>")
 SPAM_PATTERNS = [re.compile(p, re.IGNORECASE) for p in [
-    r'\bsubscribe\b', r'\bmy channel\b', r'\bcheck out my\b', r'\bclick the link\b',
-    r'\bclick here\b', r'\btelegram\b', r'\bwhatsapp\b', r'\bcontact me\b',
-    r'\bpromo\b', r'\bdiscount\b', r'\bgiveaway\b'
+    r"\bsubscribe\b", r"\bmy channel\b", r"\bcheck out my\b", r"\bclick the link\b",
+    r"\bclick here\b", r"\btelegram\b", r"\bwhatsapp\b", r"\bcontact me\b",
+    r"\bpromo\b", r"\bdiscount\b", r"\bgiveaway\b"
 ]]
-BOT_PATTERN = re.compile(r'(.)\1{5,}')
-PHONE_PATTERN = re.compile(r'\+\d{1,3}[-.\s]?\d{3,4}[-.\s]?\d{4}')
-CRYPTO_PATTERN1 = re.compile(r'\b0x[a-fA-F0-9]{40}\b')
-CRYPTO_PATTERN2 = re.compile(r'\b[13][a-km-zA-HJ-NP-Z1-9]{25,34}\b')
-EXCESS_BANG = re.compile(r'!{2,}')
-EXCESS_QUESTION = re.compile(r'\?{2,}')
-EXCESS_DOTS = re.compile(r'\.{4,}')
+BOT_PATTERN = re.compile(r"(.)\1{5,}")
+PHONE_PATTERN = re.compile(r"\+\d{1,3}[-.\s]?\d{3,4}[-.\s]?\d{4}")
+CRYPTO_PATTERN1 = re.compile(r"\b0x[a-fA-F0-9]{40}\b")
+CRYPTO_PATTERN2 = re.compile(r"\b[13][a-km-zA-HJ-NP-Z1-9]{25,34}\b")
+EXCESS_BANG = re.compile(r"!{2,}")
+EXCESS_QUESTION = re.compile(r"\?{2,}")
+EXCESS_DOTS = re.compile(r"\.{4,}")
 
 
 def extract_vehicle(title: str) -> str:
-    """
-    Extracts Year, Make, and Model from a video title.
-    Returns f"{Year} {Make} {Model}" or None if extraction is not confident.
-    """
     if not title or not isinstance(title, str):
         return None
 
-    # 1. Extract Year
     year_match = YEAR_PATTERN.search(title)
     if not year_match:
         return None
     year = year_match.group(1)
 
-    # 2. Extract Make
     found_make = None
-    make_start = -1
     make_end = -1
-
     for make in MAKES_LIST:
         match = re.search(rf"\b{re.escape(make)}\b", title, re.IGNORECASE)
         if match:
             found_make = make
-            make_start = match.start()
             make_end = match.end()
             break
 
     if not found_make:
         return None
 
-    # 3. Extract Model from words after Make
     post_make_str = title[make_end:].strip()
     words = post_make_str.split()
     model_words = []
-
     for word in words:
-        cleaned_word = word.strip(".,;:!?|()-–—\"'[]{}")
+        cleaned_word = word.strip(".,;:!?|()-â€“â€”\"'[]{}")
         cleaned_word_lower = cleaned_word.lower()
 
-        if word.startswith(("|", "-", "–", "—", ":", "/", "\\")):
+        if word.startswith(("|", "-", "â€“", "â€”", ":", "/", "\\")):
             break
         if not cleaned_word:
             continue
@@ -114,8 +122,7 @@ def extract_vehicle(title: str) -> str:
             break
 
         model_words.append(cleaned_word)
-
-        if word.endswith((":", "|", "-", "–", "—", ".", "?", "!")):
+        if word.endswith((":", "|", "-", "â€“", "â€”", ".", "?", "!")):
             break
 
     model_words = model_words[:3]
@@ -124,21 +131,15 @@ def extract_vehicle(title: str) -> str:
 
     model = " ".join(model_words)
     normalized_make = MAKE_NORM_MAP.get(found_make.lower(), found_make.capitalize())
-
     return f"{year} {normalized_make} {model}"
 
 
 def clean_comment_text(text: str) -> str:
-    """
-    Cleans comment text and filters out spam, short messages, and bot behaviors using pre-compiled regex.
-    Returns cleaned text or None if the comment is filtered out.
-    """
     if not text or not isinstance(text, str):
         return None
 
-    text = URL_PATTERN.sub('', text)
-    text = HTML_PATTERN.sub('', text)
-
+    text = URL_PATTERN.sub("", text)
+    text = HTML_PATTERN.sub("", text)
     text_lower = text.strip().lower()
     if text_lower in {"first", "first!", "first!!", "first comment", "subscribe", "sub"}:
         return None
@@ -146,288 +147,322 @@ def clean_comment_text(text: str) -> str:
     for pattern in SPAM_PATTERNS:
         if pattern.search(text):
             return None
-
-    if BOT_PATTERN.search(text):
-        return None
-    if PHONE_PATTERN.search(text):
+    if BOT_PATTERN.search(text) or PHONE_PATTERN.search(text):
         return None
     if CRYPTO_PATTERN1.search(text) or CRYPTO_PATTERN2.search(text):
         return None
 
-    text = EXCESS_BANG.sub('!', text)
-    text = EXCESS_QUESTION.sub('?', text)
-    text = EXCESS_DOTS.sub('...', text)
-
+    text = EXCESS_BANG.sub("!", text)
+    text = EXCESS_QUESTION.sub("?", text)
+    text = EXCESS_DOTS.sub("...", text)
     text = text.strip()
-
-    words = text.split()
-    if len(words) < 3:
+    if len(text.split()) < 3:
         return None
-
     return text
 
 
-def load_data(db_path: str) -> pd.DataFrame:
-    """Loads comments from SQLite database using CarDatabase manager."""
-    logger.info(f"Connecting to database at {db_path}...")
+def split_comment_into_chunks(text: str, max_chunk_words: int = 45) -> list[str]:
+    if not text:
+        return []
+    sentences = [part.strip() for part in SENTENCE_SPLIT_PATTERN.split(text) if part.strip()]
+    if not sentences:
+        sentences = [text.strip()]
+
+    chunks: list[str] = []
+    current_words: list[str] = []
+    for sentence in sentences:
+        words = sentence.split()
+        if not words:
+            continue
+        if current_words and len(current_words) + len(words) > max_chunk_words:
+            chunks.append(" ".join(current_words))
+            current_words = []
+        if len(words) > max_chunk_words:
+            for start in range(0, len(words), max_chunk_words):
+                chunk_words = words[start:start + max_chunk_words]
+                if chunk_words:
+                    chunks.append(" ".join(chunk_words))
+            continue
+        current_words.extend(words)
+    if current_words:
+        chunks.append(" ".join(current_words))
+    return chunks or [text.strip()]
+
+
+def load_data(db_path: str, force_reprocess: bool = False, limit: int = None) -> pd.DataFrame:
+    logger.info("Connecting to database at %s...", db_path)
     if not os.path.exists(db_path):
         raise FileNotFoundError(f"Database file not found: {db_path}")
 
-    db = CarDatabase(db_path)
+    db = YouTubeCommentsDatabase(db_path)
     try:
-        conn = db._get_connection()
-        df = pd.read_sql_query("SELECT * FROM youtube_comments_sentiment", conn)
-        logger.info(f"Successfully loaded {len(df)} comments from database.")
+        df = db.load_comments_for_absa(force_reprocess=force_reprocess, limit=limit)
+        logger.info("Loaded %s comments for ABSA scoring.", len(df))
         return df
     finally:
         db.close()
 
 
+def load_all_scored_comments(db_path: str) -> pd.DataFrame:
+    db = CarDatabase(db_path)
+    try:
+        conn = db._get_connection()
+        return pd.read_sql_query("SELECT * FROM youtube_comments_scored", conn)
+    finally:
+        db.close()
+
+
 def run_phase1_preprocessing(df: pd.DataFrame) -> pd.DataFrame:
-    """Executes Phase 1: Ingestion & Preprocessing."""
     logger.info("Starting Phase 1: Data Ingestion & Preprocessing...")
+    if df.empty:
+        return df.copy()
 
-    logger.info("Extracting vehicle entities from video titles...")
-    df['Vehicle_Entity'] = df['video_title'].apply(extract_vehicle)
+    df = df.copy()
+    df["Vehicle_Entity"] = df["video_title"].apply(extract_vehicle)
+    unidentified_count = df["Vehicle_Entity"].isna().sum()
+    logger.info("Extraction summary: %s identified, %s unidentified.", len(df) - unidentified_count, unidentified_count)
 
-    unidentified_count = df['Vehicle_Entity'].isna().sum()
-    logger.info(f"Extraction summary: {len(df) - unidentified_count} identified, {unidentified_count} unidentified.")
-
-    df_clean = df.dropna(subset=['Vehicle_Entity']).copy()
-    logger.info(
-        f"Dropped {unidentified_count} rows with unidentified vehicle entities. {len(df_clean)} rows remaining.")
-
-    logger.info("Cleaning text and filtering spam/bots/short comments...")
-
-    # Simplified Pandas Dataframe logic for better performance
-    df_clean['original_text'] = df_clean['text']
-    df_clean['text'] = df_clean['text'].apply(clean_comment_text)
-
-    cleaned_drop_count = df_clean['text'].isna().sum()
-    df_clean = df_clean.dropna(subset=['text']).copy()
-
-    logger.info(f"Dropped {cleaned_drop_count} rows due to text cleaning/filtering. {len(df_clean)} rows remaining.")
-
+    df_clean = df.dropna(subset=["Vehicle_Entity"]).copy()
+    df_clean["original_text"] = df_clean["text"]
+    df_clean["text"] = df_clean["text"].apply(clean_comment_text)
+    cleaned_drop_count = df_clean["text"].isna().sum()
+    df_clean = df_clean.dropna(subset=["text"]).copy()
+    logger.info("Dropped %s rows during text cleaning. %s rows remain.", cleaned_drop_count, len(df_clean))
     return df_clean
 
 
-def run_absa_on_comments(df: pd.DataFrame, model_name: str = "facebook/bart-large-mnli",
-                         limit: int = None) -> pd.DataFrame:
-    """Executes Phase 2: Aspect-Based Sentiment Analysis."""
+def _aggregate_chunk_scores(chunk_scores: list[dict]) -> dict:
+    aggregated: dict[str, dict[str, float]] = {
+        aspect: {"sentiment": np.nan, "mentioned": 0, "confidence": 0.0}
+        for aspect in ASPECTS
+    }
+    for aspect in ASPECTS:
+        aspect_sentiments = []
+        aspect_confidences = []
+        for item in chunk_scores:
+            score = item[aspect]
+            if score["mentioned"]:
+                aspect_sentiments.append(score["sentiment"])
+                aspect_confidences.append(score["confidence"])
+        if aspect_confidences:
+            weights = np.array(aspect_confidences, dtype=float)
+            sentiments = np.array(aspect_sentiments, dtype=float)
+            aggregated[aspect]["mentioned"] = 1
+            aggregated[aspect]["confidence"] = float(weights.max())
+            aggregated[aspect]["sentiment"] = float(np.average(sentiments, weights=weights))
+    return aggregated
+
+
+def run_absa_on_comments(
+    df: pd.DataFrame,
+    model_name: str = DEFAULT_MODEL_NAME,
+    limit: int = None,
+) -> pd.DataFrame:
     logger.info("Initializing HuggingFace zero-shot classification pipeline...")
     import torch
     from transformers import pipeline
 
     device = 0 if torch.cuda.is_available() else -1
     classifier = pipeline("zero-shot-classification", model=model_name, device=device)
-
-    logger.info(f"Loaded classifier on device: {'GPU' if device == 0 else 'CPU'}")
-
-    aspect_mapping = {
-        "good reliability and durability": ("reliability", 1),
-        "bad reliability and durability": ("reliability", -1),
-        "good value and fair price": ("value", 1),
-        "bad value and overpriced": ("value", -1),
-        "good performance and handling": ("performance", 1),
-        "poor performance and handling": ("performance", -1),
-        "good comfort and interior": ("comfort", 1),
-        "poor comfort and interior": ("comfort", -1),
-    }
-    candidate_labels = list(aspect_mapping.keys())
+    logger.info("Loaded classifier on device: %s", "GPU" if device == 0 else "CPU")
 
     if limit:
         df = df.iloc[:limit].copy()
     else:
         df = df.copy()
+    if df.empty:
+        return df
 
-    texts = df['text'].tolist()
-
-    for aspect in ["reliability", "value", "performance", "comfort"]:
+    for aspect in ASPECTS:
         df[f"{aspect}_sentiment"] = np.nan
         df[f"{aspect}_mentioned"] = 0
         df[f"{aspect}_confidence"] = 0.0
 
-    logger.info(f"Running zero-shot classification on {len(texts)} comments...")
+    comment_chunks: list[str] = []
+    comment_positions: list[int] = []
+    for idx, text in enumerate(df["text"].tolist()):
+        chunks = split_comment_into_chunks(text)
+        for chunk in chunks:
+            comment_chunks.append(chunk)
+            comment_positions.append(idx)
 
+    candidate_labels = [label for aspect in ASPECTS for label in ASPECT_LABELS[aspect].values()]
     batch_size = 16
-    results = []
+    per_comment_scores: dict[int, list[dict]] = {}
+    logger.info("Running zero-shot classification on %s comment chunks...", len(comment_chunks))
 
-    for i in range(0, len(texts), batch_size):
-        batch_texts = texts[i:i + batch_size]
+    for start in range(0, len(comment_chunks), batch_size):
+        batch_chunks = comment_chunks[start:start + batch_size]
+        batch_positions = comment_positions[start:start + batch_size]
         batch_results = classifier(
-            batch_texts,
+            batch_chunks,
             candidate_labels=candidate_labels,
             multi_label=True,
-            hypothesis_template="This comment is about {}."
+            hypothesis_template=HYPOTHESIS_TEMPLATE,
         )
         if isinstance(batch_results, dict):
             batch_results = [batch_results]
-        results.extend(batch_results)
 
-        if (i + batch_size) % 64 == 0 or (i + batch_size) >= len(texts):
-            processed = min(i + batch_size, len(texts))
-            logger.info(f"Processed {processed}/{len(texts)} comments...")
+        for comment_idx, result in zip(batch_positions, batch_results):
+            label_scores = dict(zip(result["labels"], result["scores"]))
+            chunk_summary = {}
+            for aspect in ASPECTS:
+                pos_label = ASPECT_LABELS[aspect]["positive"]
+                neg_label = ASPECT_LABELS[aspect]["negative"]
+                s_pos = float(label_scores.get(pos_label, 0.0))
+                s_neg = float(label_scores.get(neg_label, 0.0))
+                max_score = max(s_pos, s_neg)
+                mentioned = int(max_score >= 0.40)
+                sentiment = (s_pos - s_neg) / (s_pos + s_neg + 1e-9) if mentioned else np.nan
+                chunk_summary[aspect] = {
+                    "mentioned": mentioned,
+                    "confidence": max_score if mentioned else 0.0,
+                    "sentiment": float(sentiment) if mentioned else np.nan,
+                }
+            per_comment_scores.setdefault(comment_idx, []).append(chunk_summary)
 
-    for idx, res in enumerate(results):
-        label_scores = dict(zip(res['labels'], res['scores']))
+        processed = min(start + batch_size, len(comment_chunks))
+        if processed % 64 == 0 or processed == len(comment_chunks):
+            logger.info("Processed %s/%s comment chunks...", processed, len(comment_chunks))
 
-        aspects = ["reliability", "value", "performance", "comfort"]
-        for aspect in aspects:
-            pos_label = [l for l, (a, p) in aspect_mapping.items() if a == aspect and p == 1][0]
-            neg_label = [l for l, (a, p) in aspect_mapping.items() if a == aspect and p == -1][0]
+    for idx in range(len(df)):
+        aggregated = _aggregate_chunk_scores(per_comment_scores.get(idx, []))
+        for aspect in ASPECTS:
+            df.iloc[idx, df.columns.get_loc(f"{aspect}_mentioned")] = aggregated[aspect]["mentioned"]
+            df.iloc[idx, df.columns.get_loc(f"{aspect}_confidence")] = aggregated[aspect]["confidence"]
+            df.iloc[idx, df.columns.get_loc(f"{aspect}_sentiment")] = aggregated[aspect]["sentiment"]
 
-            s_pos = label_scores[pos_label]
-            s_neg = label_scores[neg_label]
-
-            mention_threshold = 0.35
-            max_score = max(s_pos, s_neg)
-
-            if max_score > mention_threshold:
-                df.iloc[idx, df.columns.get_loc(f"{aspect}_mentioned")] = 1
-                df.iloc[idx, df.columns.get_loc(f"{aspect}_confidence")] = float(max_score)
-                sentiment = (s_pos - s_neg) / (s_pos + s_neg + 1e-9)
-                df.iloc[idx, df.columns.get_loc(f"{aspect}_sentiment")] = float(sentiment)
-
+    df["processed_at"] = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+    df["model_name"] = model_name
+    df["aspect_version"] = ASPECT_VERSION
     return df
 
 
 def apply_weights(df: pd.DataFrame) -> pd.DataFrame:
-    """Executes Phase 3: Weighted Scoring System."""
     logger.info("Starting Phase 3: Weighted Scoring System...")
     df = df.copy()
-
-    df['like_count'] = df['like_count'].fillna(0).astype(float)
-    df['consensus_weight'] = 1.0 + np.log10(df['like_count'] + 1.0)
-
-    df['word_count'] = df['text'].apply(lambda t: len(str(t).split()))
-    df['depth_weight'] = np.where(df['word_count'] >= 20, 1.2, 1.0)
-
-    df['comment_weight'] = df['consensus_weight'] * df['depth_weight']
-
-    aspects = ["reliability", "value", "performance", "comfort"]
-    for aspect in aspects:
-        df[f"Weighted_{aspect.capitalize()}_Score"] = df[f"{aspect}_sentiment"] * df['comment_weight']
-
+    df["like_count"] = df["like_count"].fillna(0).astype(float)
+    df["consensus_weight"] = 1.0 + np.log10(df["like_count"] + 1.0)
+    df["word_count"] = df["text"].apply(lambda t: len(str(t).split()))
+    df["depth_weight"] = np.where(df["word_count"] >= 20, 1.2, 1.0)
+    df["comment_weight"] = df["consensus_weight"] * df["depth_weight"]
+    for aspect in ASPECTS:
+        df[f"Weighted_{aspect.capitalize()}_Score"] = df[f"{aspect}_sentiment"] * df["comment_weight"]
     return df
 
 
-def run_phase4_aggregation(df: pd.DataFrame, output_dir: str) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Executes Phase 4: Aggregation and Database Export."""
+def persist_scored_comments(df: pd.DataFrame, db_path: str) -> int:
+    db = YouTubeCommentsDatabase(db_path)
+    try:
+        inserted = db.upsert_scored_comments(df)
+        logger.info("Upserted %s scored comments into youtube_comments_scored.", inserted)
+        return inserted
+    finally:
+        db.close()
+
+
+def run_phase4_aggregation(scored_df: pd.DataFrame, output_dir: str) -> tuple[pd.DataFrame, pd.DataFrame]:
     logger.info("Starting Phase 4: Aggregation and Index Creation...")
-
-    grouped = df.groupby('Vehicle_Entity')
-    aggregated_results = []
-
-    for entity, group in grouped:
-        sample_size = len(group)
-
-        reliability_group = group[group['reliability_mentioned'] == 1]
-        if not reliability_group.empty:
-            rel_weighted_sum = (reliability_group['reliability_sentiment'] * reliability_group['comment_weight']).sum()
-            weight_sum = reliability_group['comment_weight'].sum()
-            rel_weighted_avg = rel_weighted_sum / (weight_sum + 1e-9)
-            reliability_index = (rel_weighted_avg + 1.0) * 50.0
-        else:
-            reliability_index = np.nan
-
-        total_weighted_sentiment = 0.0
-        total_weights = 0.0
-
-        aspects = ["reliability", "value", "performance", "comfort"]
-        for aspect in aspects:
-            aspect_group = group[group[f"{aspect}_mentioned"] == 1]
-            if not aspect_group.empty:
-                total_weighted_sentiment += (aspect_group[f"{aspect}_sentiment"] * aspect_group['comment_weight']).sum()
-                total_weights += aspect_group['comment_weight'].sum()
-
-        if total_weights > 0:
-            gen_weighted_avg = total_weighted_sentiment / total_weights
-            general_enthusiast_score = (gen_weighted_avg + 1.0) * 50.0
-        else:
-            general_enthusiast_score = np.nan
-
-        times = []
-        sentiments = []
-        for _, row in group.iterrows():
-            date_val = pd.to_datetime(row['published_at'], errors='coerce')
-            if pd.isna(date_val):
-                continue
-
-            for aspect in aspects:
-                sent = row[f"{aspect}_sentiment"]
-                if not pd.isna(sent):
-                    times.append(date_val.timestamp() / (24 * 3600))
-                    sentiments.append(sent)
-
-        if len(sentiments) >= 5:
-            times = np.array(times)
-            sentiments = np.array(sentiments)
-            sentiment_std_dev = float(np.std(sentiments))
-            time_var = np.var(times)
-            if time_var == 0:
-                sentiment_trend_slope = 0.0
-            else:
-                sentiment_trend_slope = float(np.cov(times, sentiments)[0, 1] / time_var)
-        else:
-            sentiment_std_dev = np.nan
-            sentiment_trend_slope = np.nan
-
-        confidence_level = "High Confidence" if sample_size >= 30 else "Low Confidence"
-
-        aggregated_results.append({
-            "Vehicle_Entity": entity,
-            "Sample_Size": sample_size,
-            "Reliability_Index": reliability_index,
-            "General_Enthusiast_Score": general_enthusiast_score,
-            "Sentiment_Volatility_StdDev": sentiment_std_dev,
-            "Sentiment_Trend_Slope": sentiment_trend_slope,
-            "Confidence_Level": confidence_level
-        })
-
-    df_agg = pd.DataFrame(aggregated_results)
-
-    if not df_agg.empty:
-        df_agg = df_agg.sort_values(by="General_Enthusiast_Score", ascending=False).reset_index(drop=True)
-
-    # === NEW DATABASE EXPORT LOGIC ===
     db_path = os.path.join(output_dir, "CAR_YOUTUBE_COMMENTS.db")
-    logger.info(f"Exporting DataFrames to database: {db_path}...")
+    if scored_df.empty:
+        logger.warning("No scored comments available for aggregation.")
+        df_agg = pd.DataFrame(columns=[
+            "Vehicle_Entity",
+            "Sample_Size",
+            "Reliability_Index",
+            "General_Enthusiast_Score",
+            "Sentiment_Volatility_StdDev",
+            "Sentiment_Trend_Slope",
+            "Confidence_Level",
+        ])
+    else:
+        grouped = scored_df.groupby("Vehicle_Entity")
+        aggregated_results = []
+        for entity, group in grouped:
+            sample_size = len(group)
+
+            reliability_group = group[group["reliability_mentioned"] == 1]
+            if not reliability_group.empty:
+                rel_weighted_sum = (reliability_group["reliability_sentiment"] * reliability_group["comment_weight"]).sum()
+                rel_weighted_avg = rel_weighted_sum / (reliability_group["comment_weight"].sum() + 1e-9)
+                reliability_index = (rel_weighted_avg + 1.0) * 50.0
+            else:
+                reliability_index = np.nan
+
+            total_weighted_sentiment = 0.0
+            total_weights = 0.0
+            for aspect in ASPECTS:
+                aspect_group = group[group[f"{aspect}_mentioned"] == 1]
+                if not aspect_group.empty:
+                    total_weighted_sentiment += (aspect_group[f"{aspect}_sentiment"] * aspect_group["comment_weight"]).sum()
+                    total_weights += aspect_group["comment_weight"].sum()
+
+            general_enthusiast_score = (
+                (total_weighted_sentiment / total_weights + 1.0) * 50.0
+                if total_weights > 0
+                else np.nan
+            )
+
+            times = []
+            sentiments = []
+            for _, row in group.iterrows():
+                date_val = pd.to_datetime(row["published_at"], errors="coerce")
+                if pd.isna(date_val):
+                    continue
+                for aspect in ASPECTS:
+                    sent = row[f"{aspect}_sentiment"]
+                    if not pd.isna(sent):
+                        times.append(date_val.timestamp() / (24 * 3600))
+                        sentiments.append(sent)
+
+            if len(sentiments) >= 5:
+                times_np = np.array(times)
+                sentiments_np = np.array(sentiments)
+                sentiment_std_dev = float(np.std(sentiments_np))
+                time_var = np.var(times_np)
+                sentiment_trend_slope = 0.0 if time_var == 0 else float(np.cov(times_np, sentiments_np)[0, 1] / time_var)
+            else:
+                sentiment_std_dev = np.nan
+                sentiment_trend_slope = np.nan
+
+            confidence_level = "High Confidence" if sample_size >= 30 else "Low Confidence"
+            aggregated_results.append({
+                "Vehicle_Entity": entity,
+                "Sample_Size": sample_size,
+                "Reliability_Index": reliability_index,
+                "General_Enthusiast_Score": general_enthusiast_score,
+                "Sentiment_Volatility_StdDev": sentiment_std_dev,
+                "Sentiment_Trend_Slope": sentiment_trend_slope,
+                "Confidence_Level": confidence_level,
+            })
+
+        df_agg = pd.DataFrame(aggregated_results)
+        if not df_agg.empty:
+            df_agg = df_agg.sort_values(by="General_Enthusiast_Score", ascending=False).reset_index(drop=True)
 
     db = CarDatabase(db_path)
     try:
         conn = db._get_connection()
-
-        # Write tables to database, replacing previous runs
         df_agg.to_sql("vehicle_sentiment_index", conn, if_exists="replace", index=False)
-        logger.info("Successfully wrote 'vehicle_sentiment_index' table to DB.")
-
-        df.to_sql("youtube_comments_scored", conn, if_exists="replace", index=False)
-        logger.info("Successfully wrote 'youtube_comments_scored' table to DB.")
-    except Exception as e:
-        logger.error(f"Failed to write to database: {e}")
+        logger.info("Successfully rebuilt vehicle_sentiment_index from stored scored comments.")
     finally:
         db.close()
-
-    return df_agg, df
+    return df_agg, scored_df
 
 
 def run_tests():
-    """Runs a suite of tests on vehicle parsing and comment cleaning."""
     print("Running ABSA Pipeline Tests...")
-
     test_titles = {
         "2024 Toyota Camry Hybrid Review": "2024 Toyota Camry Hybrid",
         "2021 Ford F-150 Raptor vs Ram TRX": "2021 Ford F-150 Raptor",
         "Is the 2023 Honda Civic Type R worth $45k?": "2023 Honda Civic Type R",
         "2022 Hyundai Ioniq 5: An Amazing EV": "2022 Hyundai Ioniq 5",
         "Toyota Camry 2025 Review": "2025 Toyota Camry",
-        "Just a random video without car title": None
+        "Just a random video without car title": None,
     }
-
     for title, expected in test_titles.items():
         res = extract_vehicle(title)
         assert res == expected, f"Failed title extraction. Input: '{title}', Expected: '{expected}', Got: '{res}'"
-        print(f"PASSED title extraction: '{title}' -> '{res}'")
 
     test_comments = {
         "This car is amazing! I love the handling and design.": "This car is amazing! I love the handling and design.",
@@ -436,26 +471,26 @@ def run_tests():
         "Check out my whatsapp +1-555-0199 for investment tips!": None,
         "soooooooo goooooood": None,
         "Great car": None,
-        "Good.": None
+        "Good.": None,
     }
-
     for comment, expected in test_comments.items():
         res = clean_comment_text(comment)
         assert res == expected, f"Failed comment cleaning. Input: '{comment}', Expected: '{expected}', Got: '{res}'"
-        print(f"PASSED comment cleaning: '{comment}' -> '{res}'")
 
+    chunks = split_comment_into_chunks("Great power. But the ride is harsh and overpriced for what you get.")
+    assert len(chunks) >= 2, "Expected sentence chunking to split mixed-topic comments."
     print("All tests passed successfully!")
 
 
 def main():
     parser = argparse.ArgumentParser(description="Automotive Aspect-Based Sentiment Analysis Pipeline")
     parser.add_argument("--db-path", type=str, default="", help="Path to CAR_YOUTUBE_COMMENTS.db")
-    parser.add_argument("--inspect-phase1", action="store_true",
-                        help="Run only Phase 1 & inspect ingestion/preprocessing results")
+    parser.add_argument("--inspect-phase1", action="store_true", help="Run only Phase 1 & inspect preprocessing results")
     parser.add_argument("--test", action="store_true", help="Run validation tests")
     parser.add_argument("--limit", type=int, default=None, help="Limit number of comments to process")
-    parser.add_argument("--run-all", action="store_true", help="Run all 4 phases of the pipeline")
-
+    parser.add_argument("--run-all", action="store_true", help="Run all phases of the pipeline")
+    parser.add_argument("--force-reprocess", action="store_true", help="Ignore prior comment-level scoring state.")
+    parser.add_argument("--model-name", type=str, default=DEFAULT_MODEL_NAME, help="Hugging Face model for zero-shot ABSA.")
     args = parser.parse_args()
 
     if args.test:
@@ -464,33 +499,34 @@ def main():
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
     workspace_dir = os.path.dirname(script_dir)
-
-    db_path = args.db_path
-    if not db_path:
-        db_path = os.path.join(workspace_dir, "CAR_DATA_OUTPUT", "CAR_YOUTUBE_COMMENTS.db")
-
+    db_path = args.db_path or os.path.join(workspace_dir, "CAR_DATA_OUTPUT", "CAR_YOUTUBE_COMMENTS.db")
     output_dir = os.path.dirname(db_path)
 
     try:
-        df_raw = load_data(db_path)
-    except Exception as e:
-        logger.error(f"Failed to load data: {e}")
+        df_raw = load_data(db_path, force_reprocess=args.force_reprocess, limit=args.limit)
+    except Exception as exc:
+        logger.error("Failed to load data: %s", exc)
         return
 
     df_clean = run_phase1_preprocessing(df_raw)
-
     if args.inspect_phase1:
         print("\n=== Phase 1 Inspection: First 5 Rows of Cleaned Data ===")
-        inspect_cols = ['video_title', 'Vehicle_Entity', 'author', 'like_count', 'text', 'published_at']
+        inspect_cols = ["video_title", "Vehicle_Entity", "author", "like_count", "text", "published_at"]
         preview = df_clean[inspect_cols].head(5)
         print(preview.to_string(index=False))
         print("========================================================\n")
         return
 
     if args.run_all or (not args.inspect_phase1 and not args.test):
-        df_absa = run_absa_on_comments(df_clean, limit=args.limit)
-        df_weighted = apply_weights(df_absa)
-        df_agg, df_detailed = run_phase4_aggregation(df_weighted, output_dir)
+        if not df_clean.empty:
+            df_absa = run_absa_on_comments(df_clean, model_name=args.model_name, limit=None)
+            df_weighted = apply_weights(df_absa)
+            persist_scored_comments(df_weighted, db_path)
+        else:
+            logger.info("No new comments required scoring in this run.")
+
+        all_scored_df = load_all_scored_comments(db_path)
+        df_agg, _ = run_phase4_aggregation(all_scored_df, output_dir)
 
         print("\n=== Aggregated Results Summary ===")
         print(df_agg.head(10).to_string(index=False))
