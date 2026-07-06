@@ -2,59 +2,70 @@
 applyTo: "**/*.py"
 ---
 
-# Python & Scraper Guidelines: Car_Market_Data
+# Python and Scraper Guidelines: Automotive Market ML Capstone
 
-## 1. Global Logic & Strategy
-**Goal:** Scrape AutoTempest by acting as a "Human Browser" while intercepting backend JSON data.
-**Core Rule:** NEVER use standard Selenium methods if a "Stealth" or "API" alternative exists.
+## 1. Global Logic and Strategy
 
-### The "Golden Path" for Execution:
-1.  **Initialize** with `selenium-stealth` (hides bot flags).
-2.  **Navigate** using random delays and human-like mouse movements.
-3.  **Intercept** the `queue-results` JSON response via CDP (Network logs) instead of scraping HTML.
-4.  **Save** data incrementally to prevent loss during crashes.
+Goal: collect automotive market data as structured network payloads, enrich it, clean it, and model it with research-grade validation.
 
-### Style and Hygiene Rules
+Core rule: use API/network interception for vehicle listing data. Do not replace structured `queue-results` capture with HTML parsing.
+
+## 2. Active Scraper Path
+
+The active scraper is `DataPipeline/Playwright_test.py`.
+
+Preserve these patterns:
+
+1. Use Playwright response interception for `queue-results` fetch/XHR responses.
+2. Keep the global task queue over `(make, source button)` combinations.
+3. Keep bounded global browser concurrency through `MAX_GLOBAL_CONCURRENT_BROWSERS`.
+4. Stagger browser startup to avoid CPU, RAM, and network spikes.
+5. Use randomized waits between clicks and iterations.
+6. Persist rows incrementally through `CarDatabase(thread_safe=True)`.
+7. Keep `VINCache` aligned with database deduplication.
+8. Stop a button after `EXHAUSTION_STRIKE_COUNT` consecutive zero-row responses.
+
+Do not make scraper behavior more aggressive without adding stability safeguards and documenting the reason.
+
+## 3. Selenium Reference Path
+
+`DataPipeline/DataAquisition.py` is the legacy/reference Selenium CDP scraper.
+
+If touching this file:
+
+1. Preserve `selenium-stealth`.
+2. Preserve Chrome DevTools Protocol performance logging for `queue-results`.
+3. Keep automation flags disabled and use a realistic headless user agent.
+4. Keep randomized waits and per-button browser isolation.
+5. Do not convert it to HTML scraping.
+
+## 4. Data and Enrichment Standards
+
+1. Normalize price and mileage with existing helpers before insertion or analysis.
+2. Validate VINs before enrichment.
+3. Keep NHTSA-derived fields prefixed with `nhtsa_`.
+4. Preserve SQLite table meanings:
+   - `listings`: listing snapshots keyed by VIN and load date.
+   - `price_history`: normalized price history rows.
+   - `listing_history`: normalized listing history rows.
+   - `nhtsa_enrichment`: VIN-level official metadata and safety/recall/complaint fields.
+5. Prefer additive schema changes and update tests/docs with any schema change.
+
+## 5. Modeling and Research Standards
+
+1. Avoid target leakage. Do not include `price`, `price_band`, future prices, or answer-derived fields in model features.
+2. Preserve VIN-safe validation for current-price modeling.
+3. Prefer temporal validation when sufficient dates exist.
+4. Use bounded SQLite reads by default; full scans should be intentional.
+5. Set random seeds for ML, sampling, and search procedures.
+6. Report row counts, split strategy, metrics, caveats, and research rationale in model reports.
+7. Verify new research claims against current primary sources, official documentation, or peer-reviewed papers.
+
+## 6. Style and Hygiene Rules
+
 1. Keep generated code professional and readable; do not use emojis.
-2. Keep comments minimal and only for non-obvious logic.
+2. Use comments only for non-obvious logic.
 3. Do not create extra markdown docs unless requested; prefer updating existing project docs.
 4. If you add a Python package, update `requirements.txt` in the same change.
-
----
-
-## 2. Selenium Configuration (The "Stealth" Setup)
-**Target:** Bypass WAFs (Cloudflare/Akamai) by removing `navigator.webdriver` flags.
-
-**Required Code Pattern:**
-```python
-from selenium import webdriver
-from selenium_stealth import stealth
-
-def setup_driver(headless=False):
-    options = webdriver.ChromeOptions()
-    
-    # CRITICAL: Disable internal automation flags
-    options.add_experimental_option("excludeSwitches", ["enable-automation"])
-    options.add_experimental_option('useAutomationExtension', False)
-    options.add_argument('--disable-blink-features=AutomationControlled')
-    
-    # Enable Performance Logging (Required for API Interception)
-    options.set_capability("goog:loggingPrefs", {"performance": "ALL"})
-    
-    if headless:
-        # If headless, you MUST manually set a User-Agent
-        options.add_argument('--headless=new')
-        options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-
-    driver = webdriver.Chrome(options=options)
-
-    # Apply Stealth Library
-    stealth(driver,
-        languages=["en-US", "en"],
-        vendor="Google Inc.",
-        platform="Win32",
-        webgl_vendor="Intel Inc.",
-        renderer="Intel Iris OpenGL Engine",
-        fix_hairline=True,
-    )
-    return driver
+5. Keep direct script execution intact with `if __name__ == "__main__": main()`.
+6. Prefer repo-root-relative paths over machine-specific absolute paths when touching path logic.

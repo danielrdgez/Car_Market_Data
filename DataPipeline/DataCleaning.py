@@ -9,7 +9,10 @@ from typing import Iterable
 import pandas as pd
 import polars as pl
 
-from database import CarDatabase
+try:
+    from database import CarDatabase
+except ImportError:  # pragma: no cover - used when imported as a package in tests
+    from DataPipeline.database import CarDatabase
 
 
 MAKE_WHITELIST_UPPER = {
@@ -22,8 +25,10 @@ MAKE_WHITELIST_UPPER = {
 }
 
 LISTINGS_KEEP_COLUMNS = [
-    "vin", "date", "loaddate", "locationCode", "price", "mileage",
-    "sourceName", "sellerType", "vehicleTitle",
+    "vin", "date", "loaddate", "title", "location", "locationCode",
+    "countryCode", "pendingSale", "distance", "priceRecentChange", "price",
+    "mileage", "sourceName", "sellerType", "listingType", "vehicleTitle",
+    "vehicleTitleDesc",
 ]
 
 NHTSA_DROP_COLUMNS = {
@@ -249,6 +254,22 @@ class DataCleaningPipeline:
             conn.execute(f"DROP TABLE IF EXISTS {table_name}")
             conn.execute(f"CREATE TABLE {table_name} (\n    {columns_sql}\n)")
 
+    @staticmethod
+    def _create_indexes(conn: sqlite3.Connection) -> None:
+        """Create read-optimized indexes used by modeling and time-series tasks."""
+        index_statements = [
+            "CREATE INDEX IF NOT EXISTS idx_listings_vin ON listings (vin)",
+            "CREATE INDEX IF NOT EXISTS idx_listings_loaddate ON listings (loaddate)",
+            "CREATE INDEX IF NOT EXISTS idx_listings_price ON listings (price)",
+            "CREATE INDEX IF NOT EXISTS idx_nhtsa_make_model_year ON nhtsa_enrichment (nhtsa_Make, nhtsa_Model, nhtsa_ModelYear)",
+            "CREATE INDEX IF NOT EXISTS idx_listing_history_date ON listing_history (history_date)",
+            "CREATE INDEX IF NOT EXISTS idx_listing_history_vin_date ON listing_history (vin, history_date)",
+            "CREATE INDEX IF NOT EXISTS idx_price_history_date ON price_history (history_date)",
+            "CREATE INDEX IF NOT EXISTS idx_price_history_vin_date ON price_history (vin, history_date)",
+        ]
+        for statement in index_statements:
+            conn.execute(statement)
+
     def run(self) -> None:
         if not self.source_db_path.exists():
             raise FileNotFoundError(f"Source database not found: {self.source_db_path}")
@@ -257,11 +278,14 @@ class DataCleaningPipeline:
         logging.info("Source DB: %s", self.source_db_path)
         logging.info("Target DB: %s", self.target_db_path)
 
-        with sqlite3.connect(str(self.source_db_path)) as source_conn:
+        source_conn = sqlite3.connect(str(self.source_db_path))
+        try:
             listings = self._read_table(source_conn, "listings")
             listing_history = self._read_table(source_conn, "listing_history")
             price_history = self._read_table(source_conn, "price_history")
             nhtsa = self._read_table(source_conn, "nhtsa_enrichment")
+        finally:
+            source_conn.close()
 
         listings = listings.select([c for c in LISTINGS_KEEP_COLUMNS if c in listings.columns])
         listings = self._filter_non_empty(listings, ["vin", "loaddate"])
@@ -273,6 +297,7 @@ class DataCleaningPipeline:
         listings = self._filter_price_range(listings, "price")
 
         listings = self._cast_to_int(listings, ["locationCode"])
+        listings = self._cast_to_float(listings, ["distance"])
 
         nhtsa = self._filter_non_empty(nhtsa, ["vin", "nhtsa_Make", "nhtsa_Model", "nhtsa_ModelYear"]).with_columns(
             [
@@ -323,7 +348,8 @@ class DataCleaningPipeline:
         listing_history = listing_history.join(scoped_vins, on="vin", how="inner")
         price_history = price_history.join(scoped_vins, on="vin", how="inner")
 
-        with sqlite3.connect(str(self.target_db_path)) as target_conn:
+        target_conn = sqlite3.connect(str(self.target_db_path))
+        try:
             self._create_tables_from_polars(target_conn, {
                 "listings": (scoped_listings, ["vin", "loaddate"]),
                 "nhtsa_enrichment": (scoped_nhtsa, ["vin"]),
@@ -335,7 +361,10 @@ class DataCleaningPipeline:
             inserted_nhtsa = self._insert_dataframe(target_conn, "nhtsa_enrichment", scoped_nhtsa, conflict_mode="REPLACE")
             inserted_listing_hist = self._insert_dataframe(target_conn, "listing_history", listing_history, conflict_mode="IGNORE")
             inserted_price_hist = self._insert_dataframe(target_conn, "price_history", price_history, conflict_mode="IGNORE")
+            self._create_indexes(target_conn)
             target_conn.commit()
+        finally:
+            target_conn.close()
 
         logging.info("Finished cleaned database build")
         logging.info("Inserted listings: %d", inserted_listings)

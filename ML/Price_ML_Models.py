@@ -1,28 +1,39 @@
+"""
+Train current vehicle price models with leakage-safe validation.
+
+The script is intentionally conservative with large SQLite inputs. By default
+it trains on a bounded, recent sample instead of scanning the full 5 GB cleaned
+database. Use ``--sample-size 0`` only when you intentionally want a full pass.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
 import sqlite3
 import warnings
-from math import prod
 from datetime import datetime
+from math import prod
 from pathlib import Path
+from typing import Any
 
 import joblib
 import numpy as np
 import pandas as pd
 from category_encoders import TargetEncoder
 from lightgbm import LGBMClassifier, LGBMRegressor
+from sklearn.base import BaseEstimator, RegressorMixin, clone
 from sklearn.compose import ColumnTransformer, TransformedTargetRegressor
-from sklearn.ensemble import RandomForestRegressor, VotingClassifier
+from sklearn.ensemble import RandomForestRegressor
 from sklearn.impute import SimpleImputer
-from sklearn.linear_model import HuberRegressor, LogisticRegression, Ridge
+from sklearn.linear_model import ElasticNet, Ridge
 from sklearn.metrics import (
-    accuracy_score,
-    classification_report,
     mean_absolute_error,
     mean_absolute_percentage_error,
     mean_squared_error,
     r2_score,
-    roc_auc_score,
 )
-from sklearn.model_selection import RandomizedSearchCV, train_test_split
+from sklearn.model_selection import GroupKFold, GroupShuffleSplit, RandomizedSearchCV
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
@@ -36,130 +47,449 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 HIGH_VALUE_THRESHOLD = 150_000
 RANDOM_STATE = 42
+DEFAULT_SAMPLE_SIZE = 200_000
+DEFAULT_SAMPLE_STRATEGY = "recent"
+DEFAULT_TUNING_SAMPLE_SIZE = 200_000
+MAX_PARALLEL_TUNING_ROWS = 500_000
+
+DROP_FEATURE_COLUMNS = {
+    "price",
+    "price_band",
+    "vin",
+    "date",
+    "loaddate",
+    "Vehicle_Entity",
+}
+
+TARGET_ENCODE_TOKENS = (
+    "make",
+    "model",
+    "trim",
+    "manufacturer",
+    "segment",
+    "title",
+    "location",
+)
+
+RESEARCH_REFERENCES = [
+    {
+        "title": "How much is my car worth? A methodology for predicting used cars prices using Random Forest",
+        "url": "https://arxiv.org/abs/1711.06970",
+        "reason": "Supports tree-based supervised vehicle pricing with careful feature selection.",
+    },
+    {
+        "title": "ProbSAINT: Probabilistic Tabular Regression for Used Car Pricing",
+        "url": "https://arxiv.org/abs/2403.03812",
+        "reason": "Frames used-car pricing as tabular regression where uncertainty and dynamic market context matter.",
+    },
+    {
+        "title": "Manheim Used Vehicle Value Index Summary Methodology",
+        "url": "https://site.manheim.com/wp-content/uploads/sites/2/2024/02/Used-Vehicle-Summary-Methodology.pdf",
+        "reason": "Motivates mileage, mix, outlier, and seasonality controls for used-vehicle price modeling.",
+    },
+]
 
 
-def load_and_split_data():
-    """Load merged car and ABSA data, then split by the high-value routing target."""
-    print(f"Loading data from {DB_PATH}")
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute("ATTACH DATABASE ? AS absa", (str(ABSA_DB_PATH),))
-
-    cols_to_drop = [
-        "vin",
-        "year",
-        "details",
-        "title",
-        "date",
-        "location",
-        "currentBid",
-        "bids",
-        "vehicleTitleDesc",
-        "img",
-        "nhtsa_Trim2",
-        "nhtsa_safety_ratings_count",
-        "nhtsa_overall_rating",
-        "nhtsa_front_crash_rating",
-        "nhtsa_recall_components",
-        "nhtsa_latest_recall_date",
-        "nhtsa_complaint_injuries",
-        "nhtsa_complain_deaths",
-        "nhtsa_complaint_crash_related",
-        "nhtsa_complaint_fire_related",
-        "nhtsa_common_complaint_areas",
-        "nhtsa_ModelID",
-        "nhtsa_MakeID",
-        "nhtsa_BasePrice",
-        "loaddate",
-        "nhtsa_AdditionalErrorText",
-        "nhtsa_ManufacturerId",
-        "locationCode",
-        "nhtsa_OtherEngineInfo",
-        "nhtsa_DisplacementCC",
-        "nhtsa_DisplacementCI",
-        "countryCode",
-        "nhtsa_complaint_deaths",
-    ]
-
-    cursor = conn.cursor()
-    cursor.execute("PRAGMA table_info('listings')")
-    listings_cols = [row[1] for row in cursor.fetchall()]
-    cursor.execute("PRAGMA table_info('nhtsa_enrichment')")
-    nhtsa_cols = [row[1] for row in cursor.fetchall() if row[1] != "vin"]
-
-    selected_cols = [c for c in listings_cols + nhtsa_cols if c not in cols_to_drop]
-    selected_listing_cols = [f"l.{c}" for c in listings_cols if c in selected_cols]
-    selected_nhtsa_cols = [f"n.{c}" for c in nhtsa_cols if c in selected_cols]
-    vehicle_entity_expr = (
-        "CAST(n.nhtsa_ModelYear AS TEXT) || ' ' || n.nhtsa_Make || ' ' || n.nhtsa_Model"
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Train vehicle price ML models.")
+    parser.add_argument("--db-path", default=str(DB_PATH), help="Path to CAR_DATA_CLEANED.db.")
+    parser.add_argument("--absa-db-path", default=str(ABSA_DB_PATH), help="Path to sentiment DB.")
+    parser.add_argument("--output-dir", default=str(OUTPUT_DIR), help="Directory for model artifacts.")
+    parser.add_argument(
+        "--task",
+        choices=["current", "all"],
+        default="current",
+        help="'all' runs current-price modeling and then delegates history tasks to Time_Series_Price.",
     )
-    absa_cols = [
-        "vsi.Reliability_Index",
-        "vsi.General_Enthusiast_Score",
-        "vsi.Sentiment_Volatility_StdDev",
-        "vsi.Sentiment_Trend_Slope",
-        "vsi.Confidence_Level",
-    ]
-    query_cols = selected_listing_cols + selected_nhtsa_cols + [
-        f"{vehicle_entity_expr} AS Vehicle_Entity",
-        *absa_cols,
-    ]
+    parser.add_argument(
+        "--split-date",
+        default=None,
+        help="Validation date cutoff. Defaults to the 80th percentile listing load date.",
+    )
+    parser.add_argument(
+        "--sample-size",
+        type=int,
+        default=DEFAULT_SAMPLE_SIZE,
+        help="Bounded listing rows to load. Use 0 for the full cleaned listings table.",
+    )
+    parser.add_argument(
+        "--sample-strategy",
+        choices=["recent", "rowid_even", "none"],
+        default=DEFAULT_SAMPLE_STRATEGY,
+        help=(
+            "How to bound listings when --sample-size is positive. 'recent' uses "
+            "the loaddate index, 'rowid_even' spreads reads across the table, and "
+            "'none' is equivalent to the first N rows."
+        ),
+    )
+    parser.add_argument(
+        "--keep-duplicate-vins",
+        action="store_true",
+        help="Keep repeated VIN rows. By default, training keeps the latest loaddate per VIN.",
+    )
+    parser.add_argument(
+        "--horizons",
+        default="30,90,180,365",
+        help="Forecast horizons passed through when --task all is used.",
+    )
+    return parser.parse_args()
 
-    query = f"""
-    SELECT {', '.join(query_cols)}
-    FROM listings AS l
-    JOIN nhtsa_enrichment AS n USING(vin)
-    LEFT JOIN absa.Vehicle_Sentiment_Index AS vsi
-        ON {vehicle_entity_expr} = vsi.Vehicle_Entity
+
+def _table_columns(conn: sqlite3.Connection, table: str) -> list[str]:
+    return [row[1] for row in conn.execute(f"PRAGMA table_info('{table}')").fetchall()]
+
+
+def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
+    if "." in table:
+        schema, name = table.split(".", 1)
+        row = conn.execute(
+            f"SELECT 1 FROM {schema}.sqlite_master WHERE type = 'table' AND name = ?",
+            (name,),
+        ).fetchone()
+        return row is not None
+    row = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+        (table,),
+    ).fetchone()
+    return row is not None
+
+
+def _scoped_listings_sql(sample_size: int | None, sample_strategy: str) -> str:
+    """Return SQL for a bounded listings scope that remains friendly to SQLite."""
+    if not sample_size or sample_size <= 0:
+        return "SELECT * FROM listings"
+
+    sample_size = int(sample_size)
+    if sample_strategy == "recent":
+        return f"""
+            SELECT *
+            FROM listings
+            ORDER BY loaddate DESC
+            LIMIT {sample_size}
+        """
+    if sample_strategy == "rowid_even":
+        return f"""
+            WITH RECURSIVE max_row AS (
+                SELECT MAX(rowid) AS max_rowid FROM listings
+            ),
+            sample_ids(n, rid) AS (
+                SELECT
+                    0,
+                    1
+                UNION ALL
+                SELECT
+                    n + 1,
+                    CAST(1 + (n + 1) * ((max_rowid - 1.0) / {sample_size}) AS INTEGER)
+                FROM sample_ids, max_row
+                WHERE n + 1 < {sample_size}
+            )
+            SELECT l.*
+            FROM sample_ids AS s
+            JOIN listings AS l
+                ON l.rowid = s.rid
+        """
+    return f"SELECT * FROM listings LIMIT {sample_size}"
+
+
+def build_data_profile(
+    conn: sqlite3.Connection,
+    sample_size: int | None,
+    sample_strategy: str = DEFAULT_SAMPLE_STRATEGY,
+) -> dict[str, Any]:
+    """Collect schema and bounded sample metadata without expensive full scans."""
+    tables = {}
+    for table in ["listings", "nhtsa_enrichment", "listing_history", "price_history"]:
+        if not _table_exists(conn, table):
+            continue
+        tables[table] = {
+            "columns": _table_columns(conn, table),
+            "indexes": [row[1] for row in conn.execute(f"PRAGMA index_list('{table}')").fetchall()],
+        }
+
+    listing_sample_limit = sample_size if sample_size and sample_size > 0 else 10_000
+    scoped_listings = _scoped_listings_sql(listing_sample_limit, sample_strategy)
+    profile_query = f"""
+        SELECT
+            COUNT(*) AS sampled_rows,
+            MIN(price) AS min_price,
+            AVG(price) AS avg_price,
+            MAX(price) AS max_price,
+            MIN(mileage) AS min_mileage,
+            AVG(mileage) AS avg_mileage,
+            MAX(mileage) AS max_mileage,
+            MIN(loaddate) AS min_loaddate,
+            MAX(loaddate) AS max_loaddate
+        FROM (
+            {scoped_listings}
+        )
     """
-
-    df = pd.read_sql_query(query, conn)
-    conn.close()
-
-    float_cols = df.select_dtypes(include=["float64"]).columns
-    int_cols = df.select_dtypes(include=["int64"]).columns
-    df[float_cols] = df[float_cols].astype("float32")
-    df[int_cols] = df[int_cols].astype("int32")
-
-    year_col = "nhtsa_ModelYear" if "nhtsa_ModelYear" in df.columns else "Year"
-    target_col = "price" if "price" in df.columns else "Price"
-
-    df["vehicle_age"] = datetime.now().year - pd.to_numeric(df[year_col], errors="coerce")
-    df["vehicle_age"] = df["vehicle_age"].astype("float32")
-    df["is_high_value"] = (df[target_col] >= HIGH_VALUE_THRESHOLD).astype("int32")
-
-    train_df, test_df = train_test_split(
-        df,
-        test_size=0.2,
-        random_state=RANDOM_STATE,
-        stratify=df["is_high_value"],
-    )
-    train_df = train_df.reset_index(drop=True)
-    test_df = test_df.reset_index(drop=True)
-
-    print(f"Train size: {train_df.shape[0]:,} | Test size: {test_df.shape[0]:,}")
-    print(
-        "High-value train/test rates: "
-        f"{train_df['is_high_value'].mean():.4f} / {test_df['is_high_value'].mean():.4f}"
-    )
-
-    feature_drop_cols = [target_col, "is_high_value", "Vehicle_Entity"]
-    X_train = train_df.drop(columns=feature_drop_cols, errors="ignore")
-    y_train = train_df[target_col]
-    X_test = test_df.drop(columns=feature_drop_cols, errors="ignore")
-    y_test = test_df[target_col]
-
-    return X_train, y_train, X_test, y_test
+    sample_stats = pd.read_sql_query(profile_query, conn).iloc[0].to_dict()
+    return {
+        "database_tables": tables,
+        "listing_sample_limit": int(listing_sample_limit),
+        "listing_sample_strategy": sample_strategy,
+        "listing_sample_stats": sample_stats,
+    }
 
 
-def build_pipelines(X_train):
-    """Build tree and linear preprocessors with bounded one-hot expansion."""
-    numeric_features = X_train.select_dtypes(include=[np.number]).columns.tolist()
-    categorical_features = X_train.select_dtypes(exclude=[np.number]).columns.tolist()
+def load_modeling_frame(
+    db_path: Path | str = DB_PATH,
+    absa_db_path: Path | str | None = ABSA_DB_PATH,
+    sample_size: int | None = DEFAULT_SAMPLE_SIZE,
+    sample_strategy: str = DEFAULT_SAMPLE_STRATEGY,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    """Load a bounded current-price training frame from listings and NHTSA data."""
+    db_path = Path(db_path)
+    if not db_path.exists():
+        raise FileNotFoundError(f"SQLite database not found: {db_path}")
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        profile = build_data_profile(conn, sample_size, sample_strategy)
+        listings_cols = _table_columns(conn, "listings")
+        nhtsa_cols = [c for c in _table_columns(conn, "nhtsa_enrichment") if c != "vin"]
+
+        listing_select = [f"l.{c}" for c in listings_cols]
+        nhtsa_select = [f"n.{c}" for c in nhtsa_cols]
+        query_cols = listing_select + nhtsa_select
+
+        absa_join = ""
+        if absa_db_path and Path(absa_db_path).exists():
+            try:
+                conn.execute("ATTACH DATABASE ? AS absa", (str(absa_db_path),))
+                if _table_exists(conn, "absa.Vehicle_Sentiment_Index"):
+                    entity_expr = (
+                        "CAST(n.nhtsa_ModelYear AS TEXT) || ' ' || "
+                        "n.nhtsa_Make || ' ' || n.nhtsa_Model"
+                    )
+                    query_cols.extend(
+                        [
+                            f"{entity_expr} AS Vehicle_Entity",
+                            "vsi.Reliability_Index",
+                            "vsi.General_Enthusiast_Score",
+                            "vsi.Sentiment_Volatility_StdDev",
+                            "vsi.Sentiment_Trend_Slope",
+                            "vsi.Confidence_Level",
+                        ]
+                    )
+                    absa_join = f"""
+                        LEFT JOIN absa.Vehicle_Sentiment_Index AS vsi
+                            ON {entity_expr} = vsi.Vehicle_Entity
+                    """
+            except sqlite3.Error:
+                absa_join = ""
+
+        scoped_listings = _scoped_listings_sql(sample_size, sample_strategy)
+
+        query = f"""
+            WITH scoped_listings AS (
+                {scoped_listings}
+            )
+            SELECT {', '.join(query_cols)}
+            FROM scoped_listings AS l
+            INNER JOIN nhtsa_enrichment AS n USING(vin)
+            {absa_join}
+        """
+        df = pd.read_sql_query(query, conn)
+    finally:
+        conn.close()
+
+    if df.empty:
+        raise ValueError("No modeling rows were returned from the database query.")
+    return df, profile
+
+
+def engineer_current_price_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Create derived features from cleaned listing and NHTSA columns."""
+    df = df.copy()
+    df["price"] = pd.to_numeric(df["price"], errors="coerce")
+    df["mileage"] = pd.to_numeric(df["mileage"], errors="coerce")
+    df = df[df["price"].notna() & (df["price"] > 0)]
+    df = df[df["mileage"].notna() & (df["mileage"] >= 0)]
+
+    for col in ["date", "loaddate"]:
+        if col in df.columns:
+            df[col] = pd.to_datetime(df[col], errors="coerce")
+
+    model_year_col = "nhtsa_ModelYear"
+    if model_year_col in df.columns:
+        model_year = pd.to_numeric(df[model_year_col], errors="coerce")
+        df["vehicle_age"] = (datetime.now().year - model_year).clip(lower=0)
+        df["vehicle_age_squared"] = df["vehicle_age"] ** 2
+        df["miles_per_year"] = df["mileage"] / df["vehicle_age"].clip(lower=1)
+        df["model_year_bucket"] = (model_year // 5 * 5).astype("Int64").astype("string")
+    else:
+        df["vehicle_age"] = np.nan
+        df["vehicle_age_squared"] = np.nan
+        df["miles_per_year"] = np.nan
+        df["model_year_bucket"] = "UNKNOWN"
+
+    df["log_mileage"] = np.log1p(df["mileage"])
+    df["mileage_age_interaction"] = df["log_mileage"] * df["vehicle_age"].fillna(0)
+    df["mileage_bucket"] = pd.cut(
+        df["mileage"],
+        bins=[-1, 100, 5_000, 25_000, 60_000, 100_000, 150_000, np.inf],
+        labels=[
+            "delivery",
+            "under_5k",
+            "5k_25k",
+            "25k_60k",
+            "60k_100k",
+            "100k_150k",
+            "150k_plus",
+        ],
+    ).astype("string")
+    if "loaddate" in df.columns and df["loaddate"].notna().any():
+        max_load_date = df["loaddate"].max()
+        df["listing_recency_days"] = (max_load_date - df["loaddate"]).dt.days
+        df["listing_month"] = df["loaddate"].dt.month.astype("Int64")
+        df["listing_week"] = df["loaddate"].dt.isocalendar().week.astype("Int64")
+    else:
+        df["listing_recency_days"] = np.nan
+        df["listing_month"] = np.nan
+        df["listing_week"] = np.nan
+
+    if "locationCode" in df.columns:
+        location_text = df["locationCode"].astype("string").str.zfill(5)
+        df["location_region"] = location_text.str.slice(0, 2).fillna("UNKNOWN")
+
+    for col in ["pendingSale", "priceRecentChange"]:
+        if col in df.columns:
+            df[col] = df[col].astype("string").str.lower().isin(["1", "true", "yes"]).astype("int8")
+
+    for col in ["vehicleTitle", "vehicleTitleDesc", "title"]:
+        if col in df.columns:
+            text = df[col].astype("string").fillna("")
+            df[f"{col}_length"] = text.str.len()
+            df[f"{col}_word_count"] = text.str.split().str.len()
+
+    if "vehicleTitle" in df.columns:
+        title = df["vehicleTitle"].astype("string").fillna("")
+        df["title_mentions_certified"] = title.str.contains(
+            "certified|cpo",
+            case=False,
+            na=False,
+        ).astype("int8")
+        df["title_mentions_awd_4wd"] = title.str.contains(
+            "awd|4wd|4x4|all wheel",
+            case=False,
+            na=False,
+        ).astype("int8")
+        df["title_mentions_luxury_trim"] = title.str.contains(
+            "premium|platinum|limited|reserve|s|amg|m sport|rs|performance",
+            case=False,
+            na=False,
+        ).astype("int8")
+
+    if "sourceName" in df.columns:
+        source = df["sourceName"].astype("string").fillna("UNKNOWN")
+        df["source_is_marketplace"] = source.str.contains(
+            "Cars.com|TrueCar|CarGurus|AutoTempest",
+            case=False,
+            na=False,
+        ).astype("int8")
+
+    make = df.get("nhtsa_Make", pd.Series("UNKNOWN", index=df.index)).astype("string").fillna("UNKNOWN")
+    model = df.get("nhtsa_Model", pd.Series("UNKNOWN", index=df.index)).astype("string").fillna("UNKNOWN")
+    year = df.get("nhtsa_ModelYear", pd.Series("UNKNOWN", index=df.index)).astype("string").fillna("UNKNOWN")
+    body = df.get("nhtsa_BodyClass", pd.Series("UNKNOWN", index=df.index)).astype("string").fillna("UNKNOWN")
+    fuel = df.get("nhtsa_FuelTypePrimary", pd.Series("UNKNOWN", index=df.index)).astype("string").fillna("UNKNOWN")
+
+    df["make_model_year"] = make + "_" + model + "_" + year
+    df["body_fuel_segment"] = body + "_" + fuel
+    df["is_ev_or_hybrid"] = (
+        fuel.str.contains("electric|hybrid", case=False, na=False)
+        | df.get("nhtsa_ElectrificationLevel", pd.Series("", index=df.index))
+        .astype("string")
+        .str.contains("electric|hybrid|bev|phev", case=False, na=False)
+    ).astype("int8")
+
+    df["price_band"] = pd.cut(
+        df["price"],
+        bins=[0, 25_000, 50_000, 100_000, HIGH_VALUE_THRESHOLD, np.inf],
+        labels=["under_25k", "25k_50k", "50k_100k", "100k_150k", "150k_plus"],
+    ).astype("string")
+
+    return df.reset_index(drop=True)
+
+
+def keep_latest_listing_per_vin(df: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, Any]]:
+    """Keep one current-price row per VIN, preferring the latest load date."""
+    if "vin" not in df.columns:
+        return df, {"deduplicated_vins": False, "reason": "vin column missing"}
+
+    before_rows = int(df.shape[0])
+    before_vins = int(df["vin"].nunique(dropna=True))
+    sort_cols = [c for c in ["vin", "loaddate", "date"] if c in df.columns]
+
+    if sort_cols:
+        df = df.sort_values(sort_cols)
+    df = df.drop_duplicates(subset=["vin"], keep="last").reset_index(drop=True)
+
+    metadata = {
+        "deduplicated_vins": True,
+        "rows_before": before_rows,
+        "rows_after": int(df.shape[0]),
+        "distinct_vins_before": before_vins,
+        "rows_removed": int(before_rows - df.shape[0]),
+    }
+    return df, metadata
+
+
+def split_train_test(
+    df: pd.DataFrame,
+    split_date: str | None = None,
+    test_size: float = 0.2,
+) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, Any]]:
+    """Prefer a time cutoff, then remove overlapping VINs from the training set."""
+    df = df.copy()
+    if "loaddate" in df.columns:
+        df["loaddate"] = pd.to_datetime(df["loaddate"], errors="coerce")
+
+    if "loaddate" in df.columns and df["loaddate"].notna().nunique() >= 2:
+        cutoff = pd.Timestamp(split_date) if split_date else df["loaddate"].quantile(1 - test_size)
+        raw_train = df[df["loaddate"] < cutoff].copy()
+        test_df = df[df["loaddate"] >= cutoff].copy()
+        test_vins = set(test_df["vin"].dropna())
+        train_df = raw_train[~raw_train["vin"].isin(test_vins)].copy()
+        strategy = "time_cutoff_plus_vin_exclusion"
+
+        if train_df.shape[0] >= 100 and test_df.shape[0] >= 50:
+            metadata = {
+                "split_strategy": strategy,
+                "split_date": str(cutoff.date()),
+                "train_rows_removed_for_vin_overlap": int(raw_train.shape[0] - train_df.shape[0]),
+                "vin_overlap": int(len(set(train_df["vin"]).intersection(test_vins))),
+            }
+            return train_df.reset_index(drop=True), test_df.reset_index(drop=True), metadata
+
+    splitter = GroupShuffleSplit(n_splits=1, test_size=test_size, random_state=RANDOM_STATE)
+    groups = df["vin"].fillna("UNKNOWN")
+    train_idx, test_idx = next(splitter.split(df, df["price"], groups=groups))
+    train_df = df.iloc[train_idx].copy()
+    test_df = df.iloc[test_idx].copy()
+    metadata = {
+        "split_strategy": "group_shuffle_by_vin",
+        "split_date": None,
+        "train_rows_removed_for_vin_overlap": 0,
+        "vin_overlap": int(len(set(train_df["vin"]).intersection(set(test_df["vin"])))),
+    }
+    return train_df.reset_index(drop=True), test_df.reset_index(drop=True), metadata
+
+
+def make_feature_matrix(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series, pd.DataFrame]:
+    y = df["price"].astype("float64")
+    feature_df = df.drop(columns=[c for c in DROP_FEATURE_COLUMNS if c in df.columns], errors="ignore")
+    return feature_df, y, df[["vin", "price", "price_band", "nhtsa_Make", "nhtsa_ModelYear"]].copy()
+
+
+def build_preprocessors(X_train: pd.DataFrame) -> tuple[ColumnTransformer, Pipeline, dict[str, Any]]:
+    numeric_features = X_train.select_dtypes(include=[np.number, "bool"]).columns.tolist()
+    categorical_features = X_train.select_dtypes(exclude=[np.number, "bool"]).columns.tolist()
 
     low_cardinality_threshold = 50
-    target_encoded_name_tokens = ("make", "model", "trim")
     forced_target_cols = [
-        c for c in categorical_features if any(token in c.lower() for token in target_encoded_name_tokens)
+        c for c in categorical_features if any(token in c.lower() for token in TARGET_ENCODE_TOKENS)
     ]
     low_card_cols = [
         c
@@ -172,317 +502,170 @@ def build_pipelines(X_train):
         if c in forced_target_cols or X_train[c].nunique(dropna=True) > low_cardinality_threshold
     ]
 
-    numeric_tree = Pipeline(
-        steps=[
-            ("imputer", SimpleImputer(strategy="median")),
-        ]
-    )
-    numeric_linear = Pipeline(
-        steps=[
-            ("imputer", SimpleImputer(strategy="median")),
-        ]
-    )
+    numeric_pipeline = Pipeline([("imputer", SimpleImputer(strategy="median"))])
     categorical_low = Pipeline(
-        steps=[
+        [
             ("imputer", SimpleImputer(strategy="constant", fill_value="UNKNOWN")),
             ("onehot", OneHotEncoder(handle_unknown="ignore", sparse_output=True)),
         ]
     )
     categorical_high = Pipeline(
-        steps=[
+        [
             ("imputer", SimpleImputer(strategy="constant", fill_value="UNKNOWN")),
             ("target", TargetEncoder()),
         ]
     )
 
-    preprocessor_tree = ColumnTransformer(
-        transformers=[
-            ("num", numeric_tree, numeric_features),
+    tree_preprocessor = ColumnTransformer(
+        [
+            ("num", numeric_pipeline, numeric_features),
             ("cat_low", categorical_low, low_card_cols),
             ("cat_high", categorical_high, high_card_cols),
         ],
         remainder="drop",
     )
-    linear_feature_encoder = ColumnTransformer(
-        transformers=[
-            ("num", numeric_linear, numeric_features),
-            ("cat_low", categorical_low, low_card_cols),
-            ("cat_high", categorical_high, high_card_cols),
-        ],
-        remainder="drop",
-    )
-    preprocessor_linear = Pipeline(
-        steps=[
-            ("features", linear_feature_encoder),
+    linear_preprocessor = Pipeline(
+        [
+            ("features", tree_preprocessor),
             ("scaler", StandardScaler(with_mean=False)),
         ]
     )
-
-    print(f"Numeric features: {len(numeric_features)}")
-    print(f"Low-cardinality categorical features: {len(low_card_cols)}")
-    print(f"High-cardinality target-encoded features: {len(high_card_cols)}")
-
-    return preprocessor_tree, preprocessor_linear, numeric_features, low_card_cols, high_card_cols
-
-
-def sample_training_data(X_train, y_train, sample_size, stratify=None):
-    """Return a reproducible tuning subset without changing the full-training fit."""
-    if X_train.shape[0] <= sample_size:
-        return X_train, y_train
-
-    _, X_sample, _, y_sample = train_test_split(
-        X_train,
-        y_train,
-        test_size=sample_size,
-        random_state=RANDOM_STATE,
-        stratify=stratify,
-    )
-    return X_sample, y_sample
+    metadata = {
+        "numeric_features": numeric_features,
+        "low_cardinality_categorical_features": low_card_cols,
+        "high_cardinality_categorical_features": high_card_cols,
+    }
+    return tree_preprocessor, linear_preprocessor, metadata
 
 
-def evaluate_regressor(name, model, X_test, y_test):
-    preds = model.predict(X_test)
-    rmse = np.sqrt(mean_squared_error(y_test, preds))
-    mae = mean_absolute_error(y_test, preds)
-    mape = mean_absolute_percentage_error(y_test, preds)
-    r2 = r2_score(y_test, preds)
+class HighValueRoutedRegressor(BaseEstimator, RegressorMixin):
+    """
+    Route predictions through separate regressors for everyday and high-value cars.
 
-    print(f"--- {name} Results ---")
-    print(f"RMSE:  {rmse:.4f}")
-    print(f"MAE:   {mae:.4f}")
-    print(f"MAPE:  {mape:.4f} ({mape * 100:.2f}%)")
-    print(f"R2:    {r2:.4f}\n")
-    return rmse, mae, mape, r2
+    The classifier is trained only on training labels, then inference uses the
+    predicted high-value probability. This tests whether a sparse luxury/exotic
+    tail benefits from segmentation without leaking the actual price band.
+    """
 
+    def __init__(
+        self,
+        threshold: int = HIGH_VALUE_THRESHOLD,
+        probability_cutoff: float = 0.35,
+        min_high_value_rows: int = 50,
+        random_state: int = RANDOM_STATE,
+    ):
+        self.threshold = threshold
+        self.probability_cutoff = probability_cutoff
+        self.min_high_value_rows = min_high_value_rows
+        self.random_state = random_state
 
-def tune_and_train_classifier(pipeline, X_train, y_train):
-    """Tune voting weights on a subset, then fit the router on all training rows."""
-    sample_size = min(250_000, X_train.shape[0])
-    X_tune, y_tune = sample_training_data(
-        X_train,
-        y_train,
-        sample_size,
-        stratify=y_train if y_train.nunique() > 1 else None,
-    )
+    def fit(self, X: pd.DataFrame, y: pd.Series) -> "HighValueRoutedRegressor":
+        y_array = np.asarray(y, dtype="float64")
+        high_mask = y_array > self.threshold
+        high_count = int(high_mask.sum())
 
-    print(f"\nTuning high-value router on {X_tune.shape[0]:,} rows...")
-    search = RandomizedSearchCV(
-        pipeline,
-        param_distributions={
-            "weights": [
-                [0.9, 0.1],
-                [0.8, 0.2],
-                [0.7, 0.3],
-                [0.6, 0.4],
-                [0.5, 0.5],
-                [0.4, 0.6],
-            ]
-        },
-        n_iter=6,
-        cv=3,
-        scoring="roc_auc",
-        n_jobs=-1,
-        random_state=RANDOM_STATE,
-        verbose=1,
-    )
-    search.fit(X_tune, y_tune)
-    print(f"Best classifier parameters: {search.best_params_}")
+        self.classifier_ = LGBMClassifier(
+            objective="binary",
+            n_estimators=300,
+            learning_rate=0.05,
+            num_leaves=31,
+            min_child_samples=25,
+            class_weight="balanced",
+            random_state=self.random_state,
+            n_jobs=-1,
+            verbose=-1,
+        )
+        self.low_regressor_ = LGBMRegressor(
+            objective="regression",
+            n_estimators=700,
+            learning_rate=0.05,
+            num_leaves=63,
+            min_child_samples=50,
+            subsample=0.85,
+            colsample_bytree=0.85,
+            reg_lambda=1.0,
+            random_state=self.random_state,
+            n_jobs=-1,
+            verbose=-1,
+        )
+        self.high_regressor_ = clone(self.low_regressor_)
+        self.global_regressor_ = clone(self.low_regressor_)
 
-    best_model = search.best_estimator_
-    print(f"Training high-value router on full dataset ({X_train.shape[0]:,} rows)...")
-    best_model.fit(X_train, y_train)
-    return best_model
+        self.global_regressor_.fit(X, np.log1p(y_array))
+        self.low_regressor_.fit(X[~high_mask], np.log1p(y_array[~high_mask]))
+        self.has_high_value_expert_ = high_count >= self.min_high_value_rows
 
+        if self.has_high_value_expert_:
+            self.classifier_.fit(X, high_mask.astype("int8"))
+            self.high_regressor_.fit(X[high_mask], np.log1p(y_array[high_mask]))
 
-def tune_and_train_regressor(pipeline, param_grid, X_train, y_train, model_name, sample_size=100_000):
-    """Tune a regressor on a subset, then fit the best estimator on the full routed segment."""
-    if X_train.empty:
-        raise ValueError(f"{model_name} received an empty training segment.")
+        return self
 
-    sample_size = min(sample_size, X_train.shape[0])
-    X_tune, y_tune = sample_training_data(X_train, y_train, sample_size)
+    def predict(self, X: pd.DataFrame) -> np.ndarray:
+        global_preds = np.expm1(self.global_regressor_.predict(X))
+        low_preds = np.expm1(self.low_regressor_.predict(X))
 
-    print(f"\nTuning {model_name} on {X_tune.shape[0]:,} rows...")
-    total_param_combinations = prod(len(values) for values in param_grid.values()) if param_grid else 1
-    search = RandomizedSearchCV(
-        pipeline,
-        param_distributions=param_grid,
-        n_iter=min(8, total_param_combinations),
-        cv=3,
-        scoring="neg_root_mean_squared_error",
-        n_jobs=-1,
-        random_state=RANDOM_STATE,
-        verbose=1,
-    )
-    search.fit(X_tune, y_tune)
-    print(f"Best parameters for {model_name}: {search.best_params_}")
+        if not self.has_high_value_expert_:
+            return np.clip(global_preds, a_min=0, a_max=None)
 
-    best_model = search.best_estimator_
-    print(f"Training {model_name} on full segment ({X_train.shape[0]:,} rows)...")
-    best_model.fit(X_train, y_train)
-    return best_model
+        high_probability = self.classifier_.predict_proba(X)[:, 1]
+        high_preds = np.expm1(self.high_regressor_.predict(X))
+        routed_preds = np.where(
+            high_probability >= self.probability_cutoff,
+            high_preds,
+            low_preds,
+        )
 
-
-def evaluate_classifier(classifier, X_test, y_test):
-    y_route = (y_test >= HIGH_VALUE_THRESHOLD).astype(int)
-    predicted_labels = classifier.predict(X_test)
-    predicted_probs = classifier.predict_proba(X_test)[:, 1]
-
-    print("--- Stage 1 Classifier Results ---")
-    print(f"Accuracy: {accuracy_score(y_route, predicted_labels):.4f}")
-    print(f"ROC AUC:  {roc_auc_score(y_route, predicted_probs):.4f}")
-    print(classification_report(y_route, predicted_labels, digits=4))
+        # Blend lightly with the global model to reduce hard-router volatility.
+        blended = 0.85 * routed_preds + 0.15 * global_preds
+        return np.clip(blended, a_min=0, a_max=None)
 
 
-def evaluate_full_pipeline(classifier, regressor_everyday, regressor_exotic, X_test, y_test):
-    """Route test rows through the classifier, then score the combined price predictions."""
-    predicted_labels = classifier.predict(X_test)
-    predictions = np.empty(X_test.shape[0], dtype=np.float64)
-
-    everyday_mask = predicted_labels == 0
-    exotic_mask = predicted_labels == 1
-
-    if everyday_mask.any():
-        predictions[everyday_mask] = regressor_everyday.predict(X_test.loc[everyday_mask])
-    if exotic_mask.any():
-        predictions[exotic_mask] = regressor_exotic.predict(X_test.loc[exotic_mask])
-
-    rmse = np.sqrt(mean_squared_error(y_test, predictions))
-    mae = mean_absolute_error(y_test, predictions)
-    mape = mean_absolute_percentage_error(y_test, predictions)
-    r2 = r2_score(y_test, predictions)
-
-    print("--- Full Two-Stage Routed System Results ---")
-    print(f"Routed to everyday regressor: {everyday_mask.sum():,}")
-    print(f"Routed to exotic regressor:   {exotic_mask.sum():,}")
-    print(f"RMSE:  {rmse:.4f}")
-    print(f"MAE:   {mae:.4f}")
-    print(f"MAPE:  {mape:.4f} ({mape * 100:.2f}%)")
-    print(f"R2:    {r2:.4f}\n")
-    return rmse, mae, mape, r2
-
-
-def main():
-    X_train, y_train, X_test, y_test = load_and_split_data()
-    preprocessor_tree, preprocessor_linear, _, _, _ = build_pipelines(X_train)
-
-    y_train_classifier = (y_train >= HIGH_VALUE_THRESHOLD).astype(int)
-
-    lgbm_classifier_pipeline = Pipeline(
-        steps=[
-            ("preprocessor", preprocessor_tree),
-            (
-                "model",
-                LGBMClassifier(
-                    class_weight="balanced",
-                    n_jobs=-1,
-                    random_state=RANDOM_STATE,
-                    verbose=-1,
-                ),
-            ),
-        ]
-    )
-    logistic_classifier_pipeline = Pipeline(
-        steps=[
-            ("preprocessor", preprocessor_linear),
-            (
-                "model",
-                LogisticRegression(
-                    penalty="elasticnet",
-                    solver="saga",
-                    l1_ratio=0.5,
-                    n_jobs=-1,
-                    max_iter=200,
-                    class_weight="balanced",
-                    random_state=RANDOM_STATE,
-                ),
-            ),
-        ]
-    )
-    classifier = VotingClassifier(
-        estimators=[
-            ("lgbm", lgbm_classifier_pipeline),
-            ("logistic", logistic_classifier_pipeline),
-        ],
-        voting="soft",
-    )
-    classifier = tune_and_train_classifier(classifier, X_train, y_train_classifier)
-    evaluate_classifier(classifier, X_test, y_test)
-    joblib.dump(classifier, OUTPUT_DIR / "Stage1_High_Value_Router.joblib")
-
-    everyday_mask = y_train < HIGH_VALUE_THRESHOLD
-    exotic_mask = y_train >= HIGH_VALUE_THRESHOLD
-    X_train_everyday = X_train.loc[everyday_mask].reset_index(drop=True)
-    y_train_everyday = y_train.loc[everyday_mask].reset_index(drop=True)
-    X_train_exotic = X_train.loc[exotic_mask].reset_index(drop=True)
-    y_train_exotic = y_train.loc[exotic_mask].reset_index(drop=True)
-
-    print(f"\nEveryday training rows: {X_train_everyday.shape[0]:,}")
-    print(f"Exotic training rows:   {X_train_exotic.shape[0]:,}")
-
-    everyday_lgbm = Pipeline(
-        steps=[
-            ("preprocessor", preprocessor_tree),
+def model_candidates(tree_preprocessor: ColumnTransformer, linear_preprocessor: Pipeline) -> dict[str, tuple[Pipeline, dict[str, list[Any]]]]:
+    ridge = Pipeline(
+        [
+            ("preprocessor", clone(linear_preprocessor)),
             (
                 "model",
                 TransformedTargetRegressor(
-                    regressor=LGBMRegressor(n_jobs=-1, random_state=RANDOM_STATE, verbose=-1),
+                    regressor=Ridge(random_state=RANDOM_STATE),
                     func=np.log1p,
                     inverse_func=np.expm1,
                 ),
             ),
         ]
     )
-    everyday_lgbm_grid = {
-        "model__regressor__num_leaves": [31, 63, 127],
-        "model__regressor__learning_rate": [0.03, 0.05, 0.1],
-        "model__regressor__n_estimators": [300, 600, 900],
-        "model__regressor__max_depth": [-1, 10, 20],
-    }
-    everyday_lgbm = tune_and_train_regressor(
-        everyday_lgbm,
-        everyday_lgbm_grid,
-        X_train_everyday,
-        y_train_everyday,
-        "Everyday LightGBM Regressor",
-    )
-    joblib.dump(everyday_lgbm, OUTPUT_DIR / "Stage2_Everyday_LightGBM.joblib")
-
-    everyday_ridge = Pipeline(
-        steps=[
-            ("preprocessor", preprocessor_linear),
+    elastic = Pipeline(
+        [
+            ("preprocessor", clone(linear_preprocessor)),
             (
                 "model",
                 TransformedTargetRegressor(
-                    regressor=Ridge(solver="auto", random_state=RANDOM_STATE),
+                    regressor=ElasticNet(max_iter=5_000, random_state=RANDOM_STATE),
                     func=np.log1p,
                     inverse_func=np.expm1,
                 ),
             ),
         ]
     )
-    everyday_ridge_grid = {
-        "model__regressor__alpha": [0.1, 1.0, 10.0, 50.0, 100.0],
-    }
-    everyday_ridge = tune_and_train_regressor(
-        everyday_ridge,
-        everyday_ridge_grid,
-        X_train_everyday,
-        y_train_everyday,
-        "Everyday Ridge Baseline",
-    )
-    joblib.dump(everyday_ridge, OUTPUT_DIR / "Stage2_Everyday_Ridge.joblib")
-
-    exotic_rf = Pipeline(
-        steps=[
-            ("preprocessor", preprocessor_tree),
+    lightgbm = Pipeline(
+        [
+            ("preprocessor", clone(tree_preprocessor)),
             (
                 "model",
                 TransformedTargetRegressor(
-                    regressor=RandomForestRegressor(
-                        n_jobs=-1,
+                    regressor=LGBMRegressor(
+                        objective="regression",
+                        n_estimators=700,
+                        learning_rate=0.05,
+                        num_leaves=63,
+                        min_child_samples=50,
+                        subsample=0.85,
+                        colsample_bytree=0.85,
+                        reg_lambda=1.0,
                         random_state=RANDOM_STATE,
-                        bootstrap=True,
+                        n_jobs=-1,
+                        verbose=-1,
                     ),
                     func=np.log1p,
                     inverse_func=np.expm1,
@@ -490,64 +673,400 @@ def main():
             ),
         ]
     )
-    exotic_rf_grid = {
-        "model__regressor__n_estimators": [200, 400, 600],
-        "model__regressor__max_depth": [10, 20, None],
-        "model__regressor__min_samples_leaf": [2, 5, 10],
-        "model__regressor__max_features": ["sqrt", 0.5, 1.0],
-    }
-    exotic_rf = tune_and_train_regressor(
-        exotic_rf,
-        exotic_rf_grid,
-        X_train_exotic,
-        y_train_exotic,
-        "Exotic Random Forest Regressor",
-        sample_size=50_000,
-    )
-    joblib.dump(exotic_rf, OUTPUT_DIR / "Stage3_Exotic_RandomForest.joblib")
-
-    exotic_huber = Pipeline(
-        steps=[
-            ("preprocessor", preprocessor_linear),
+    random_forest = Pipeline(
+        [
+            ("preprocessor", clone(tree_preprocessor)),
             (
                 "model",
                 TransformedTargetRegressor(
-                    regressor=HuberRegressor(max_iter=300),
+                    regressor=RandomForestRegressor(
+                        n_estimators=250,
+                        min_samples_leaf=5,
+                        max_features="sqrt",
+                        n_jobs=-1,
+                        random_state=RANDOM_STATE,
+                    ),
                     func=np.log1p,
                     inverse_func=np.expm1,
                 ),
             ),
         ]
     )
-    exotic_huber_grid = {
-        "model__regressor__epsilon": [1.1, 1.35, 1.75, 2.0],
-        "model__regressor__alpha": [0.0001, 0.001, 0.01],
+    high_value_router = Pipeline(
+        [
+            ("preprocessor", clone(tree_preprocessor)),
+            ("model", HighValueRoutedRegressor()),
+        ]
+    )
+
+    return {
+        "Readable_Ridge": (ridge, {"model__regressor__alpha": [0.3, 1.0, 3.0, 10.0, 30.0]}),
+        "Readable_ElasticNet": (
+            elastic,
+            {
+                "model__regressor__alpha": [0.0005, 0.001, 0.005, 0.01],
+                "model__regressor__l1_ratio": [0.1, 0.3, 0.5, 0.7],
+            },
+        ),
+        "Advanced_LightGBM": (
+            lightgbm,
+            {
+                "model__regressor__num_leaves": [31, 63, 127],
+                "model__regressor__learning_rate": [0.03, 0.05, 0.08],
+                "model__regressor__min_child_samples": [25, 50, 100],
+                "model__regressor__reg_lambda": [0.5, 1.0, 2.0],
+            },
+        ),
+        "Tree_RandomForest": (
+            random_forest,
+            {
+                "model__regressor__n_estimators": [150, 250],
+                "model__regressor__min_samples_leaf": [3, 5, 10],
+                "model__regressor__max_features": ["sqrt", 0.5],
+            },
+        ),
+        "Segmented_HighValue_LightGBM": (
+            high_value_router,
+            {
+                "model__probability_cutoff": [0.25, 0.35, 0.5],
+                "model__min_high_value_rows": [25, 50, 100],
+            },
+        ),
     }
-    exotic_huber = tune_and_train_regressor(
-        exotic_huber,
-        exotic_huber_grid,
-        X_train_exotic,
-        y_train_exotic,
-        "Exotic Huber Baseline",
-        sample_size=50_000,
-    )
-    joblib.dump(exotic_huber, OUTPUT_DIR / "Stage3_Exotic_Huber.joblib")
 
-    evaluate_regressor(
-        "Everyday LightGBM on true everyday test rows",
-        everyday_lgbm,
-        X_test.loc[y_test < HIGH_VALUE_THRESHOLD],
-        y_test.loc[y_test < HIGH_VALUE_THRESHOLD],
-    )
-    evaluate_regressor(
-        "Exotic Random Forest on true exotic test rows",
-        exotic_rf,
-        X_test.loc[y_test >= HIGH_VALUE_THRESHOLD],
-        y_test.loc[y_test >= HIGH_VALUE_THRESHOLD],
-    )
-    evaluate_full_pipeline(classifier, everyday_lgbm, exotic_rf, X_test, y_test)
 
-    print(f"\nAll routing models saved successfully to {OUTPUT_DIR}")
+def _rmsle(y_true: pd.Series, preds: np.ndarray) -> float:
+    clipped = np.clip(preds, a_min=0, a_max=None)
+    return float(np.sqrt(mean_squared_error(np.log1p(y_true), np.log1p(clipped))))
+
+
+def evaluate_predictions(y_true: pd.Series, preds: np.ndarray) -> dict[str, float]:
+    rmse = np.sqrt(mean_squared_error(y_true, preds))
+    return {
+        "mae": float(mean_absolute_error(y_true, preds)),
+        "rmse": float(rmse),
+        "rmsle": _rmsle(y_true, preds),
+        "mape": float(mean_absolute_percentage_error(y_true, preds)),
+        "r2": float(r2_score(y_true, preds)),
+    }
+
+
+def segment_metrics(
+    y_true: pd.Series,
+    preds: np.ndarray,
+    segment_frame: pd.DataFrame,
+) -> dict[str, dict[str, dict[str, float]]]:
+    scored = segment_frame.copy()
+    scored["actual"] = y_true.to_numpy()
+    scored["prediction"] = preds
+    scored["abs_error"] = (scored["actual"] - scored["prediction"]).abs()
+    scored["is_high_value"] = np.where(scored["actual"] >= HIGH_VALUE_THRESHOLD, "high_value", "everyday")
+
+    output: dict[str, dict[str, dict[str, float]]] = {}
+    for column in ["price_band", "nhtsa_Make", "nhtsa_ModelYear", "is_high_value"]:
+        if column not in scored.columns:
+            continue
+        groups = {}
+        for value, group in scored.groupby(column, dropna=False):
+            groups[str(value)] = {
+                "rows": int(group.shape[0]),
+                "mae": float(group["abs_error"].mean()),
+            }
+        output[column] = groups
+    return output
+
+
+def tuning_search_n_jobs(row_count: int) -> int:
+    """Avoid process pickling multi-million-row frames during CV search."""
+    return -1 if row_count <= MAX_PARALLEL_TUNING_ROWS else 1
+
+
+def stratified_tuning_sample_positions(
+    segment_frame: pd.DataFrame,
+    max_rows: int = DEFAULT_TUNING_SAMPLE_SIZE,
+) -> np.ndarray:
+    """Return row positions for a deterministic price/make/year tuning sample."""
+    segment_frame = segment_frame.reset_index(drop=True)
+    row_count = int(segment_frame.shape[0])
+    if max_rows <= 0 or row_count <= max_rows:
+        return np.arange(row_count)
+
+    available_cols = [c for c in ["price_band", "nhtsa_Make", "nhtsa_ModelYear"] if c in segment_frame.columns]
+    if not available_cols:
+        return np.sort(
+            np.random.default_rng(RANDOM_STATE).choice(row_count, size=max_rows, replace=False)
+        )
+
+    strata = (
+        segment_frame[available_cols]
+        .astype("string")
+        .fillna("UNKNOWN")
+        .agg("|".join, axis=1)
+    )
+    rng = np.random.default_rng(RANDOM_STATE)
+    sample_fraction = max_rows / row_count
+    selected: list[np.ndarray] = []
+
+    for positions in strata.groupby(strata, sort=False).groups.values():
+        stratum_positions = np.asarray(list(positions), dtype=int)
+        take = min(stratum_positions.size, max(1, int(round(stratum_positions.size * sample_fraction))))
+        selected.append(rng.choice(stratum_positions, size=take, replace=False))
+
+    sampled = np.unique(np.concatenate(selected)) if selected else np.array([], dtype=int)
+    if sampled.size > max_rows:
+        sampled = rng.choice(sampled, size=max_rows, replace=False)
+    elif sampled.size < max_rows:
+        remaining = np.setdiff1d(np.arange(row_count), sampled, assume_unique=False)
+        fill_count = min(max_rows - sampled.size, remaining.size)
+        if fill_count:
+            sampled = np.concatenate([sampled, rng.choice(remaining, size=fill_count, replace=False)])
+    return np.sort(sampled.astype(int))
+
+
+def tune_and_fit(
+    name: str,
+    pipeline: Pipeline,
+    param_grid: dict[str, list[Any]],
+    X_train: pd.DataFrame,
+    y_train: pd.Series,
+    groups: pd.Series,
+    train_segments: pd.DataFrame,
+    tuning_sample_size: int = DEFAULT_TUNING_SAMPLE_SIZE,
+) -> Pipeline:
+    if not param_grid or X_train.shape[0] < 1_000 or groups.nunique() < 3:
+        pipeline.fit(X_train, y_train)
+        return pipeline
+
+    tuning_positions = stratified_tuning_sample_positions(train_segments, tuning_sample_size)
+    X_tune = X_train.iloc[tuning_positions]
+    y_tune = y_train.iloc[tuning_positions]
+    groups_tune = groups.iloc[tuning_positions]
+    if groups_tune.nunique() < 3:
+        pipeline.fit(X_train, y_train)
+        return pipeline
+
+    total_param_combinations = prod(len(values) for values in param_grid.values())
+    cv = GroupKFold(n_splits=min(3, int(groups_tune.nunique())))
+    tuning_n_jobs = tuning_search_n_jobs(X_tune.shape[0])
+    search = RandomizedSearchCV(
+        pipeline,
+        param_distributions=param_grid,
+        n_iter=min(8, total_param_combinations),
+        cv=cv,
+        scoring="neg_root_mean_squared_error",
+        n_jobs=tuning_n_jobs,
+        random_state=RANDOM_STATE,
+        verbose=1,
+    )
+    print(f"Tuning {name} on {X_tune.shape[0]:,} representative rows...")
+    if tuning_n_jobs == 1:
+        print(
+            "Large training frame detected; running CV search in one process "
+            "to avoid Windows joblib pickling memory pressure."
+        )
+    search.fit(X_tune, y_tune, groups=groups_tune)
+    print(f"Best parameters for {name}: {search.best_params_}")
+    if X_tune.shape[0] < X_train.shape[0]:
+        print(f"Refitting {name} with tuned parameters on {X_train.shape[0]:,} training rows...")
+        tuned_model = clone(pipeline).set_params(**search.best_params_)
+        tuned_model.fit(X_train, y_train)
+        return tuned_model
+    return search.best_estimator_
+
+
+def train_current_price_models(
+    db_path: Path | str = DB_PATH,
+    absa_db_path: Path | str | None = ABSA_DB_PATH,
+    output_dir: Path | str = OUTPUT_DIR,
+    sample_size: int | None = DEFAULT_SAMPLE_SIZE,
+    sample_strategy: str = DEFAULT_SAMPLE_STRATEGY,
+    deduplicate_vins: bool = True,
+    split_date: str | None = None,
+) -> dict[str, Any]:
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    raw_df, data_profile = load_modeling_frame(
+        db_path,
+        absa_db_path,
+        sample_size,
+        sample_strategy,
+    )
+    model_df = engineer_current_price_features(raw_df)
+    dedup_metadata = {"deduplicated_vins": False}
+    if deduplicate_vins:
+        model_df, dedup_metadata = keep_latest_listing_per_vin(model_df)
+    train_df, test_df, split_metadata = split_train_test(model_df, split_date)
+
+    X_train, y_train, train_segments = make_feature_matrix(train_df)
+    X_test, y_test, test_segments = make_feature_matrix(test_df)
+    tree_preprocessor, linear_preprocessor, feature_metadata = build_preprocessors(X_train)
+
+    metrics: dict[str, Any] = {}
+    best_name = ""
+    best_model: Pipeline | None = None
+    best_mae = float("inf")
+
+    for name, (pipeline, param_grid) in model_candidates(tree_preprocessor, linear_preprocessor).items():
+        model = tune_and_fit(
+            name,
+            pipeline,
+            param_grid,
+            X_train,
+            y_train,
+            train_df["vin"].fillna("UNKNOWN"),
+            train_segments,
+        )
+        predictions = model.predict(X_test)
+        model_metrics = evaluate_predictions(y_test, predictions)
+        model_metrics["segment_metrics"] = segment_metrics(y_test, predictions, test_segments)
+        metrics[name] = model_metrics
+        joblib.dump(model, output_dir / f"{name}.joblib")
+
+        if model_metrics["mae"] < best_mae:
+            best_mae = model_metrics["mae"]
+            best_name = name
+            best_model = model
+
+    if best_model is None:
+        raise RuntimeError("No model was trained.")
+
+    joblib.dump(best_model, output_dir / "Current_Price_Best_Model.joblib")
+
+    report = {
+        "task": "current_price",
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "database_path": str(Path(db_path)),
+        "sample_size": int(sample_size or 0),
+        "sample_strategy": sample_strategy,
+        "row_counts": {
+            "raw_rows": int(raw_df.shape[0]),
+            "model_rows": int(model_df.shape[0]),
+            "train_rows": int(train_df.shape[0]),
+            "test_rows": int(test_df.shape[0]),
+            "train_vins": int(train_df["vin"].nunique()),
+            "test_vins": int(test_df["vin"].nunique()),
+        },
+        "deduplication": dedup_metadata,
+        "date_ranges": {
+            "train_loaddate_min": str(train_df["loaddate"].min()) if "loaddate" in train_df else None,
+            "train_loaddate_max": str(train_df["loaddate"].max()) if "loaddate" in train_df else None,
+            "test_loaddate_min": str(test_df["loaddate"].min()) if "loaddate" in test_df else None,
+            "test_loaddate_max": str(test_df["loaddate"].max()) if "loaddate" in test_df else None,
+        },
+        "split": split_metadata,
+        "features": feature_metadata,
+        "tuning": {
+            "max_tuning_rows": DEFAULT_TUNING_SAMPLE_SIZE,
+            "sampling_strategy": "deterministic stratified sample by diagnostic price band, NHTSA make, and model year",
+            "final_fit": "best hyperparameters are refit on the full training split before evaluation",
+        },
+        "leakage_controls": {
+            "dropped_answer_derived_columns": ["price", "price_band"],
+            "price_band_usage": "diagnostic segmentation only; never included in model inputs",
+            "vin_overlap": split_metadata["vin_overlap"],
+        },
+        "models": metrics,
+        "recommended_model": best_name,
+        "notes": [
+            "Training defaults to the latest listing row per VIN to avoid duplicate VIN overweighting.",
+            "Price bands are created only after observing price and are kept out of the feature matrix to avoid target leakage.",
+            "Hyperparameters are tuned on a representative bounded sample, then refit on the full training split.",
+            "The high-value router is useful only if it improves the >$150k segment without hurting global MAE/RMSLE.",
+            "CatBoost remains a strong future candidate for categorical-heavy modeling but is not required for this dependency set.",
+        ],
+        "research_sources": RESEARCH_REFERENCES,
+        "data_profile": data_profile,
+    }
+
+    write_reports(output_dir, report)
+    return report
+
+
+def write_reports(output_dir: Path, report: dict[str, Any]) -> None:
+    json_path = output_dir / "model_report.json"
+    json_path.write_text(json.dumps(report, indent=2, default=str), encoding="utf-8")
+
+    best_name = report["recommended_model"]
+    best_metrics = report["models"][best_name]
+    md = [
+        "# Vehicle Price Model Report",
+        "",
+        f"Generated: {report['generated_at']}",
+        f"Recommended model: **{best_name}**",
+        "",
+        "## Data",
+        f"- Model rows: {report['row_counts']['model_rows']:,}",
+        f"- Train/test rows: {report['row_counts']['train_rows']:,} / {report['row_counts']['test_rows']:,}",
+        f"- Split strategy: {report['split']['split_strategy']}",
+        f"- VIN overlap: {report['split']['vin_overlap']}",
+        "",
+        "## Best Model Metrics",
+        f"- MAE: ${best_metrics['mae']:,.2f}",
+        f"- RMSE: ${best_metrics['rmse']:,.2f}",
+        f"- RMSLE: {best_metrics['rmsle']:.4f}",
+        f"- MAPE: {best_metrics['mape']:.4f}",
+        f"- R2: {best_metrics['r2']:.4f}",
+        "",
+        "## Model Comparison",
+    ]
+    for name, metrics in report["models"].items():
+        md.append(
+            f"- {name}: MAE ${metrics['mae']:,.2f}, RMSE ${metrics['rmse']:,.2f}, R2 {metrics['r2']:.4f}"
+        )
+    md.extend(
+        [
+            "",
+            "## Notes",
+            "- The current-price benchmark now uses leakage-safe VIN handling.",
+            "- Answer-derived `price_band` is excluded from model features and used only for segment diagnostics.",
+            "- Hyperparameters are tuned on a representative bounded sample, then refit on the full training split.",
+            "- Full-database runs are opt-in with `--sample-size 0`.",
+            "",
+            "## Research Rationale",
+            "- Used-car pricing literature supports supervised tabular/tree models when vehicle attributes, mileage, and market context are controlled.",
+            "- Manheim's used-vehicle index methodology reinforces mileage, mix, outlier, and seasonal controls rather than raw price comparisons.",
+        ]
+    )
+    (output_dir / "model_report.md").write_text("\n".join(md) + "\n", encoding="utf-8")
+
+
+def load_and_split_data():
+    """Backward-compatible helper used by the existing notebook."""
+    raw_df, _ = load_modeling_frame(DB_PATH, ABSA_DB_PATH, DEFAULT_SAMPLE_SIZE)
+    model_df = engineer_current_price_features(raw_df)
+    model_df, _ = keep_latest_listing_per_vin(model_df)
+    train_df, test_df, _ = split_train_test(model_df)
+    X_train, y_train, _ = make_feature_matrix(train_df)
+    X_test, y_test, _ = make_feature_matrix(test_df)
+    return X_train, y_train, X_test, y_test
+
+
+def main() -> None:
+    args = parse_args()
+    report = train_current_price_models(
+        db_path=args.db_path,
+        absa_db_path=args.absa_db_path,
+        output_dir=args.output_dir,
+        sample_size=args.sample_size,
+        sample_strategy=args.sample_strategy,
+        deduplicate_vins=not args.keep_duplicate_vins,
+        split_date=args.split_date,
+    )
+    print(f"Recommended current-price model: {report['recommended_model']}")
+    print(f"Saved report to {Path(args.output_dir) / 'model_report.json'}")
+
+    if args.task == "all":
+        from Time_Series_Price import run_cohort_forecast
+
+        horizons = [int(x.strip()) for x in args.horizons.split(",") if x.strip()]
+        run_cohort_forecast(
+            db_path=Path(args.db_path),
+            output_dir=Path(args.output_dir),
+            sample_size=args.sample_size,
+            horizons=horizons,
+            split_date=args.split_date,
+        )
 
 
 if __name__ == "__main__":

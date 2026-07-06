@@ -1,49 +1,74 @@
-# AGENTS Guide
+# GitHub Agent Guide
+
+This file mirrors the root `AGENTS.md` for tools that read instructions from `.github/`. If the two files ever disagree, update both and treat the root `AGENTS.md` as the source of truth.
 
 ## Mission-Critical Context
-- This repo is a Python pipeline: scrape AutoTempest via network interception, store snapshots in SQLite, then enrich VINs with NHTSA APIs.
-- Core flow: `DataPipeline/DataAquisition.py` -> `DataPipeline/database.py` -> `DataPipeline/NHTSA_enrichment.py` -> optional cleanup in `DataPipeline/DataCleaning.py`.
-- Preserve the key design: intercept `queue-results` JSON via CDP `performance` logs; do not switch to HTML parsing.
+
+- This is a master's capstone data science project for automotive market pricing, depreciation, NHTSA enrichment, and consumer sentiment.
+- The active scraper is `DataPipeline/Playwright_test.py`.
+- The current data flow is `DataPipeline/Playwright_test.py` -> `DataPipeline/database.py` -> `DataPipeline/NHTSA_enrichment.py` -> `DataPipeline/DataCleaning.py` -> EDA and ML.
+- `DataPipeline/DataAquisition.py` is the legacy/reference Selenium CDP scraper. Keep it working, but do not treat it as the default path unless asked.
+- Preserve the key acquisition design: intercept structured `queue-results` network responses and persist them incrementally. Do not switch to HTML parsing for vehicle data.
 
 ## Architecture To Learn First
-- `ParallelScrapingOrchestrator` iterates makes sequentially; `ButtonScrapingCoordinator` runs source buttons in parallel.
-- Each `ButtonScraper` uses its own Chrome instance (`create_stealth_driver`) to avoid shared-DOM slowdown and detection coupling.
-- Button completion is behavioral: stop after `EXHAUSTION_STRIKE_COUNT` consecutive zero-row API responses.
-- Dedup is two-layered: in-memory `VINCache` plus DB-sourced `get_seen_vins()` for current `loaddate`.
+
+- `Playwright_test.py` builds a global queue of `(make, source button)` tasks so browser workers stay busy across all makes.
+- Each `ButtonScraper` owns its own Playwright browser context and intercepts `queue-results` fetch/XHR responses.
+- Button completion is behavioral: stop after `EXHAUSTION_STRIKE_COUNT` consecutive zero-row responses.
+- Dedup is two-layered: in-memory `VINCache` plus DB-sourced `get_seen_vins()`.
 - Acquisition writes use `CarDatabase(thread_safe=True)` with thread-local SQLite connections and a shared write lock.
+- `DataCleaning.py` builds `CAR_DATA_OUTPUT/CAR_DATA_CLEANED.db` with normalized data and modeling indexes.
+- `Price_ML_Models.py` trains leakage-aware current-price models.
+- `Time_Series_Price.py` trains cohort-level depreciation forecasts.
 
 ## Runbook Commands
+
 ```powershell
 pip install -r requirements.txt
 python Utilities\health_check.py
-python DataPipeline\DataAquisition.py
+python DataPipeline\Playwright_test.py
 python DataPipeline\NHTSA_enrichment.py
-python Utilities\verify_schema.py
-python Utilities\fix_database_schema.py
+python DataPipeline\DataCleaning.py
+python -m unittest tests\test_ml_upgrade.py
+```
+
+Use this before scheduled ingestion:
+
+```powershell
+run_pipeline_scheduler.bat --dry-run
 ```
 
 ## Coding Rules Specific To This Repo
-- Stealth-first Selenium is mandatory (`selenium-stealth`, automation flags disabled, custom user-agent in headless mode).
-- Use randomized waits (`random.uniform(...)`) for automation timing; avoid fixed sleeps.
-- Keep ingestion values normalized (`normalize_price`) and validate VINs before enrichment (`_is_valid_vin`).
-- Keep all NHTSA-enriched fields prefixed `nhtsa_`.
-- Prefer incremental persistence (batch inserts per intercepted API payload) over large in-memory accumulation.
-- For data cleaning work, prefer `polars` as the default dataframe engine going forward.
-- Keep code professional and readable: no emojis and no excessive comments (comment only where logic is non-obvious).
 
-## Documentation And Dependency Hygiene
-- Do not create extra markdown docs unless requested; update existing docs first (`README.md`, `PROJECT_SUMMARY.md`, `.github/*.md`).
-- Keep markdown professional and emoji-free.
+- Preserve Playwright response interception for `queue-results`; do not scrape listing HTML when structured network data is available.
+- Use randomized waits and bounded concurrency for scraper stability.
+- Keep ingestion values normalized with `normalize_price` and `normalize_mileage`.
+- Validate VINs before enrichment with `_is_valid_vin`.
+- Keep all NHTSA-derived fields prefixed with `nhtsa_`.
+- Prefer incremental persistence over large in-memory accumulation.
+- For data cleaning work, prefer Polars by default and keep Pandas where modeling/notebook code already depends on it.
+- Preserve direct script execution with `if __name__ == "__main__": main()`.
+- Keep code and markdown professional, concise, and emoji-free.
+
+## Research and Modeling Standards
+
+- Tie EDA and feature engineering to the capstone research questions: safety/depreciation, high-dimensional price prediction, cohort depreciation forecasting, NLP/sentiment lift, and segment robustness.
+- Avoid target leakage. Do not train on `price`, `price_band`, future prices, or answer-derived features.
+- Preserve VIN-safe train/test validation for current-price modeling.
+- Prefer temporal validation when enough dates exist.
+- Keep full-database runs opt-in; default to bounded samples for development.
+- When adding research claims or new techniques, verify against current primary sources, official documentation, or peer-reviewed papers.
+
+## Documentation and Dependency Hygiene
+
+- Update `README.md`, `PROJECT_SUMMARY.md`, root `AGENTS.md`, and relevant `.github` instructions when workflows, schemas, or modeling practices change.
+- Do not create extra markdown files unless requested.
 - When adding new packages, update `requirements.txt` in the same change.
 
-## Integrations And Boundaries
-- External integrations: AutoTempest backend `queue-results` via CDP; NHTSA vPIC + SafetyRatings + Recalls + Complaints APIs.
-- Persistence boundary: `CAR_DATA_OUTPUT/CAR_DATA.db`; operational logs: `CAR_DATA_OUTPUT/*.log`.
-- `NHTSAEnricher` processes VINs in batches (`MAX_BATCH_SIZE=50`) and caches MMY-level lookups.
-
 ## Gotchas
-- Keep direct script execution intact (`if __name__ == "__main__": main()`).
-- `DataPipeline` imports `database` as a sibling module; avoid refactors that break root-level script runs.
-- `Utilities/verify_schema.py` and `Utilities/fix_database_schema.py` use absolute DB paths.
-- `DataCleaning.py` still contains machine-specific default paths; treat it as non-production wired.
 
+- `Playwright_test.py` is the current scraper even though its filename sounds experimental.
+- `DataAquisition.py` is misspelled historically and remains the Selenium reference/fallback path.
+- Some utility and EDA scripts still contain absolute Windows paths; improve portability when touching those files.
+- YouTube ingestion requires `YOUTUBE_API_KEY` or `GOOGLE_API_KEY`.
+- Large database scans can be expensive. Use sample-size defaults unless a full capstone run is intentional.

@@ -37,6 +37,7 @@ def check_dependencies():
         'requests',
         'pandas',
         'polars',
+        'playwright',
         'urllib3',
         'nbformat',
         'ipykernel'
@@ -125,6 +126,7 @@ def check_files():
     base_path = Path(__file__).parent.parent
 
     required_files = [
+        "DataPipeline/Playwright_test.py",
         "DataPipeline/DataAquisition.py",
         "DataPipeline/database.py",
         "DataPipeline/DataCleaning.py",
@@ -159,10 +161,10 @@ def check_configuration():
 
     try:
         pipeline_path = Path(__file__).parent.parent / "DataPipeline"
-        module_path = Path(__file__).parent.parent / "DataPipeline" / "DataAquisition.py"
-        spec = importlib.util.spec_from_file_location("DataAquisition", module_path)
+        module_path = Path(__file__).parent.parent / "DataPipeline" / "Playwright_test.py"
+        spec = importlib.util.spec_from_file_location("Playwright_test", module_path)
         if spec is None or spec.loader is None:
-            raise RuntimeError("Could not load DataAquisition.py")
+            raise RuntimeError("Could not load Playwright_test.py")
         module = importlib.util.module_from_spec(spec)
         sys.path.insert(0, str(pipeline_path))
         try:
@@ -172,11 +174,12 @@ def check_configuration():
                 sys.path.pop(0)
         config = module.ScrapingConfig()
         print(f"  Config loaded successfully")
+        print(f"     Active scraper: Playwright_test.py")
         print(f"     ZIP Code: {config.INPUT_ZIP}")
         print(f"     State: {config.INPUT_STATE}")
         print(f"     Headless: {config.HEADLESS}")
-        print(f"     Max button workers: {config.MAX_BUTTON_WORKERS}")
-        print(f"     Log cleanup: Every {config.LOG_CLEANUP_INTERVAL} iteration(s)")
+        print(f"     Max global browsers: {config.MAX_GLOBAL_CONCURRENT_BROWSERS}")
+        print(f"     Startup stagger: {config.GLOBAL_STARTUP_STAGGER}s")
         return True
 
     except Exception as e:
@@ -245,7 +248,7 @@ def main():
     if all_passed:
         print(colored("ALL CHECKS PASSED - SYSTEM READY", "green"))
         print("\nYou can now run:")
-        print("  python DataPipeline/DataAquisition.py")
+        print("  python DataPipeline/Playwright_test.py")
     else:
         print(colored("SOME CHECKS FAILED - PLEASE FIX BEFORE RUNNING", "yellow"))
         print("\nRecommended actions:")

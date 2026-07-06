@@ -1,100 +1,132 @@
-# Car Market Data Pipeline & Visualization
+# Automotive Market ML Capstone
 
-A production-grade data pipeline that scrapes car listings from AutoTempest and enriches them with NHTSA specifications, safety ratings, recalls, and complaints. The project features sentiment analysis of YouTube reviews, machine learning for price prediction, and comprehensive exploratory data analysis.
+This repository is a master's capstone project for studying the current new and used car market with web-scraped listing data, official NHTSA enrichment, consumer sentiment, and machine learning. The project focuses on price prediction, depreciation forecasting, and the measurable value of safety technology, vehicle attributes, and public sentiment in automotive pricing.
 
-For the full technical documentation, workflows, and detailed troubleshooting, see `PROJECT_SUMMARY.md`.
+The pipeline captures vehicle listings from AutoTempest-style result pages, stores longitudinal snapshots in SQLite, enriches VINs with NHTSA specifications, safety, recall, and complaint data, and trains models for current-price prediction and cohort-level depreciation forecasting.
 
-## Quick Start
+## Research Goals
 
-### Python Pipeline
-```bash
-pip install -r requirements.txt
-python Utilities\health_check.py
-python DataPipeline\DataAquisition.py
-python DataPipeline\NHTSA_enrichment.py
-python DataPipeline\DataCleaning.py
-
-# Optional: Sentiment Analysis
-python DataPipeline\SentimentAnalysis.py --video-id [VIDEO_ID]
-
-# Optional: Machine Learning
-python ML\Price_ML_Models.py
-```
-
-### Notebook Troubleshooting
-
-If you see `Mime type rendering requires nbformat>=4.2.0 but it is not installed`, your notebook kernel is using a different interpreter than the project environment.
-
-```bash
-pip install -r requirements.txt
-python -m ipykernel install --user --name car-market-data --display-name "Python (car-market-data)"
-```
-
-Then select `Python (car-market-data)` as the kernel for `EDA/EDA_notebook.ipynb`.
-
-### Data Analysis & Visualization
-
-- **Python (Plotly):** Use `EDA/EDA_notebook.ipynb` for interactive exploratory data analysis.
-- **Python (Depreciation):** Use `EDA/Depreciation_Analysis.py` to calculate and visualize vehicle depreciation metrics.
-- **R (ggplot2):** Use `EDA/EDA_r.R` for statistical analysis and visualization in R.
+1. Quantify how safety technology, safety ratings, recalls, and complaints relate to resale price and depreciation.
+2. Improve current vehicle price prediction with enriched NHTSA attributes, listing metadata, mileage, geography, and market timing.
+3. Model depreciation as a time-series problem using price history by make, model, model year, and trim-like cohorts.
+4. Evaluate whether YouTube comment sentiment and aspect-based sentiment analysis add predictive signal beyond structured vehicle data.
+5. Keep the analysis reproducible enough for academic review: bounded data loads, leakage-safe validation, documented assumptions, and clear model reports.
 
 ## Repository Layout
 
-```
+```text
 Car-Price-Data-Visualization-Learning/
-├── DataPipeline/
-│   ├── DataAquisition.py
-│   ├── database.py
-│   ├── DataCleaning.py
-│   ├── NHTSA_enrichment.py
-│   ├── SentimentAnalysis.py
-│   └── migrate_to_db.py
-├── EDA/
-│   ├── EDA_notebook.ipynb    # Main Python EDA
-│   ├── Depreciation_Analysis.py
-│   └── EDA_r.R               # R Analysis script
-├── ML/
-│   ├── Price_ML_Models.py    # Training pipelines
-│   └── Model_Output.ipynb    # Evaluation
-├── MODELS_OUTPUT/            # Trained model binaries (.joblib)
-├── Utilities/
-│   ├── health_check.py
-│   ├── verify_schema.py
-│   └── fix_database_schema.py
-├── CAR_DATA_OUTPUT/
-│   ├── CAR_DATA.db           # Raw scraped data
-│   ├── CAR_DATA_CLEANED.db   # Cleaned & joined data
-│   └── *.log                 # Operation logs
-├── PROJECT_SUMMARY.md
-└── README.md
+|-- AGENTS.md                         # Root instructions for coding agents
+|-- README.md                         # Project overview and runbook
+|-- PROJECT_SUMMARY.md                # Technical architecture and capstone narrative
+|-- requirements.txt                  # Python dependencies
+|-- run_pipeline_scheduler.bat        # Windows scheduler entry point
+|-- DataPipeline/
+|   |-- Playwright_test.py            # Current Playwright global-queue scraper
+|   |-- DataAquisition.py             # Legacy/reference Selenium CDP scraper
+|   |-- database.py                   # SQLite schema and persistence helpers
+|   |-- NHTSA_enrichment.py           # vPIC, safety ratings, recalls, complaints
+|   |-- DataCleaning.py               # Polars-based cleaned database builder
+|   |-- SentimentAnalysis.py          # YouTube comments ingestion
+|   |-- absa_pipeline.py              # Aspect-based sentiment scoring
+|   |-- migrate_to_db.py              # Legacy CSV to SQLite migration helper
+|-- EDA/
+|   |-- EDA_notebook.ipynb            # Data quality and exploratory analysis
+|   |-- Depreciation_Analysis.py      # Targeted depreciation exploration
+|   |-- EDA_r.R                       # R/ggplot2 exploratory analysis
+|-- ML/
+|   |-- Price_ML_Models.py            # Current-price modeling pipeline
+|   |-- Time_Series_Price.py          # Cohort depreciation forecasting
+|   |-- Model_Output.ipynb            # KPI-style model output notebook
+|-- Utilities/
+|   |-- health_check.py               # Dependency, config, file, and schema checks
+|   |-- verify_schema.py              # Raw database schema inspection
+|   |-- fix_database_schema.py        # Additive schema migration helper
+|-- tests/
+|   |-- test_ml_upgrade.py            # Cleaning and modeling regression tests
+|-- CAR_DATA_OUTPUT/                  # SQLite databases, logs, exports
+|-- MODELS_OUTPUT/                    # Model artifacts and generated reports
 ```
 
-## Configuration
+## Quick Start
 
-Update the `ScrapingConfig` dataclass in `DataPipeline/DataAquisition.py` for ZIP, makes list, concurrent button workers, exhaustion thresholds, and timing controls.
+Create or activate a Python environment, then install dependencies:
 
-## Common Operations
+```powershell
+pip install -r requirements.txt
+python Utilities\health_check.py
+```
 
-### Python Pipeline
-```bash
-python DataPipeline\DataAquisition.py
+Run the core data pipeline:
+
+```powershell
+python DataPipeline\Playwright_test.py
 python DataPipeline\NHTSA_enrichment.py
 python DataPipeline\DataCleaning.py
-python DataPipeline\SentimentAnalysis.py --video-id [ID]
+```
+
+Train current-price models:
+
+```powershell
 python ML\Price_ML_Models.py
-python Utilities\verify_schema.py
-python Utilities\fix_database_schema.py
 ```
 
-### R Analysis
+The default run loads a bounded recent sample for iteration. Full-database
+training is opt-in with `--sample-size 0`; hyperparameter search uses a
+representative 200k-row tuning sample, then refits the tuned model on the full
+training split.
 
-```r
-# Load data and generate plots
-source("EDA/EDA_r.R")
+Train current-price and depreciation models together:
+
+```powershell
+python ML\Price_ML_Models.py --task all
 ```
 
-## Notes
+Run regression tests:
 
-- `PROJECT_SUMMARY.md` consolidates the technical documentation for the entire pipeline.
-- Sentiment analysis requires a YouTube API key in a `.env` file or environment variable.
-- Utility scripts were moved to `Utilities/` to keep `DataPipeline/` focused on core pipeline code.
+```powershell
+python -m unittest tests\test_ml_upgrade.py
+```
+
+## Data Workflow
+
+1. `DataPipeline/Playwright_test.py` is the active scraper. It runs a global queue of `(make, source button)` tasks, intercepts `queue-results` network responses, and writes results incrementally to SQLite.
+2. `DataPipeline/database.py` stores listing snapshots, normalized `price_history`, normalized `listing_history`, and NHTSA enrichment tables in SQLite.
+3. `DataPipeline/NHTSA_enrichment.py` enriches unenriched VINs with vPIC decode fields, safety ratings, recalls, and complaints.
+4. `DataPipeline/DataCleaning.py` builds `CAR_DATA_OUTPUT/CAR_DATA_CLEANED.db` with filtered rows, normalized dates/numerics, scoped NHTSA fields, and modeling indexes.
+5. `DataPipeline/SentimentAnalysis.py` collects YouTube comments into `CAR_YOUTUBE_COMMENTS.db`.
+6. `DataPipeline/absa_pipeline.py` converts comments into vehicle-level sentiment indexes.
+7. `ML/Price_ML_Models.py` trains leakage-aware current-price models and writes reports to `MODELS_OUTPUT/`.
+8. `ML/Time_Series_Price.py` trains global cohort-level depreciation forecasts from historical price trajectories.
+
+## Modeling Approach
+
+The current-price pipeline uses bounded SQLite reads by default, engineered mileage and age features, location and listing metadata, NHTSA categorical and numeric attributes, target encoding for high-cardinality fields, and leakage-safe train/test handling. Candidate models include readable linear baselines, Random Forest, LightGBM, and a high-value vehicle routing model.
+
+The depreciation pipeline builds weekly cohorts by make, model, model year, and trim proxy. It trains global forecasting models across related vehicle cohorts so sparse segments can borrow signal from the broader market. Horizon-specific hyperparameters are tuned on a representative bounded cohort-week sample with an inner temporal holdout, then refit on the full training frame.
+
+## Sentiment and NLP
+
+`SentimentAnalysis.py` uses the YouTube Data API to collect comments for configured videos or playlists. `absa_pipeline.py` then extracts vehicle entities from video titles, filters low-quality comments, runs zero-shot aspect classification, and writes vehicle-level sentiment tables for downstream modeling.
+
+Set `YOUTUBE_API_KEY` or `GOOGLE_API_KEY` in the environment or `.env` before running sentiment ingestion.
+
+## Databases and Outputs
+
+- `CAR_DATA_OUTPUT/CAR_DATA.db`: raw listing snapshots, history tables, and NHTSA enrichment.
+- `CAR_DATA_OUTPUT/CAR_DATA_CLEANED.db`: cleaned analysis and modeling database.
+- `CAR_DATA_OUTPUT/CAR_YOUTUBE_COMMENTS.db`: YouTube comment and sentiment-derived tables.
+- `MODELS_OUTPUT/model_report.json` and `MODELS_OUTPUT/model_report.md`: current-price model reports.
+- `MODELS_OUTPUT/cohort_depreciation_model_report.json` and `.md`: depreciation model reports.
+- `MODELS_OUTPUT/*.joblib`: trained model artifacts.
+
+## Notes for Contributors and Agents
+
+- Read `AGENTS.md` before making changes.
+- Preserve API interception as the acquisition strategy. Do not replace structured network capture with HTML scraping.
+- Treat `DataPipeline/Playwright_test.py` as the current scraper unless the user explicitly asks to work on the Selenium fallback.
+- Keep NHTSA-derived columns prefixed with `nhtsa_`.
+- Use Polars for new cleaning work unless a touched area already requires Pandas.
+- Avoid target leakage in modeling. Do not train on fields derived from the target price.
+- When adding dependencies, update `requirements.txt` in the same change.
+- When making research claims or recommending new techniques, verify against current primary sources or official documentation.
