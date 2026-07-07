@@ -621,6 +621,9 @@ class YouTubeCommentsDatabase:
             cursor.execute(
                 "CREATE INDEX IF NOT EXISTS idx_youtube_video_fetch_state_playlist ON youtube_video_fetch_state(playlist_id)"
             )
+            cursor.execute(
+                "CREATE INDEX IF NOT EXISTS idx_youtube_comments_sentiment_video_id ON youtube_comments_sentiment(video_id)"
+            )
             conn.commit()
         self._ensure_columns(
             "youtube_comments_sentiment",
@@ -931,7 +934,14 @@ class YouTubeCommentsDatabase:
     ) -> List[dict]:
         now_iso = now_iso or self._utcnow_iso()
         filters = []
-        params: List[object] = [self.FETCH_STATUS_PENDING, now_iso, now_iso, 1 if force_recheck else 0]
+        params: List[object] = [
+            self.FETCH_STATUS_PENDING,
+            now_iso,
+            self.FETCH_STATUS_PENDING,
+            now_iso,
+            now_iso,
+            1 if force_recheck else 0,
+        ]
 
         if playlist_ids:
             placeholders = ", ".join("?" for _ in playlist_ids)
@@ -956,17 +966,42 @@ class YouTubeCommentsDatabase:
                 comments_seen_count,
                 next_eligible_at,
                 CASE
-                    WHEN last_status IS NULL OR last_status = ? THEN 1
+                    WHEN EXISTS (
+                        SELECT 1
+                        FROM youtube_comments_sentiment AS comments
+                        WHERE comments.video_id = youtube_video_fetch_state.video_id
+                        LIMIT 1
+                    ) THEN 1
+                    ELSE 0
+                END AS has_existing_comments,
+                CASE
+                    WHEN (last_status IS NULL OR last_status = ?)
+                         AND NOT EXISTS (
+                             SELECT 1
+                             FROM youtube_comments_sentiment AS comments
+                             WHERE comments.video_id = youtube_video_fetch_state.video_id
+                             LIMIT 1
+                         ) THEN 1
                     WHEN last_status IN ('quota_exhausted', 'api_error')
-                         AND (next_eligible_at IS NULL OR next_eligible_at <= ?) THEN 2
-                    WHEN last_status IN ('complete', 'zero_comments', 'comments_disabled')
+                         AND (next_eligible_at IS NULL OR next_eligible_at <= ?)
+                         AND NOT EXISTS (
+                             SELECT 1
+                             FROM youtube_comments_sentiment AS comments
+                             WHERE comments.video_id = youtube_video_fetch_state.video_id
+                             LIMIT 1
+                         ) THEN 2
+                    WHEN last_status IS NULL OR last_status = ? THEN 3
+                    WHEN last_status IN ('quota_exhausted', 'api_error')
                          AND (next_eligible_at IS NULL OR next_eligible_at <= ?) THEN 3
-                    WHEN ? = 1 THEN 4
+                    WHEN last_status IN ('complete', 'zero_comments', 'comments_disabled')
+                         AND (next_eligible_at IS NULL OR next_eligible_at <= ?) THEN 5
+                    WHEN ? = 1 THEN 6
                     ELSE 99
                 END AS priority_bucket
             FROM youtube_video_fetch_state
             {where_sql}
             ORDER BY priority_bucket ASC,
+                     has_existing_comments ASC,
                      COALESCE(next_eligible_at, discovered_at, '') ASC,
                      COALESCE(last_attempted_at, discovered_at, '') ASC,
                      video_id ASC
@@ -986,11 +1021,12 @@ class YouTubeCommentsDatabase:
             "last_error",
             "comments_seen_count",
             "next_eligible_at",
+            "has_existing_comments",
             "priority_bucket",
         ]
         candidates = [dict(zip(columns, row)) for row in rows if row[-1] < 99]
         if not force_recheck:
-            candidates = [row for row in candidates if row["priority_bucket"] < 4]
+            candidates = [row for row in candidates if row["priority_bucket"] < 6]
         if limit is not None:
             return candidates[:limit]
         return candidates

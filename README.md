@@ -20,6 +20,7 @@ Car-Price-Data-Visualization-Learning/
 |-- README.md                         # Project overview and runbook
 |-- PROJECT_SUMMARY.md                # Technical architecture and capstone narrative
 |-- requirements.txt                  # Python dependencies
+|-- streamlit_app.py                  # Interactive dashboard for actuals and models
 |-- run_pipeline_scheduler.bat        # Windows scheduler entry point
 |-- DataPipeline/
 |   |-- Playwright_test.py            # Current Playwright global-queue scraper
@@ -82,6 +83,12 @@ Train current-price and depreciation models together:
 python ML\Price_ML_Models.py --task all
 ```
 
+Launch the Streamlit dashboard:
+
+```powershell
+streamlit run streamlit_app.py
+```
+
 Run regression tests:
 
 ```powershell
@@ -93,17 +100,18 @@ python -m unittest tests\test_ml_upgrade.py
 1. `DataPipeline/Playwright_test.py` is the active scraper. It runs a global queue of `(make, source button)` tasks, intercepts `queue-results` network responses, and writes results incrementally to SQLite.
 2. `DataPipeline/database.py` stores listing snapshots, normalized `price_history`, normalized `listing_history`, and NHTSA enrichment tables in SQLite.
 3. `DataPipeline/NHTSA_enrichment.py` enriches unenriched VINs with vPIC decode fields, safety ratings, recalls, and complaints.
-4. `DataPipeline/DataCleaning.py` builds `CAR_DATA_OUTPUT/CAR_DATA_CLEANED.db` with filtered rows, normalized dates/numerics, scoped NHTSA fields, and modeling indexes.
+4. `DataPipeline/DataCleaning.py` builds `CAR_DATA_OUTPUT/CAR_DATA_CLEANED.db` with filtered rows, normalized dates/numerics, contextual price-outlier removal, title-derived trim features, scoped NHTSA fields, and modeling indexes.
 5. `DataPipeline/SentimentAnalysis.py` discovers playlist videos, resumes comment collection at the video level, and stores progress in `CAR_YOUTUBE_COMMENTS.db`.
 6. `DataPipeline/absa_pipeline.py` scores only new comments by `comment_id` and rebuilds vehicle-level sentiment indexes from stored scored rows.
 7. `ML/Price_ML_Models.py` trains leakage-aware current-price models and writes reports to `MODELS_OUTPUT/`.
-8. `ML/Time_Series_Price.py` trains global cohort-level depreciation forecasts from historical price trajectories.
+8. `ML/Time_Series_Price.py` trains global cohort-level monthly depreciation forecasts from historical price trajectories.
+9. `streamlit_app.py` reads `CAR_DATA_CLEANED.db` and `MODELS_OUTPUT/` artifacts to present filterable VIN actuals, NHTSA KPIs, global and filter-scoped model metrics, current-price predictions, and cohort future-price forecasts.
 
 ## Modeling Approach
 
-The current-price pipeline uses bounded SQLite reads by default, engineered mileage and age features, location and listing metadata, NHTSA categorical and numeric attributes, target encoding for high-cardinality fields, and leakage-safe train/test handling. Candidate models include readable linear baselines, Random Forest, LightGBM, and a high-value vehicle routing model.
+The current-price pipeline uses bounded SQLite reads by default, engineered mileage and age features, location and listing metadata, NHTSA categorical and numeric attributes, cleaned title/trim features, target encoding for high-cardinality fields, and leakage-safe train/test handling. Candidate models include readable linear baselines, Random Forest, LightGBM, and a high-value vehicle routing model.
 
-The depreciation pipeline builds weekly cohorts by make, model, model year, and trim proxy. It trains global forecasting models across related vehicle cohorts so sparse segments can borrow signal from the broader market. Horizon-specific hyperparameters are tuned on a representative bounded cohort-week sample with an inner temporal holdout, then refit on the full training frame.
+The depreciation pipeline builds monthly cohorts by make, model, model year, and cleaned trim proxy. It trains a global one-month depreciation model across related vehicle cohorts, then recursively emits a month-by-month median-price forecast for the next 60 months by default. Sparse and newer cohorts borrow signal from related make/model/year/trim cohorts through the global model instead of fitting VIN-level local forecasts.
 
 ## Sentiment and NLP
 
@@ -127,6 +135,7 @@ Set `YOUTUBE_API_KEY` or `GOOGLE_API_KEY` in the environment or `.env` before ru
 - `CAR_DATA_OUTPUT/CAR_YOUTUBE_COMMENTS.db`: YouTube comment and sentiment-derived tables, including `youtube_video_fetch_state`, `youtube_playlist_fetch_state`, `youtube_comments_scored`, and `vehicle_sentiment_index`.
 - `MODELS_OUTPUT/model_report.json` and `MODELS_OUTPUT/model_report.md`: current-price model reports.
 - `MODELS_OUTPUT/cohort_depreciation_model_report.json` and `.md`: depreciation model reports.
+- `MODELS_OUTPUT/cohort_future_forecasts.csv`: monthly future cohort median-price forecasts used by the dashboard.
 - `MODELS_OUTPUT/*.joblib`: trained model artifacts.
 
 ## Notes for Contributors and Agents

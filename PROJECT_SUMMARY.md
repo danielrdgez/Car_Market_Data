@@ -47,6 +47,10 @@ Analysis and ML
   -> EDA notebooks and scripts
   -> current-price models
   -> cohort depreciation forecasts
+
+Dashboard
+  CAR_DATA_CLEANED.db and MODELS_OUTPUT artifacts
+  -> Streamlit VIN actuals, model metrics, predictions, forecasts
 ```
 
 ## Core Components
@@ -105,7 +109,10 @@ Current cleaning choices:
 
 - Uses Polars for table reads, type normalization, filtering, and output.
 - Keeps predictive listing fields such as title, location, source, seller type, listing type, vehicle title, and price-change flags.
-- Drops obviously invalid price rows outside the configured range.
+- Applies contextual price-outlier removal with robust medians and quantile fences by make, model, model year, and trim when enough support exists; repeated-digit prices such as `444444` are dropped only when they are extreme relative to the relevant cohort.
+- Preserves listing titles and adds normalized trim fields such as `title_trim`, `trim_combined`, and `trim_source`.
+- Keeps and consolidates `nhtsa_Trim` and `nhtsa_Trim2`, filling missing trim values from title-derived trim when available and recording `nhtsa_Trim_source`.
+- Fills missing or non-positive `nhtsa_BasePrice` from the earliest cleaned `price_history` price for the VIN, then the earliest cleaned `listing_history` price when price history is unavailable, while recording `nhtsa_BasePrice_source`.
 - Normalizes date and numeric columns.
 - Filters NHTSA rows to supported makes and valid make/model/model year values.
 - Creates indexes for modeling and time-series reads.
@@ -146,7 +153,7 @@ Important design choices:
 - Full-database runs are opt-in with `--sample-size 0`; hyperparameter search
   uses a representative 200k-row tuning sample, then refits the tuned model on
   the full training split.
-- Feature engineering for age, mileage, recency, ZIP region, listing text lengths, title keywords, EV/hybrid status, body/fuel segments, and make/model/year combinations.
+- Feature engineering for age, mileage, recency, ZIP region, listing text lengths, title keywords, cleaned trim labels, EV/hybrid status, body/fuel segments, and make/model/year combinations.
 - Latest-row-per-VIN deduplication by default.
 - Time cutoff validation when possible, with VIN overlap removed from train rows.
 - Group shuffle fallback by VIN.
@@ -159,13 +166,17 @@ Important design choices:
 Important design choices:
 
 - Cohort grain is make, model, model year, and trim proxy.
-- Weekly cohort frames are built from price history.
+- Monthly cohort frames are built from price history.
 - Features include market index, cohort lags, rolling prices, mileage, volume, NHTSA attributes, recall/complaint counts, and optional sentiment signals.
-- Models forecast future depreciation percentages for configurable horizons such as 30, 90, 180, and 365 days.
+- Models forecast one-month depreciation percentages and recursively emit a monthly median-price path up to five years ahead by default.
 - The script uses global models across cohorts to share signal across sparse vehicle segments.
-- Horizon-specific hyperparameters are tuned on a representative bounded cohort-week sample with an inner temporal holdout, then refit on the full training frame.
+- Target-specific hyperparameters are tuned on a representative bounded cohort-month sample with an inner temporal holdout, then refit on the full training frame.
 
 `ML/Model_Output.ipynb` reads generated reports and presents a KPI-style model summary.
+
+### Streamlit Dashboard
+
+`streamlit_app.py` provides an interactive UI over the cleaned database and generated model artifacts. The dashboard uses make, model, year, and trim-proxy filters, then shows latest VIN-level actuals with price, mileage, title, NHTSA base price, recall counts, complaint counts, cohort price distribution, price-mileage position, and VIN price history. The model page reads `MODELS_OUTPUT/model_report.json`, current-price `.joblib` artifacts, `cohort_depreciation_model_report.json`, and `cohort_future_forecasts.csv` to show validation metrics, filter-scoped current-price scoring, selected-VIN price predictions across trained current-price models, and future cohort median-price forecasts.
 
 ## Validation and Testing
 
@@ -239,6 +250,12 @@ Depreciation forecasting only:
 
 ```powershell
 python ML\Time_Series_Price.py
+```
+
+Streamlit dashboard:
+
+```powershell
+streamlit run streamlit_app.py
 ```
 
 ## Known Caveats

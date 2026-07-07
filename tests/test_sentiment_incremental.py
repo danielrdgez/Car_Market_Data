@@ -53,11 +53,28 @@ class SentimentIncrementalTests(unittest.TestCase):
             refresh_days=0,
         )
 
-        candidates = self.db.get_candidate_videos(refresh_days=30, force_recheck=False)
+        candidates = self.db.get_candidate_videos(
+            refresh_days=30,
+            force_recheck=False,
+            now_iso="2999-01-01T00:00:00+00:00",
+        )
         self.assertGreaterEqual(len(candidates), 2)
         self.assertEqual(candidates[0]["video_id"], "new_video")
         self.assertEqual(candidates[0]["priority_bucket"], 1)
         self.assertEqual(candidates[1]["video_id"], "stale_video")
+        self.assertEqual(candidates[1]["priority_bucket"], 5)
+
+    def test_never_ingested_videos_sort_ahead_of_pending_with_existing_comments(self):
+        self.db.ensure_video_fetch_state("already_ingested", playlist_id="playlist_a", video_title="Old")
+        self.db.ensure_video_fetch_state("never_ingested", playlist_id="playlist_a", video_title="New")
+        self.db.insert_sentiment_data(pd.DataFrame(make_comment_rows("already_ingested", "playlist_a", 2)))
+
+        candidates = self.db.get_candidate_videos(playlist_ids=["playlist_a"])
+
+        self.assertEqual([row["video_id"] for row in candidates], ["never_ingested", "already_ingested"])
+        self.assertEqual(candidates[0]["has_existing_comments"], 0)
+        self.assertEqual(candidates[0]["priority_bucket"], 1)
+        self.assertEqual(candidates[1]["has_existing_comments"], 1)
         self.assertEqual(candidates[1]["priority_bucket"], 3)
 
     def test_partially_completed_playlist_surfaces_pending_videos(self):

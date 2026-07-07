@@ -17,7 +17,7 @@ This file mirrors the root `AGENTS.md` for tools that read instructions from `.g
 - Button completion is behavioral: stop after `EXHAUSTION_STRIKE_COUNT` consecutive zero-row responses.
 - Dedup is two-layered: in-memory `VINCache` plus DB-sourced `get_seen_vins()`.
 - Acquisition writes use `CarDatabase(thread_safe=True)` with thread-local SQLite connections and a shared write lock.
-- `DataCleaning.py` builds `CAR_DATA_OUTPUT/CAR_DATA_CLEANED.db` with normalized data and modeling indexes.
+- `DataCleaning.py` builds `CAR_DATA_OUTPUT/CAR_DATA_CLEANED.db` with normalized data, contextual price-outlier filtering, durable trim features, and modeling indexes.
 - `Price_ML_Models.py` trains leakage-aware current-price models.
 - `Time_Series_Price.py` trains cohort-level depreciation forecasts.
 
@@ -30,6 +30,7 @@ python DataPipeline\Playwright_test.py
 python DataPipeline\NHTSA_enrichment.py
 python DataPipeline\DataCleaning.py
 python -m unittest tests\test_ml_upgrade.py
+streamlit run streamlit_app.py
 ```
 
 Use this before scheduled ingestion:
@@ -47,6 +48,9 @@ run_pipeline_scheduler.bat --dry-run
 - Keep all NHTSA-derived fields prefixed with `nhtsa_`.
 - Prefer incremental persistence over large in-memory accumulation.
 - For data cleaning work, prefer Polars by default and keep Pandas where modeling/notebook code already depends on it.
+- For price outliers, prefer robust cohort-aware checks over only global cutoffs; preserve title-derived trim fields and NHTSA trim provenance for modeling.
+- Preserve `nhtsa_BasePrice` provenance; missing cleaned base prices can be filled from earliest cleaned price history, then earliest cleaned listing history.
+- Keep depreciation forecasts cohort-level and monthly out to five years by default, not VIN-level or fixed 30/60/90-day buckets.
 - Preserve direct script execution with `if __name__ == "__main__": main()`.
 - Keep code and markdown professional, concise, and emoji-free.
 

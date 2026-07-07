@@ -40,11 +40,23 @@ NHTSA_DROP_COLUMNS = {
     "nhtsa_AdditionalErrorText", "nhtsa_DisplacementCC", "nhtsa_DisplacementCI",
     "nhtsa_ModelID", "nhtsa_ManufacturerId", "nhtsa_MakeID", 'nhtsa_SemiautomaticHeadlampBeamSwitching',
     'nhtsa_LowerBeamHeadlampLightSource', 'nhtsa_EntertainmentSystem', 'nhtsa_DestinationMarket',
-    'nhtsa_BrakeSystemDesc', 'nhtsa_Trim', 'nhtsa_Trim2'
+    'nhtsa_BrakeSystemDesc'
 }
 
 PRICE_MIN = 1000
 PRICE_MAX = 1_000_000
+PRICE_CONTEXT_MIN_MEDIAN = 5_000
+PRICE_CONTEXT_HIGH_RATIO = 3.5
+PRICE_CONTEXT_LOW_RATIO = 0.25
+PRICE_CONTEXT_IQR_MULTIPLIER = 3.0
+PRICE_REPEATED_HIGH_RATIO = 2.0
+PRICE_REPEATED_LOW_RATIO = 0.50
+PRICE_REPEATED_DIGIT_LENGTH = 5
+PRICE_CONTEXT_LEVELS = [
+    (["nhtsa_Make", "nhtsa_Model", "nhtsa_ModelYear", "trim_combined"], 6, "make_model_year_trim"),
+    (["nhtsa_Make", "nhtsa_Model", "nhtsa_ModelYear"], 10, "make_model_year"),
+    (["nhtsa_Make", "nhtsa_Model"], 20, "make_model"),
+]
 
 VIN_BLACKLIST = {
     "1GCUY6ED0LF228114",
@@ -53,24 +65,98 @@ VIN_BLACKLIST = {
 
 CARDINALITY_THRESHOLD = 0.005  # 0.5%
 
+KNOWN_TRIMS = [
+    "TRD OFF ROAD", "TRD SPORT", "HIGH COUNTRY", "KING RANCH", "BIG HORN",
+    "M SPORT", "AMG", "PLATINUM", "LIMITED", "PREMIUM", "TOURING", "DENALI",
+    "LARIAT", "RAPTOR", "LARAMIE", "LONGHORN", "RUBICON", "OVERLAND",
+    "ALTITUDE", "GT350", "GT500", "PRO 4X", "TRD PRO", "RTL E", "EX L",
+    "330I", "340I", "430I", "440I", "530I", "540I", "M340I", "M440I",
+    "M3", "M4", "M5", "RS3", "RS5", "RS7", "S3", "S4", "S5", "S6", "S7",
+    "2LT", "1LT", "3LT", "2SS", "1SS", "Z71", "LTZ", "RST", "SLT", "SLE",
+    "SEL", "XLE", "XSE", "SR5", "SPORT", "BASE", "RTL", "SXT", "SRT",
+    "XLT", "WILLYS", "SAHARA", "REBEL", "SV", "SR", "SL", "SE", "LE",
+    "EX", "LX", "SI", "LT", "LS", "XL", "GT", "R T",
+]
 
-def extract_clean_trim(make: str, model: str, title: str) -> str:
-    """Extract clean trim by removing Make, Model, and Year from title."""
-    if not title or pd.isna(title):
+TITLE_STOPWORDS = {
+    "NEW", "USED", "CERTIFIED", "CPO", "SEDAN", "COUPE", "SUV", "TRUCK",
+    "VAN", "WAGON", "HATCHBACK", "CONVERTIBLE", "AWD", "FWD", "RWD", "4WD",
+    "4X4", "AUTO", "AUTOMATIC", "MANUAL", "GAS", "GASOLINE", "HYBRID",
+    "ELECTRIC", "DIESEL", "TURBO", "LOCAL", "CARFAX", "CLEAN", "TITLE",
+    "NAVIGATION", "SUNROOF", "LEATHER", "BACKUP", "CAMERA", "LOW", "MILES",
+}
+
+
+def normalize_trim_text(value: object, fallback: str = "") -> str:
+    """Normalize trim-like text while preserving useful alphanumeric badges."""
+    if value is None or pd.isna(value):
+        return fallback
+    text = re.sub(r"[^A-Za-z0-9]+", " ", str(value).upper())
+    text = re.sub(r"\s+", " ", text).strip()
+    if not text or text in {"N A", "NA", "NONE", "NULL", "UNKNOWN", "NOT APPLICABLE"}:
+        return fallback
+    return text
+
+
+def normalize_title(value: object) -> str:
+    return normalize_trim_text(value, "")
+
+
+def extract_clean_trim(make: object, model: object, model_year: object, title: object) -> str:
+    """Extract a trim-like token from noisy listing titles."""
+    title_text = normalize_title(title)
+    if not title_text:
         return ""
 
-    title = str(title).upper().strip()
-    make = str(make).upper().strip() if make else ""
-    model = str(model).upper().strip() if model else ""
+    padded = f" {title_text} "
+    for trim in KNOWN_TRIMS:
+        normalized_trim = normalize_trim_text(trim)
+        if f" {normalized_trim} " in padded:
+            return normalized_trim.replace(" ", "_")
 
-    if make:
-        title = title.replace(make, "")
-    if model:
-        title = title.replace(model, "")
+    remove_tokens = set(normalize_title(make).split())
+    remove_tokens.update(normalize_title(model).split())
+    if model_year is not None and not pd.isna(model_year):
+        try:
+            remove_tokens.add(str(int(float(model_year))))
+        except (TypeError, ValueError):
+            remove_tokens.add(str(model_year).strip())
 
-    title = re.sub(r"^\s*20\d{2}\s+", "", title)
+    candidates = [
+        token
+        for token in title_text.split()
+        if token not in remove_tokens
+        and token not in TITLE_STOPWORDS
+        and not token.isdigit()
+        and len(token) > 1
+    ]
+    if not candidates:
+        return ""
+    return "_".join(candidates[:2])[:40]
 
-    return title.strip()
+
+def combine_trim_values(*values: object) -> str:
+    """Return a stable, de-duplicated trim label from official and title-derived values."""
+    parts = []
+    seen = set()
+    for value in values:
+        cleaned = normalize_trim_text(value).replace(" ", "_")
+        if cleaned and cleaned != "UNKNOWN_TRIM" and cleaned not in seen:
+            parts.append(cleaned)
+            seen.add(cleaned)
+    return " ".join(parts) if parts else "UNKNOWN_TRIM"
+
+
+def has_repeated_digit_price(value: object) -> bool:
+    if value is None or pd.isna(value):
+        return False
+    try:
+        digits = str(int(float(value)))
+    except (TypeError, ValueError):
+        return False
+    if len(digits) < PRICE_REPEATED_DIGIT_LENGTH:
+        return False
+    return len(set(digits)) == 1 and digits[0] != "0"
 
 
 def reduce_cardinality(df: pl.DataFrame, columns: list[str], threshold: float = CARDINALITY_THRESHOLD) -> pl.DataFrame:
@@ -110,6 +196,7 @@ class DataCleaningPipeline:
             filename=str(log_file),
             level=logging.INFO,
             format="%(asctime)s - %(levelname)s - %(message)s",
+            force=True,
         )
 
     @staticmethod
@@ -184,6 +271,249 @@ class DataCleaningPipeline:
             & (pl.col(price_col) >= PRICE_MIN)
             & (pl.col(price_col) <= PRICE_MAX)
         )
+
+    @staticmethod
+    def _ensure_columns(df: pl.DataFrame, columns: Iterable[str], dtype: pl.DataType = pl.String) -> pl.DataFrame:
+        missing = [col for col in columns if col not in df.columns]
+        if not missing:
+            return df
+        return df.with_columns([pl.lit(None, dtype=dtype).alias(col) for col in missing])
+
+    @staticmethod
+    def _normalize_trim_columns(df: pl.DataFrame, columns: Iterable[str]) -> pl.DataFrame:
+        for col in columns:
+            if col in df.columns:
+                df = df.with_columns(
+                    pl.col(col)
+                    .map_elements(normalize_trim_text, return_dtype=pl.String)
+                    .alias(col)
+                )
+        return df
+
+    @staticmethod
+    def _add_listing_trim_features(df: pl.DataFrame) -> pl.DataFrame:
+        required = {"title", "nhtsa_Make", "nhtsa_Model", "nhtsa_ModelYear", "nhtsa_Trim", "nhtsa_Trim2"}
+        if not required.issubset(set(df.columns)):
+            return df
+
+        df = df.with_columns(
+            [
+                pl.col("title").map_elements(normalize_title, return_dtype=pl.String).alias("title_normalized"),
+                pl.struct(["nhtsa_Make", "nhtsa_Model", "nhtsa_ModelYear", "title"])
+                .map_elements(
+                    lambda row: extract_clean_trim(
+                        row["nhtsa_Make"],
+                        row["nhtsa_Model"],
+                        row["nhtsa_ModelYear"],
+                        row["title"],
+                    ),
+                    return_dtype=pl.String,
+                )
+                .alias("title_trim"),
+            ]
+        )
+        df = df.with_columns(
+            [
+                pl.struct(["nhtsa_Trim", "nhtsa_Trim2", "title_trim"])
+                .map_elements(
+                    lambda row: combine_trim_values(row["nhtsa_Trim"], row["nhtsa_Trim2"], row["title_trim"]),
+                    return_dtype=pl.String,
+                )
+                .alias("trim_combined"),
+                pl.when(pl.col("nhtsa_Trim").is_not_null() & (pl.col("nhtsa_Trim") != ""))
+                .then(pl.lit("nhtsa_Trim"))
+                .when(pl.col("nhtsa_Trim2").is_not_null() & (pl.col("nhtsa_Trim2") != ""))
+                .then(pl.lit("nhtsa_Trim2"))
+                .when(pl.col("title_trim").is_not_null() & (pl.col("title_trim") != ""))
+                .then(pl.lit("title"))
+                .otherwise(pl.lit("unknown"))
+                .alias("trim_source"),
+            ]
+        )
+        return df
+
+    @staticmethod
+    def _contextual_price_stats(
+        df: pl.DataFrame,
+        price_col: str,
+        context_levels: list[tuple[list[str], int, str]],
+    ) -> pl.DataFrame:
+        stats_df = df
+        valid_levels = [
+            (idx, cols, min_count, label)
+            for idx, (cols, min_count, label) in enumerate(context_levels)
+            if all(col in stats_df.columns for col in cols)
+        ]
+
+        for idx, cols, _, _ in valid_levels:
+            stats = stats_df.group_by(cols).agg(
+                [
+                    pl.len().alias(f"_price_context_count_{idx}"),
+                    pl.col(price_col).median().alias(f"_price_context_median_{idx}"),
+                    pl.col(price_col).quantile(0.25).alias(f"_price_context_q1_{idx}"),
+                    pl.col(price_col).quantile(0.75).alias(f"_price_context_q3_{idx}"),
+                ]
+            )
+            stats_df = stats_df.join(stats, on=cols, how="left")
+
+        global_stats = df.select(
+            [
+                pl.len().alias("_price_context_count_global"),
+                pl.col(price_col).median().alias("_price_context_median_global"),
+                pl.col(price_col).quantile(0.25).alias("_price_context_q1_global"),
+                pl.col(price_col).quantile(0.75).alias("_price_context_q3_global"),
+            ]
+        ).row(0, named=True)
+
+        stats_df = stats_df.with_columns(
+            [
+                pl.lit(global_stats["_price_context_count_global"]).alias("_price_context_count_global"),
+                pl.lit(global_stats["_price_context_median_global"]).alias("_price_context_median_global"),
+                pl.lit(global_stats["_price_context_q1_global"]).alias("_price_context_q1_global"),
+                pl.lit(global_stats["_price_context_q3_global"]).alias("_price_context_q3_global"),
+            ]
+        )
+
+        count_expr = pl.col("_price_context_count_global")
+        median_expr = pl.col("_price_context_median_global")
+        q1_expr = pl.col("_price_context_q1_global")
+        q3_expr = pl.col("_price_context_q3_global")
+        level_expr = pl.lit("global")
+
+        for idx, _, min_count, label in reversed(valid_levels):
+            enough_rows = pl.col(f"_price_context_count_{idx}") >= min_count
+            count_expr = pl.when(enough_rows).then(pl.col(f"_price_context_count_{idx}")).otherwise(count_expr)
+            median_expr = pl.when(enough_rows).then(pl.col(f"_price_context_median_{idx}")).otherwise(median_expr)
+            q1_expr = pl.when(enough_rows).then(pl.col(f"_price_context_q1_{idx}")).otherwise(q1_expr)
+            q3_expr = pl.when(enough_rows).then(pl.col(f"_price_context_q3_{idx}")).otherwise(q3_expr)
+            level_expr = pl.when(enough_rows).then(pl.lit(label)).otherwise(level_expr)
+
+        return stats_df.with_columns(
+            [
+                count_expr.alias("_price_context_count"),
+                median_expr.alias("_price_context_median"),
+                q1_expr.alias("_price_context_q1"),
+                q3_expr.alias("_price_context_q3"),
+                level_expr.alias("_price_context_level"),
+            ]
+        )
+
+    @staticmethod
+    def _filter_contextual_price_outliers(
+        df: pl.DataFrame,
+        price_col: str = "price",
+        label: str = "rows",
+    ) -> pl.DataFrame:
+        if price_col not in df.columns or df.is_empty():
+            return df
+
+        helper_prefixes = ("_price_context_",)
+        df = DataCleaningPipeline._contextual_price_stats(df, price_col, PRICE_CONTEXT_LEVELS)
+        df = df.with_columns(
+            pl.col(price_col)
+            .map_elements(has_repeated_digit_price, return_dtype=pl.Boolean)
+            .alias("_price_repeated_digit")
+        )
+
+        iqr = (pl.col("_price_context_q3") - pl.col("_price_context_q1")).clip(lower_bound=0)
+        upper_fence = pl.max_horizontal(
+            pl.col("_price_context_q3") + (PRICE_CONTEXT_IQR_MULTIPLIER * iqr),
+            pl.col("_price_context_median") + 25_000,
+        )
+        lower_fence = pl.min_horizontal(
+            (pl.col("_price_context_q1") - (PRICE_CONTEXT_IQR_MULTIPLIER * iqr)).clip(lower_bound=0),
+            pl.col("_price_context_median") * 0.5,
+        )
+        repeated_upper_fence = pl.max_horizontal(
+            pl.col("_price_context_q3") + (1.5 * iqr),
+            pl.col("_price_context_median") + 15_000,
+        )
+        valid_context = (
+            (pl.col("_price_context_count") >= 6)
+            & (pl.col("_price_context_median") >= PRICE_CONTEXT_MIN_MEDIAN)
+        )
+        high_context_outlier = (
+            valid_context
+            & (pl.col(price_col) > pl.col("_price_context_median") * PRICE_CONTEXT_HIGH_RATIO)
+            & (pl.col(price_col) > upper_fence)
+        )
+        low_context_outlier = (
+            valid_context
+            & (pl.col(price_col) < pl.col("_price_context_median") * PRICE_CONTEXT_LOW_RATIO)
+            & (pl.col(price_col) < lower_fence)
+        )
+        repeated_digit_outlier = (
+            valid_context
+            & pl.col("_price_repeated_digit")
+            & (
+                (
+                    (pl.col(price_col) > pl.col("_price_context_median") * PRICE_REPEATED_HIGH_RATIO)
+                    & (pl.col(price_col) > repeated_upper_fence)
+                )
+                | (
+                    (pl.col(price_col) < pl.col("_price_context_median") * PRICE_REPEATED_LOW_RATIO)
+                    & (pl.col(price_col) < pl.col("_price_context_q1"))
+                )
+            )
+        )
+
+        df = df.with_columns(
+            (high_context_outlier | low_context_outlier | repeated_digit_outlier).alias("_price_context_outlier")
+        )
+        removed = int(df.filter(pl.col("_price_context_outlier")).height)
+        if removed:
+            logging.info("Dropped %d contextual price outliers from %s", removed, label)
+
+        drop_cols = [
+            col
+            for col in df.columns
+            if col.startswith(helper_prefixes) or col in {"_price_repeated_digit", "_price_context_outlier"}
+        ]
+        return df.filter(~pl.col("_price_context_outlier")).drop(drop_cols)
+
+    @staticmethod
+    def _fill_nhtsa_base_price_from_history(
+        nhtsa: pl.DataFrame,
+        price_history: pl.DataFrame,
+        listing_history: pl.DataFrame,
+    ) -> pl.DataFrame:
+        """Fill missing NHTSA base price from earliest cleaned history prices."""
+        nhtsa = DataCleaningPipeline._ensure_columns(nhtsa, ["nhtsa_BasePrice"], dtype=pl.Int64)
+
+        def earliest_price(df: pl.DataFrame, alias: str) -> pl.DataFrame:
+            if df.is_empty() or not {"vin", "history_date", "price"}.issubset(set(df.columns)):
+                return pl.DataFrame({"vin": [], alias: []}, schema={"vin": pl.String, alias: pl.Int64})
+            return (
+                df.filter(pl.col("price").is_not_null() & (pl.col("price") > 0))
+                .sort(["vin", "history_date"])
+                .group_by("vin", maintain_order=True)
+                .agg(pl.col("price").first().alias(alias))
+            )
+
+        price_first = earliest_price(price_history, "_base_price_from_price_history")
+        listing_first = earliest_price(listing_history, "_base_price_from_listing_history")
+        nhtsa = nhtsa.join(price_first, on="vin", how="left").join(listing_first, on="vin", how="left")
+        history_fill = pl.coalesce(
+            [pl.col("_base_price_from_price_history"), pl.col("_base_price_from_listing_history")]
+        )
+        missing_base_price = pl.col("nhtsa_BasePrice").is_null() | (pl.col("nhtsa_BasePrice") <= 0)
+        nhtsa = nhtsa.with_columns(
+            [
+                pl.when(missing_base_price)
+                .then(history_fill)
+                .otherwise(pl.col("nhtsa_BasePrice"))
+                .alias("nhtsa_BasePrice"),
+                pl.when(~missing_base_price)
+                .then(pl.lit("nhtsa"))
+                .when(pl.col("_base_price_from_price_history").is_not_null())
+                .then(pl.lit("price_history"))
+                .when(pl.col("_base_price_from_listing_history").is_not_null())
+                .then(pl.lit("listing_history"))
+                .otherwise(pl.lit("missing"))
+                .alias("nhtsa_BasePrice_source"),
+            ]
+        )
+        return nhtsa.drop(["_base_price_from_price_history", "_base_price_from_listing_history"])
 
     @staticmethod
     def _filter_non_null_numeric(df: pl.DataFrame, columns: Iterable[str]) -> pl.DataFrame:
@@ -299,6 +629,7 @@ class DataCleaningPipeline:
         listings = self._cast_to_int(listings, ["locationCode"])
         listings = self._cast_to_float(listings, ["distance"])
 
+        nhtsa = self._ensure_columns(nhtsa, ["nhtsa_Trim", "nhtsa_Trim2"])
         nhtsa = self._filter_non_empty(nhtsa, ["vin", "nhtsa_Make", "nhtsa_Model", "nhtsa_ModelYear"]).with_columns(
             [
                 pl.col("nhtsa_Make").cast(pl.String).str.strip_chars().str.to_uppercase().alias("nhtsa_Make"),
@@ -321,11 +652,72 @@ class DataCleaningPipeline:
             "nhtsa_DisplacementL", "nhtsa_TrackWidth"
         ])
 
-        scoped_listings = listings.join(nhtsa.select("vin"), on="vin", how="inner")
+        nhtsa = self._normalize_trim_columns(nhtsa, ["nhtsa_Trim", "nhtsa_Trim2"])
+
+        listing_context_columns = [
+            "vin", "nhtsa_Make", "nhtsa_Model", "nhtsa_ModelYear", "nhtsa_Trim", "nhtsa_Trim2"
+        ]
+        scoped_listings = listings.join(nhtsa.select(listing_context_columns), on="vin", how="inner")
+        scoped_listings = self._add_listing_trim_features(scoped_listings)
+        scoped_listings = self._filter_contextual_price_outliers(scoped_listings, "price", "listings")
         scoped_vins = scoped_listings.select("vin").unique()
 
-        keep_nhtsa_columns = [c for c in nhtsa.columns if c not in NHTSA_DROP_COLUMNS]
-        scoped_nhtsa = nhtsa.join(scoped_vins, on="vin", how="inner").select(keep_nhtsa_columns)
+        vin_title_trim = (
+            scoped_listings
+            .sort([c for c in ["vin", "loaddate", "date"] if c in scoped_listings.columns])
+            .group_by("vin")
+            .agg(
+                pl.col("title_trim")
+                .filter(pl.col("title_trim").is_not_null() & (pl.col("title_trim") != ""))
+                .last()
+                .alias("title_trim_for_fill")
+            )
+        )
+        nhtsa = nhtsa.join(vin_title_trim, on="vin", how="left")
+        nhtsa = nhtsa.with_columns(
+            [
+                pl.when(pl.col("nhtsa_Trim").is_not_null() & (pl.col("nhtsa_Trim") != ""))
+                .then(pl.col("nhtsa_Trim"))
+                .otherwise(pl.col("title_trim_for_fill"))
+                .alias("_nhtsa_Trim_filled"),
+                pl.when(pl.col("nhtsa_Trim2").is_not_null() & (pl.col("nhtsa_Trim2") != ""))
+                .then(pl.col("nhtsa_Trim2"))
+                .when(
+                    pl.col("nhtsa_Trim").is_not_null()
+                    & (pl.col("nhtsa_Trim") != "")
+                    & pl.col("title_trim_for_fill").is_not_null()
+                    & (pl.col("title_trim_for_fill") != "")
+                    & (pl.col("title_trim_for_fill") != pl.col("nhtsa_Trim"))
+                )
+                .then(pl.col("title_trim_for_fill"))
+                .otherwise(pl.col("nhtsa_Trim2"))
+                .alias("_nhtsa_Trim2_filled"),
+                pl.when(pl.col("nhtsa_Trim").is_not_null() & (pl.col("nhtsa_Trim") != ""))
+                .then(pl.lit("nhtsa"))
+                .when(pl.col("title_trim_for_fill").is_not_null() & (pl.col("title_trim_for_fill") != ""))
+                .then(pl.lit("title"))
+                .otherwise(pl.lit("unknown"))
+                .alias("nhtsa_Trim_source"),
+            ]
+        ).with_columns(
+            [
+                pl.col("_nhtsa_Trim_filled").alias("nhtsa_Trim"),
+                pl.col("_nhtsa_Trim2_filled").alias("nhtsa_Trim2"),
+                pl.struct(["_nhtsa_Trim_filled", "_nhtsa_Trim2_filled"])
+                .map_elements(
+                    lambda row: combine_trim_values(row["_nhtsa_Trim_filled"], row["_nhtsa_Trim2_filled"]),
+                    return_dtype=pl.String,
+                )
+                .alias("nhtsa_trim_combined"),
+            ]
+        ).drop(["_nhtsa_Trim_filled", "_nhtsa_Trim2_filled", "title_trim_for_fill"])
+
+        vin_price_context = scoped_listings.select(
+            ["vin", "nhtsa_Make", "nhtsa_Model", "nhtsa_ModelYear", "trim_combined"]
+        ).unique(subset=["vin"], keep="last")
+
+        listing_helper_cols = ["nhtsa_Make", "nhtsa_Model", "nhtsa_ModelYear", "nhtsa_Trim", "nhtsa_Trim2"]
+        scoped_listings = scoped_listings.drop([c for c in listing_helper_cols if c in scoped_listings.columns])
 
         cardinality_cols = [c for c in ['nhtsa_Make', 'nhtsa_Model'] if c in scoped_listings.columns]
         if cardinality_cols:
@@ -338,15 +730,29 @@ class DataCleaningPipeline:
         listing_history = self._drop_null_dates(listing_history, ["history_date"])
         listing_history = self._normalize_numeric_to_int_ceil(listing_history, ["price", "mileage"])
         listing_history = self._filter_price_range(listing_history, "price")
+        listing_history = listing_history.join(vin_price_context, on="vin", how="inner")
+        listing_history = self._filter_contextual_price_outliers(listing_history, "price", "listing_history")
+        listing_history = listing_history.drop(
+            [c for c in ["nhtsa_Make", "nhtsa_Model", "nhtsa_ModelYear", "trim_combined"] if c in listing_history.columns]
+        )
 
         price_history = self._normalize_date_columns(price_history, ["history_date"])
         price_history = self._drop_null_dates(price_history, ["history_date"])
         price_history = self._normalize_numeric_to_int_ceil(price_history, ["price", "mileage"])
         price_history = self._filter_price_range(price_history, "price")
+        price_history = price_history.join(vin_price_context, on="vin", how="inner")
+        price_history = self._filter_contextual_price_outliers(price_history, "price", "price_history")
+        price_history = price_history.drop(
+            [c for c in ["nhtsa_Make", "nhtsa_Model", "nhtsa_ModelYear", "trim_combined"] if c in price_history.columns]
+        )
 
         # Keep all history rows, but restrict them to VINs in the make-filtered scope.
         listing_history = listing_history.join(scoped_vins, on="vin", how="inner")
         price_history = price_history.join(scoped_vins, on="vin", how="inner")
+
+        nhtsa = self._fill_nhtsa_base_price_from_history(nhtsa, price_history, listing_history)
+        keep_nhtsa_columns = [c for c in nhtsa.columns if c not in NHTSA_DROP_COLUMNS]
+        scoped_nhtsa = nhtsa.join(scoped_vins, on="vin", how="inner").select(keep_nhtsa_columns)
 
         target_conn = sqlite3.connect(str(self.target_db_path))
         try:

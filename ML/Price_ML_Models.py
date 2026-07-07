@@ -78,6 +78,24 @@ TARGET_ENCODE_TOKENS = (
     "location",
 )
 
+TRIM_FEATURE_CANDIDATES = [
+    "trim_combined",
+    "nhtsa_trim_combined",
+    "nhtsa_Trim",
+    "nhtsa_Trim2",
+    "title_trim",
+]
+
+TRIM_METADATA_COLUMNS = [
+    "title_trim",
+    "trim_combined",
+    "trim_source",
+    "nhtsa_Trim",
+    "nhtsa_Trim2",
+    "nhtsa_Trim_source",
+    "nhtsa_trim_combined",
+]
+
 RESEARCH_REFERENCES = [
     {
         "title": "How much is my car worth? A methodology for predicting used cars prices using Random Forest",
@@ -95,6 +113,13 @@ RESEARCH_REFERENCES = [
         "reason": "Motivates mileage, mix, outlier, and seasonality controls for used-vehicle price modeling.",
     },
 ]
+
+
+def normalize_trim_feature(value: Any, fallback: str = "UNKNOWN_TRIM") -> str:
+    if value is None or pd.isna(value):
+        return fallback
+    text = str(value).strip().upper().replace(" ", "_")
+    return text if text and text not in {"NA", "N_A", "NONE", "NULL", "UNKNOWN"} else fallback
 
 
 def parse_args() -> argparse.Namespace:
@@ -135,9 +160,15 @@ def parse_args() -> argparse.Namespace:
         help="Keep repeated VIN rows. By default, training keeps the latest loaddate per VIN.",
     )
     parser.add_argument(
-        "--horizons",
-        default="30,90,180,365",
-        help="Forecast horizons passed through when --task all is used.",
+        "--target-months",
+        default="1",
+        help="Monthly depreciation target(s) passed through when --task all is used.",
+    )
+    parser.add_argument(
+        "--forecast-months",
+        type=int,
+        default=60,
+        help="Number of future monthly depreciation forecast points when --task all is used.",
     )
     return parser.parse_args()
 
@@ -370,8 +401,27 @@ def engineer_current_price_features(df: pd.DataFrame) -> pd.DataFrame:
             df[f"{col}_length"] = text.str.len()
             df[f"{col}_word_count"] = text.str.split().str.len()
 
+    trim_candidates = [df[col] for col in TRIM_FEATURE_CANDIDATES if col in df.columns]
+    for col in TRIM_METADATA_COLUMNS:
+        if col in df.columns:
+            df[col] = df[col].map(normalize_trim_feature).astype("string")
+
+    df["trim_proxy"] = "UNKNOWN_TRIM"
+    for candidate in trim_candidates:
+        normalized = candidate.map(normalize_trim_feature)
+        usable = normalized.notna() & normalized.ne("UNKNOWN_TRIM") & normalized.ne("")
+        df.loc[df["trim_proxy"].eq("UNKNOWN_TRIM") & usable, "trim_proxy"] = normalized[usable]
+    df["trim_proxy"] = df["trim_proxy"].astype("string")
+
     if "vehicleTitle" in df.columns:
-        title = df["vehicleTitle"].astype("string").fillna("")
+        title_parts = [
+            df[col].astype("string").fillna("")
+            for col in ["vehicleTitle", "vehicleTitleDesc", "title", "trim_proxy"]
+            if col in df.columns
+        ]
+        title = title_parts[0] if title_parts else pd.Series("", index=df.index, dtype="string")
+        for part in title_parts[1:]:
+            title = title + " " + part
         df["title_mentions_certified"] = title.str.contains(
             "certified|cpo",
             case=False,
@@ -383,7 +433,7 @@ def engineer_current_price_features(df: pd.DataFrame) -> pd.DataFrame:
             na=False,
         ).astype("int8")
         df["title_mentions_luxury_trim"] = title.str.contains(
-            "premium|platinum|limited|reserve|s|amg|m sport|rs|performance",
+            "premium|platinum|limited|reserve|s|amg|m sport|rs|performance|gt350|gt500",
             case=False,
             na=False,
         ).astype("int8")
@@ -403,6 +453,7 @@ def engineer_current_price_features(df: pd.DataFrame) -> pd.DataFrame:
     fuel = df.get("nhtsa_FuelTypePrimary", pd.Series("UNKNOWN", index=df.index)).astype("string").fillna("UNKNOWN")
 
     df["make_model_year"] = make + "_" + model + "_" + year
+    df["make_model_year_trim"] = df["make_model_year"] + "_" + df["trim_proxy"].fillna("UNKNOWN_TRIM")
     df["body_fuel_segment"] = body + "_" + fuel
     df["is_ev_or_hybrid"] = (
         fuel.str.contains("electric|hybrid", case=False, na=False)
@@ -1133,6 +1184,14 @@ def train_current_price_models(
         },
         "split": split_metadata,
         "features": feature_metadata,
+        "trim_features": {
+            "cleaned_trim_columns_available": [
+                col for col in TRIM_METADATA_COLUMNS if col in model_df.columns
+            ],
+            "engineered_trim_columns": [
+                col for col in ["trim_proxy", "make_model_year_trim"] if col in model_df.columns
+            ],
+        },
         "tuning": {
             "max_tuning_rows": DEFAULT_TUNING_SAMPLE_SIZE,
             "sampling_strategy": "deterministic stratified sample by diagnostic price band, NHTSA make, and model year",
@@ -1184,6 +1243,7 @@ def write_reports(output_dir: Path, report: dict[str, Any]) -> None:
         f"- Feature matrix profile: {report['feature_space_profile']['transformed_shape_on_profile'][1]:,} transformed columns on "
         f"{report['feature_space_profile']['profile_rows']:,} profiled rows; projected full training matrix "
         f"{report['feature_space_profile']['projected_full_training_matrix_memory_mb'] / 1024:,.2f} GB",
+        f"- Cleaned trim fields used: {', '.join(report.get('trim_features', {}).get('cleaned_trim_columns_available', [])) or 'none available'}",
         "",
         "## Best Model Metrics",
         f"- MAE: ${best_metrics['mae']:,.2f}",
@@ -1256,12 +1316,13 @@ def main() -> None:
     if args.task == "all":
         from Time_Series_Price import run_cohort_forecast
 
-        horizons = [int(x.strip()) for x in args.horizons.split(",") if x.strip()]
+        target_months = [int(x.strip()) for x in args.target_months.split(",") if x.strip()]
         run_cohort_forecast(
             db_path=Path(args.db_path),
             output_dir=Path(args.output_dir),
             sample_size=args.sample_size,
-            horizons=horizons,
+            target_months=target_months,
+            forecast_months=args.forecast_months,
             split_date=args.split_date,
         )
 

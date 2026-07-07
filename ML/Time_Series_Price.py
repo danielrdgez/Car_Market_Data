@@ -1,10 +1,10 @@
 """
 Train make/model/year/trim cohort depreciation forecasts from price history.
 
-The model grain is a weekly cohort, not an individual VIN. Cohorts are built
-from NHTSA make, model, model year, and a best-effort trim token parsed from
-the latest listing title. The script trains global forecasting models across
-all cohorts so sparse cohorts can borrow signal from richer ones.
+The model grain is a monthly cohort, not an individual VIN. Cohorts are built
+from NHTSA make, model, model year, and the cleaned trim proxy when available.
+The script trains global forecasting models across all cohorts so sparse or
+newer cohorts can borrow signal from richer related cohorts.
 """
 
 from __future__ import annotations
@@ -51,9 +51,10 @@ RANDOM_STATE = 42
 DEFAULT_SAMPLE_SIZE = 250_000
 DEFAULT_TUNING_SAMPLE_SIZE = 200_000
 DEFAULT_TUNING_CANDIDATES = 8
-DEFAULT_HORIZONS = [30, 90, 180, 365]
-DEFAULT_MIN_WEEKLY_VINS = 1
-DEFAULT_MIN_COHORT_WEEKS = 3
+DEFAULT_TARGET_MONTHS = [1]
+DEFAULT_FORECAST_MONTHS = 60
+DEFAULT_MIN_MONTHLY_VINS = 1
+DEFAULT_MIN_COHORT_MONTHS = 3
 DEFAULT_MAX_PRICE = 250_000
 MIN_MODEL_ROWS = 50
 MIN_TEMPORAL_TRAIN_ROWS = 2
@@ -173,22 +174,21 @@ NUMERIC_FEATURES = [
     "price_down_rate",
     "month",
     "quarter",
-    "week_of_year",
-    "cohort_week_number",
-    "cohort_age_weeks",
+    "cohort_month_number",
+    "cohort_age_months",
     "cohort_first_median_price",
     "price_index_vs_cohort_first",
     "cumulative_depreciation_pct",
     "lag_median_price_1",
     "lag_median_price_2",
     "lag_price_index_1",
-    "rolling_median_price_4",
-    "rolling_avg_mileage_4",
-    "rolling_volume_4",
-    "rolling_depreciation_pct_4",
+    "rolling_median_price_3m",
+    "rolling_avg_mileage_3m",
+    "rolling_volume_3m",
+    "rolling_depreciation_pct_3m",
     "market_median_price",
     "market_price_index",
-    "market_weekly_volume",
+    "market_monthly_volume",
     "sentiment_score",
     "sentiment_comment_count",
     "sentiment_video_count",
@@ -238,26 +238,35 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
-        "--horizons",
-        default="30,90,180,365",
-        help="Comma-separated forecast horizons in days.",
+        "--target-months",
+        default=",".join(str(value) for value in DEFAULT_TARGET_MONTHS),
+        help=(
+            "Comma-separated direct training targets in months. The default one-month "
+            "target is recursively rolled forward for the full forecast window."
+        ),
+    )
+    parser.add_argument(
+        "--forecast-months",
+        type=int,
+        default=DEFAULT_FORECAST_MONTHS,
+        help="Number of future monthly points to emit for each latest cohort.",
     )
     parser.add_argument(
         "--split-date",
         default=None,
-        help="Validation cutoff by cohort week. Defaults to the 80th percentile week.",
+        help="Validation cutoff by cohort month. Defaults to the 80th percentile month.",
     )
     parser.add_argument(
-        "--min-weekly-vins",
+        "--min-monthly-vins",
         type=int,
-        default=DEFAULT_MIN_WEEKLY_VINS,
-        help="Minimum distinct VINs required in a cohort-week.",
+        default=DEFAULT_MIN_MONTHLY_VINS,
+        help="Minimum distinct VINs required in a cohort-month.",
     )
     parser.add_argument(
-        "--min-cohort-weeks",
+        "--min-cohort-months",
         type=int,
-        default=DEFAULT_MIN_COHORT_WEEKS,
-        help="Minimum retained weeks required per cohort.",
+        default=DEFAULT_MIN_COHORT_MONTHS,
+        help="Minimum retained months required per cohort.",
     )
     parser.add_argument(
         "--max-price",
@@ -272,6 +281,27 @@ def _basic_limit_clause(sample_size: int | None) -> str:
     if sample_size and sample_size > 0:
         return f"LIMIT {int(sample_size)}"
     return ""
+
+
+def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+        (table,),
+    ).fetchone()
+    return row is not None
+
+
+def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    if not _table_exists(conn, table):
+        return set()
+    return {row[1] for row in conn.execute(f"PRAGMA table_info('{table}')").fetchall()}
+
+
+def _select_or_null(columns: set[str], table_alias: str, column: str, output_alias: str | None = None) -> str:
+    alias = output_alias or column
+    if column in columns:
+        return f"{table_alias}.{column} AS {alias}"
+    return f"NULL AS {alias}"
 
 
 def _sample_history_cte(sample_size: int | None) -> str:
@@ -365,72 +395,116 @@ def load_history_frame(db_path: Path, sample_size: int | None) -> pd.DataFrame:
     if not db_path.exists():
         raise FileNotFoundError(f"SQLite database not found: {db_path}")
 
-    query = f"""
-        WITH RECURSIVE
-        {_sample_history_cte(sample_size)},
-        history_vins AS (
-            SELECT DISTINCT vin
-            FROM sample_history
-        ),
-        latest_listing AS (
-            SELECT *
-            FROM (
-                SELECT
-                    l.vin,
-                    l.title,
-                    l.vehicleTitle,
-                    l.vehicleTitleDesc,
-                    l.sellerType,
-                    l.sourceName,
-                    l.listingType,
-                    ROW_NUMBER() OVER (
-                        PARTITION BY l.vin
-                        ORDER BY l.loaddate DESC, l.date DESC, l.rowid DESC
-                    ) AS row_num
-                FROM listings AS l
-                INNER JOIN history_vins AS hv
-                    ON l.vin = hv.vin
-            )
-            WHERE row_num = 1
+    conn = sqlite3.connect(str(db_path))
+    try:
+        listing_cols = _table_columns(conn, "listings")
+        nhtsa_cols = _table_columns(conn, "nhtsa_enrichment")
+        has_sentiment = _table_exists(conn, "vehicle_sentiment")
+
+        latest_listing_columns = [
+            "l.vin AS vin",
+            _select_or_null(listing_cols, "l", "title"),
+            _select_or_null(listing_cols, "l", "vehicleTitle"),
+            _select_or_null(listing_cols, "l", "vehicleTitleDesc"),
+            _select_or_null(listing_cols, "l", "title_trim"),
+            _select_or_null(listing_cols, "l", "trim_combined"),
+            _select_or_null(listing_cols, "l", "trim_source"),
+            _select_or_null(listing_cols, "l", "sellerType"),
+            _select_or_null(listing_cols, "l", "sourceName"),
+            _select_or_null(listing_cols, "l", "listingType"),
+        ]
+        latest_listing_order = [
+            f"l.{column} DESC" for column in ["loaddate", "date"] if column in listing_cols
+        ]
+        latest_listing_order.append("l.rowid DESC")
+        nhtsa_select_columns = [
+            _select_or_null(nhtsa_cols, "n", "nhtsa_Make"),
+            _select_or_null(nhtsa_cols, "n", "nhtsa_Model"),
+            _select_or_null(nhtsa_cols, "n", "nhtsa_ModelYear"),
+            _select_or_null(nhtsa_cols, "n", "nhtsa_Trim"),
+            _select_or_null(nhtsa_cols, "n", "nhtsa_Trim2"),
+            _select_or_null(nhtsa_cols, "n", "nhtsa_trim_combined"),
+            _select_or_null(nhtsa_cols, "n", "nhtsa_BodyClass"),
+            _select_or_null(nhtsa_cols, "n", "nhtsa_DriveType"),
+            _select_or_null(nhtsa_cols, "n", "nhtsa_FuelTypePrimary"),
+            _select_or_null(nhtsa_cols, "n", "nhtsa_ElectrificationLevel"),
+            _select_or_null(nhtsa_cols, "n", "nhtsa_EngineHP"),
+            _select_or_null(nhtsa_cols, "n", "nhtsa_EngineCylinders"),
+            _select_or_null(nhtsa_cols, "n", "nhtsa_total_recalls"),
+            _select_or_null(nhtsa_cols, "n", "nhtsa_total_complaints"),
+        ]
+        sentiment_select_columns = (
+            [
+                "vs.sentiment_score AS sentiment_score",
+                "vs.comment_count AS sentiment_comment_count",
+                "vs.video_count AS sentiment_video_count",
+            ]
+            if has_sentiment
+            else [
+                "NULL AS sentiment_score",
+                "NULL AS sentiment_comment_count",
+                "NULL AS sentiment_video_count",
+            ]
         )
-        SELECT
-            ph.vin,
-            ph.history_date,
-            ph.mileage,
-            ph.price,
-            ph.trend,
-            ll.title,
-            ll.vehicleTitle,
-            ll.vehicleTitleDesc,
-            ll.sellerType,
-            ll.sourceName,
-            ll.listingType,
-            n.nhtsa_Make,
-            n.nhtsa_Model,
-            n.nhtsa_ModelYear,
-            n.nhtsa_BodyClass,
-            n.nhtsa_DriveType,
-            n.nhtsa_FuelTypePrimary,
-            n.nhtsa_ElectrificationLevel,
-            n.nhtsa_EngineHP,
-            n.nhtsa_EngineCylinders,
-            n.nhtsa_total_recalls,
-            n.nhtsa_total_complaints,
-            vs.sentiment_score,
-            vs.comment_count AS sentiment_comment_count,
-            vs.video_count AS sentiment_video_count
-        FROM sample_history AS ph
-        LEFT JOIN latest_listing AS ll
-            ON ph.vin = ll.vin
-        LEFT JOIN nhtsa_enrichment AS n
-            ON ph.vin = n.vin
+        sentiment_join = (
+            """
         LEFT JOIN vehicle_sentiment AS vs
             ON LOWER(vs.make) = LOWER(n.nhtsa_Make)
            AND LOWER(vs.model) = LOWER(n.nhtsa_Model)
            AND vs.year = n.nhtsa_ModelYear
-    """
-    with sqlite3.connect(str(db_path)) as conn:
+            """
+            if has_sentiment
+            else ""
+        )
+
+        query = f"""
+            WITH RECURSIVE
+            {_sample_history_cte(sample_size)},
+            history_vins AS (
+                SELECT DISTINCT vin
+                FROM sample_history
+            ),
+            latest_listing AS (
+                SELECT *
+                FROM (
+                    SELECT
+                        {', '.join(latest_listing_columns)},
+                        ROW_NUMBER() OVER (
+                            PARTITION BY l.vin
+                            ORDER BY {', '.join(latest_listing_order)}
+                        ) AS row_num
+                    FROM listings AS l
+                    INNER JOIN history_vins AS hv
+                        ON l.vin = hv.vin
+                )
+                WHERE row_num = 1
+            )
+            SELECT
+                ph.vin,
+                ph.history_date,
+                ph.mileage,
+                ph.price,
+                ph.trend,
+                ll.title,
+                ll.vehicleTitle,
+                ll.vehicleTitleDesc,
+                ll.title_trim,
+                ll.trim_combined,
+                ll.trim_source,
+                ll.sellerType,
+                ll.sourceName,
+                ll.listingType,
+                {', '.join(nhtsa_select_columns + sentiment_select_columns)}
+            FROM sample_history AS ph
+            LEFT JOIN latest_listing AS ll
+                ON ph.vin = ll.vin
+            LEFT JOIN nhtsa_enrichment AS n
+                ON ph.vin = n.vin
+            {sentiment_join}
+        """
         return pd.read_sql_query(query, conn)
+    finally:
+        conn.close()
 
 
 def clean_history_frame(df: pd.DataFrame, max_price: int | None) -> pd.DataFrame:
@@ -464,15 +538,33 @@ def clean_history_frame(df: pd.DataFrame, max_price: int | None) -> pd.DataFrame
         + " "
         + history["vehicleTitleDesc"].fillna("")
     )
-    history["trim_proxy"] = [
-        parse_trim_proxy(title, make, model, year)
-        for title, make, model, year in zip(
-            title_source,
-            history["make"],
-            history["model"],
-            history["model_year"],
-        )
+    parsed_trim = pd.Series(
+        [
+            parse_trim_proxy(title, make, model, year)
+            for title, make, model, year in zip(
+                title_source,
+                history["make"],
+                history["model"],
+                history["model_year"],
+            )
+        ],
+        index=history.index,
+    )
+    trim_candidates = [
+        history.get("trim_combined"),
+        history.get("nhtsa_trim_combined"),
+        history.get("nhtsa_Trim"),
+        history.get("nhtsa_Trim2"),
+        history.get("title_trim"),
+        parsed_trim,
     ]
+    history["trim_proxy"] = "UNKNOWN_TRIM"
+    for candidate in trim_candidates:
+        if candidate is None:
+            continue
+        normalized = candidate.map(lambda value: normalize_label(value, "UNKNOWN_TRIM").replace(" ", "_"))
+        usable = normalized.notna() & normalized.ne("UNKNOWN_TRIM") & normalized.ne("")
+        history.loc[history["trim_proxy"].eq("UNKNOWN_TRIM") & usable, "trim_proxy"] = normalized[usable]
 
     history["body_class"] = history["nhtsa_BodyClass"].map(normalize_label)
     history["drive_type"] = history["nhtsa_DriveType"].map(normalize_label)
@@ -501,19 +593,19 @@ def clean_history_frame(df: pd.DataFrame, max_price: int | None) -> pd.DataFrame
     history["price_down_signal"] = (
         history["trend"].fillna("").astype(str).str.lower().str.contains("down|drop|decrease")
     ).astype("int8")
-    history["week_start"] = history["history_date"].dt.to_period("W").dt.start_time
+    history["month_start"] = history["history_date"].dt.to_period("M").dt.start_time
     return history
 
 
-def build_cohort_weekly_frame(
+def build_cohort_monthly_frame(
     history: pd.DataFrame,
-    horizons: list[int],
-    min_weekly_vins: int,
-    min_cohort_weeks: int,
+    target_months: list[int],
+    min_monthly_vins: int,
+    min_cohort_months: int,
 ) -> pd.DataFrame:
-    group_cols = COHORT_COLUMNS + ["week_start"]
+    group_cols = COHORT_COLUMNS + ["month_start"]
 
-    weekly = (
+    monthly = (
         history.groupby(group_cols, dropna=False)
         .agg(
             median_price=("price", "median"),
@@ -544,69 +636,71 @@ def build_cohort_weekly_frame(
         .reset_index()
     )
 
-    weekly = weekly[weekly["unique_vins"].ge(min_weekly_vins)].copy()
-    cohort_sizes = weekly.groupby(COHORT_COLUMNS, dropna=False)["week_start"].transform("nunique")
-    weekly = weekly[cohort_sizes.ge(min_cohort_weeks)].copy()
-    if weekly.empty:
+    monthly = monthly[monthly["unique_vins"].ge(min_monthly_vins)].copy()
+    cohort_sizes = monthly.groupby(COHORT_COLUMNS, dropna=False)["month_start"].transform("nunique")
+    monthly = monthly[cohort_sizes.ge(min_cohort_months)].copy()
+    if monthly.empty:
         raise ValueError(
-            "No cohort-week rows survived support filters. Lower --min-weekly-vins "
-            "or --min-cohort-weeks, or increase --sample-size."
+            "No cohort-month rows survived support filters. Lower --min-monthly-vins "
+            "or --min-cohort-months, or increase --sample-size."
         )
 
-    weekly = weekly.sort_values(COHORT_COLUMNS + ["week_start"]).reset_index(drop=True)
+    monthly = monthly.sort_values(COHORT_COLUMNS + ["month_start"]).reset_index(drop=True)
     market = (
-        weekly.groupby("week_start", as_index=False)
+        monthly.groupby("month_start", as_index=False)
         .agg(
             market_median_price=("median_price", "median"),
-            market_weekly_volume=("volume", "sum"),
+            market_monthly_volume=("volume", "sum"),
         )
-        .sort_values("week_start")
+        .sort_values("month_start")
     )
     market["market_price_index"] = (
         market["market_median_price"] / market["market_median_price"].iloc[0]
     )
-    weekly = weekly.merge(market, on="week_start", how="left")
+    monthly = monthly.merge(market, on="month_start", how="left")
 
-    group = weekly.groupby(COHORT_COLUMNS, dropna=False, group_keys=False)
-    weekly["month"] = weekly["week_start"].dt.month.astype("int16")
-    weekly["quarter"] = weekly["week_start"].dt.quarter.astype("int16")
-    weekly["week_of_year"] = weekly["week_start"].dt.isocalendar().week.astype("int16")
-    weekly["cohort_week_number"] = group.cumcount().astype("int16")
-    first_week = group["week_start"].transform("min")
-    weekly["cohort_age_weeks"] = ((weekly["week_start"] - first_week).dt.days / 7).astype("int16")
-    weekly["cohort_first_median_price"] = group["median_price"].transform("first")
-    weekly["price_index_vs_cohort_first"] = (
-        weekly["median_price"] / weekly["cohort_first_median_price"].replace(0, np.nan)
+    group = monthly.groupby(COHORT_COLUMNS, dropna=False, group_keys=False)
+    monthly["month"] = monthly["month_start"].dt.month.astype("int16")
+    monthly["quarter"] = monthly["month_start"].dt.quarter.astype("int16")
+    monthly["cohort_month_number"] = group.cumcount().astype("int16")
+    first_month = group["month_start"].transform("min")
+    monthly["cohort_age_months"] = (
+        (monthly["month_start"].dt.year - first_month.dt.year) * 12
+        + (monthly["month_start"].dt.month - first_month.dt.month)
+    ).astype("int16")
+    monthly["cohort_first_median_price"] = group["median_price"].transform("first")
+    monthly["price_index_vs_cohort_first"] = (
+        monthly["median_price"] / monthly["cohort_first_median_price"].replace(0, np.nan)
     )
-    weekly["cumulative_depreciation_pct"] = weekly["price_index_vs_cohort_first"] - 1
+    monthly["cumulative_depreciation_pct"] = monthly["price_index_vs_cohort_first"] - 1
 
-    weekly["lag_median_price_1"] = group["median_price"].shift(1)
-    weekly["lag_median_price_2"] = group["median_price"].shift(2)
-    weekly["lag_price_index_1"] = group["price_index_vs_cohort_first"].shift(1)
-    weekly["rolling_median_price_4"] = group["median_price"].transform(
-        lambda s: s.shift(1).rolling(4, min_periods=1).median()
+    monthly["lag_median_price_1"] = group["median_price"].shift(1)
+    monthly["lag_median_price_2"] = group["median_price"].shift(2)
+    monthly["lag_price_index_1"] = group["price_index_vs_cohort_first"].shift(1)
+    monthly["rolling_median_price_3m"] = group["median_price"].transform(
+        lambda s: s.shift(1).rolling(3, min_periods=1).median()
     )
-    weekly["rolling_avg_mileage_4"] = group["avg_mileage"].transform(
-        lambda s: s.shift(1).rolling(4, min_periods=1).mean()
+    monthly["rolling_avg_mileage_3m"] = group["avg_mileage"].transform(
+        lambda s: s.shift(1).rolling(3, min_periods=1).mean()
     )
-    weekly["rolling_volume_4"] = group["volume"].transform(
-        lambda s: s.shift(1).rolling(4, min_periods=1).mean()
+    monthly["rolling_volume_3m"] = group["volume"].transform(
+        lambda s: s.shift(1).rolling(3, min_periods=1).mean()
     )
-    weekly["rolling_depreciation_pct_4"] = group["median_price"].transform(
-        lambda s: s.pct_change().shift(1).rolling(4, min_periods=1).mean()
+    monthly["rolling_depreciation_pct_3m"] = group["median_price"].transform(
+        lambda s: s.pct_change().shift(1).rolling(3, min_periods=1).mean()
     )
 
-    for horizon in horizons:
-        periods = max(1, int(np.ceil(horizon / 7)))
+    for horizon in target_months:
+        periods = max(1, int(horizon))
         future_price = group["median_price"].shift(-periods)
-        future_week = group["week_start"].shift(-periods)
-        weekly[f"target_week_{horizon}d"] = future_week
-        weekly[f"target_median_price_{horizon}d"] = future_price
-        weekly[f"target_depreciation_pct_{horizon}d"] = (
-            future_price / weekly["median_price"].replace(0, np.nan) - 1
+        future_month = group["month_start"].shift(-periods)
+        monthly[f"target_month_start_{horizon}m"] = future_month
+        monthly[f"target_median_price_{horizon}m"] = future_price
+        monthly[f"target_depreciation_pct_{horizon}m"] = (
+            future_price / monthly["median_price"].replace(0, np.nan) - 1
         )
 
-    return weekly
+    return monthly
 
 
 def build_regression_pipeline(
@@ -677,10 +771,10 @@ def build_regression_pipeline(
     return Pipeline([("preprocessor", preprocessor), ("model", regressor)]), model_name
 
 
-def choose_cutoff(weekly: pd.DataFrame, split_date: str | None) -> pd.Timestamp:
+def choose_cutoff(monthly: pd.DataFrame, split_date: str | None) -> pd.Timestamp:
     if split_date:
         return pd.Timestamp(split_date)
-    return pd.to_datetime(weekly["week_start"]).quantile(0.8)
+    return pd.to_datetime(monthly["month_start"]).quantile(0.8)
 
 
 def split_for_horizon(
@@ -691,28 +785,28 @@ def split_for_horizon(
     min_train_rows: int = MIN_TEMPORAL_TRAIN_ROWS,
     min_test_rows: int = MIN_TEMPORAL_TEST_ROWS,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.Timestamp]:
-    target_week = pd.to_datetime(model_df[f"target_week_{horizon}d"])
-    week_start = pd.to_datetime(model_df["week_start"])
+    target_month = pd.to_datetime(model_df[f"target_month_start_{horizon}m"])
+    month_start = pd.to_datetime(model_df["month_start"])
     candidate_cutoffs = [cutoff]
     if allow_auto_cutoff:
         candidate_cutoffs.extend(
-            week_start.quantile(q) for q in [0.85, 0.75, 0.65, 0.55, 0.45, 0.35, 0.25, 0.15]
+            month_start.quantile(q) for q in [0.85, 0.75, 0.65, 0.55, 0.45, 0.35, 0.25, 0.15]
         )
-        candidate_cutoffs.extend(pd.to_datetime(model_df["week_start"].drop_duplicates().sort_values()))
+        candidate_cutoffs.extend(pd.to_datetime(model_df["month_start"].drop_duplicates().sort_values()))
 
     for candidate in candidate_cutoffs:
         candidate = pd.Timestamp(candidate)
-        train = model_df[target_week < candidate].copy()
-        test = model_df[week_start >= candidate].copy()
+        train = model_df[target_month < candidate].copy()
+        test = model_df[month_start >= candidate].copy()
         if train.shape[0] >= min_train_rows and test.shape[0] >= min_test_rows:
             return train, test, candidate
 
     raise ValueError(
-        f"Horizon {horizon}d has no leakage-safe temporal validation split with at least "
+        f"Horizon {horizon}m has no leakage-safe temporal validation split with at least "
         f"{min_train_rows} training rows and {min_test_rows} test rows. "
-        f"Complete rows: {model_df.shape[0]:,}; source weeks: "
-        f"{week_start.min().date()} to {week_start.max().date()}; target weeks: "
-        f"{target_week.min().date()} to {target_week.max().date()}."
+        f"Complete rows: {model_df.shape[0]:,}; source months: "
+        f"{month_start.min().date()} to {month_start.max().date()}; target months: "
+        f"{target_month.min().date()} to {target_month.max().date()}."
     )
 
 
@@ -805,11 +899,11 @@ def tune_depreciation_hyperparameters(
         return {}, metadata
 
     positions = stratified_depreciation_tuning_sample_positions(train, max_rows=max_rows)
-    tuning_df = train.iloc[positions].sort_values("week_start").reset_index(drop=True)
+    tuning_df = train.iloc[positions].sort_values("month_start").reset_index(drop=True)
     metadata["sampled_rows"] = int(tuning_df.shape[0])
 
     try:
-        inner_cutoff = pd.to_datetime(tuning_df["week_start"]).quantile(0.8)
+        inner_cutoff = pd.to_datetime(tuning_df["month_start"]).quantile(0.8)
         inner_train, inner_valid, cutoff = split_for_horizon(
             model_df=tuning_df,
             horizon=horizon,
@@ -924,22 +1018,22 @@ def forecast_latest_cohorts(
     pred_dep = model.predict(forecast_frame[feature_columns])
     observed_price = forecast_frame["median_price"].to_numpy(dtype="float64")
     predicted_price = np.clip(observed_price * (1 + pred_dep), a_min=0, a_max=None)
-    observed_week = pd.to_datetime(forecast_frame["week_start"])
+    observed_month = pd.to_datetime(forecast_frame["month_start"])
 
     output = forecast_frame[
-        COHORT_COLUMNS + ["week_start", "median_price", "unique_vins", "volume"]
+        COHORT_COLUMNS + ["month_start", "median_price", "unique_vins", "volume"]
     ].copy()
     output = output.rename(
         columns={
-            "week_start": "observed_week_start",
+            "month_start": "observed_month_start",
             "median_price": "observed_median_price",
         }
     )
-    output["forecast_horizon_days"] = int(horizon)
-    output["forecast_date"] = observed_week + pd.to_timedelta(int(horizon), unit="D")
+    output["forecast_month"] = int(horizon)
+    output["forecast_date"] = observed_month + pd.DateOffset(months=int(horizon))
     output["predicted_depreciation_pct"] = pred_dep
     output["predicted_median_price"] = predicted_price
-    output["forecast_method"] = f"direct_{int(horizon)}d_model"
+    output["forecast_method"] = f"direct_{int(horizon)}m_model"
     return output
 
 
@@ -947,46 +1041,46 @@ def forecast_latest_cohorts_recursive(
     latest_features: pd.DataFrame,
     model: Pipeline,
     feature_columns: list[str],
-    step_horizon: int,
-    forecast_days: int,
+    step_months: int,
+    forecast_months: int,
 ) -> pd.DataFrame:
     working = latest_features.copy()
-    observed_week = pd.to_datetime(latest_features["week_start"])
-    elapsed_days = 0
+    observed_month = pd.to_datetime(latest_features["month_start"])
+    elapsed_months = 0
     frames: list[pd.DataFrame] = []
 
-    while elapsed_days < forecast_days:
-        remaining_days = min(step_horizon, forecast_days - elapsed_days)
+    while elapsed_months < forecast_months:
+        remaining_months = min(step_months, forecast_months - elapsed_months)
         pred_step_dep = model.predict(working[feature_columns])
-        if remaining_days != step_horizon:
-            pred_dep = np.power(1 + pred_step_dep, remaining_days / step_horizon) - 1
+        if remaining_months != step_months:
+            pred_dep = np.power(1 + pred_step_dep, remaining_months / step_months) - 1
         else:
             pred_dep = pred_step_dep
 
         current_price = working["median_price"].to_numpy(dtype="float64")
         predicted_price = np.clip(current_price * (1 + pred_dep), a_min=0, a_max=None)
-        elapsed_days += remaining_days
+        elapsed_months += remaining_months
 
         output = latest_features[
-            COHORT_COLUMNS + ["week_start", "median_price", "unique_vins", "volume"]
+            COHORT_COLUMNS + ["month_start", "median_price", "unique_vins", "volume"]
         ].copy()
         output = output.rename(
             columns={
-                "week_start": "observed_week_start",
+                "month_start": "observed_month_start",
                 "median_price": "observed_median_price",
             }
         )
-        output["forecast_horizon_days"] = int(elapsed_days)
-        output["forecast_date"] = observed_week + pd.to_timedelta(int(elapsed_days), unit="D")
+        output["forecast_month"] = int(elapsed_months)
+        output["forecast_date"] = observed_month + pd.DateOffset(months=int(elapsed_months))
         output["predicted_depreciation_pct"] = (
             predicted_price / output["observed_median_price"].replace(0, np.nan) - 1
         )
         output["predicted_median_price"] = predicted_price
-        output["forecast_method"] = f"recursive_{int(step_horizon)}d_model"
+        output["forecast_method"] = f"recursive_{int(step_months)}m_model"
         frames.append(output)
 
         working["median_price"] = predicted_price
-        for column in ["avg_price", "price_p25", "price_p75", "lag_median_price_1", "rolling_median_price_4"]:
+        for column in ["avg_price", "price_p25", "price_p75", "lag_median_price_1", "rolling_median_price_3m"]:
             if column in working.columns:
                 working[column] = predicted_price
         if "price_index_vs_cohort_first" in working.columns:
@@ -995,12 +1089,14 @@ def forecast_latest_cohorts_recursive(
             )
         if "cumulative_depreciation_pct" in working.columns:
             working["cumulative_depreciation_pct"] = working["price_index_vs_cohort_first"] - 1
-        working["week_start"] = observed_week + pd.to_timedelta(int(elapsed_days), unit="D")
-        working["month"] = working["week_start"].dt.month.astype("int16")
-        working["quarter"] = working["week_start"].dt.quarter.astype("int16")
-        working["week_of_year"] = working["week_start"].dt.isocalendar().week.astype("int16")
-        working["cohort_age_weeks"] = (
-            working["cohort_age_weeks"].astype("float64") + remaining_days / 7
+        working["month_start"] = observed_month + pd.DateOffset(months=int(elapsed_months))
+        working["month"] = working["month_start"].dt.month.astype("int16")
+        working["quarter"] = working["month_start"].dt.quarter.astype("int16")
+        working["cohort_age_months"] = (
+            working["cohort_age_months"].astype("float64") + remaining_months
+        ).round().astype("int16")
+        working["cohort_month_number"] = (
+            working["cohort_month_number"].astype("float64") + remaining_months
         ).round().astype("int16")
 
     return pd.concat(frames, ignore_index=True)
@@ -1010,40 +1106,43 @@ def train_cohort_models(
     db_path: Path,
     output_dir: Path,
     sample_size: int | None,
-    horizons: list[int],
+    target_months: list[int],
+    forecast_months: int,
     split_date: str | None,
-    min_weekly_vins: int,
-    min_cohort_weeks: int,
+    min_monthly_vins: int,
+    min_cohort_months: int,
     max_price: int | None,
 ) -> dict[str, Any]:
     raw = load_history_frame(db_path, sample_size)
     history = clean_history_frame(raw, max_price=max_price)
-    weekly = build_cohort_weekly_frame(
+    monthly = build_cohort_monthly_frame(
         history,
-        horizons=horizons,
-        min_weekly_vins=min_weekly_vins,
-        min_cohort_weeks=min_cohort_weeks,
+        target_months=target_months,
+        min_monthly_vins=min_monthly_vins,
+        min_cohort_months=min_cohort_months,
     )
 
     feature_columns = [
         column
         for column in CATEGORICAL_FEATURES + NUMERIC_FEATURES
-        if column in weekly.columns
+        if column in monthly.columns
     ]
-    cutoff = choose_cutoff(weekly, split_date)
+    cutoff = choose_cutoff(monthly, split_date)
     report: dict[str, Any] = {
         "task": "cohort_depreciation",
         "modeling_approach": (
-            "Global supervised time-series model across make/model/year/trim cohorts, "
-            "trained to predict future depreciation percentage."
+            "Global supervised monthly time-series model across make/model/year/trim cohorts, "
+            "trained to predict one-step monthly depreciation and recursively forecast 60 months."
         ),
         "rows_loaded": int(raw.shape[0]),
         "history_rows_after_cleaning": int(history.shape[0]),
-        "cohort_week_rows": int(weekly.shape[0]),
-        "cohorts": int(weekly[COHORT_COLUMNS].drop_duplicates().shape[0]),
+        "cohort_month_rows": int(monthly.shape[0]),
+        "cohort_week_rows": int(monthly.shape[0]),
+        "cohorts": int(monthly[COHORT_COLUMNS].drop_duplicates().shape[0]),
         "split_date": str(cutoff.date()),
-        "min_weekly_vins": int(min_weekly_vins),
-        "min_cohort_weeks": int(min_cohort_weeks),
+        "forecast_months": int(forecast_months),
+        "min_monthly_vins": int(min_monthly_vins),
+        "min_cohort_months": int(min_cohort_months),
         "minimum_model_rows": MIN_MODEL_ROWS,
         "minimum_temporal_train_rows": MIN_TEMPORAL_TRAIN_ROWS,
         "minimum_temporal_test_rows": MIN_TEMPORAL_TEST_ROWS,
@@ -1052,24 +1151,25 @@ def train_cohort_models(
     }
 
     latest_features = (
-        weekly.sort_values("week_start")
+        monthly.sort_values("month_start")
         .groupby(COHORT_COLUMNS, dropna=False)
         .tail(1)
         .sort_values(["make", "model", "model_year", "trim_proxy"])
     )
     latest_features[
-        COHORT_COLUMNS + ["week_start", "median_price", "unique_vins", "volume"]
+        COHORT_COLUMNS + ["month_start", "median_price", "unique_vins", "volume"]
     ].to_csv(output_dir / "cohort_latest_observations.csv", index=False)
-    weekly.to_csv(output_dir / "cohort_weekly_training_frame.csv", index=False)
+    monthly.to_csv(output_dir / "cohort_monthly_training_frame.csv", index=False)
+    monthly.to_csv(output_dir / "cohort_weekly_training_frame.csv", index=False)
 
     fitted_horizon_models: dict[int, Pipeline] = {}
-    for horizon in horizons:
-        target_col = f"target_depreciation_pct_{horizon}d"
-        future_price_col = f"target_median_price_{horizon}d"
-        model_df = weekly.dropna(subset=feature_columns + [target_col, future_price_col]).copy()
+    for horizon in target_months:
+        target_col = f"target_depreciation_pct_{horizon}m"
+        future_price_col = f"target_median_price_{horizon}m"
+        model_df = monthly.dropna(subset=feature_columns + [target_col, future_price_col]).copy()
         if model_df.shape[0] < MIN_MODEL_ROWS:
             report["models"][target_col] = {
-                "skipped": f"fewer than {MIN_MODEL_ROWS} complete cohort-week rows",
+                "skipped": f"fewer than {MIN_MODEL_ROWS} complete cohort-month rows",
                 "complete_rows": int(model_df.shape[0]),
             }
             continue
@@ -1120,7 +1220,7 @@ def train_cohort_models(
         )
         final_model.fit(model_df[feature_columns], model_df[target_col])
 
-        artifact_name = f"Cohort_Depreciation_{horizon}d.joblib"
+        artifact_name = f"Cohort_Depreciation_{horizon}m.joblib"
         joblib.dump(final_model, output_dir / artifact_name)
         fitted_horizon_models[int(horizon)] = final_model
         feature_importance = extract_pipeline_feature_importance(final_model)
@@ -1144,46 +1244,35 @@ def train_cohort_models(
         }
 
     future_forecast_frames: list[pd.DataFrame] = []
-    for horizon, model in fitted_horizon_models.items():
-        future_forecast_frames.append(
-            forecast_latest_cohorts(
-                latest_features=latest_features,
-                model=model,
-                feature_columns=feature_columns,
-                horizon=horizon,
-            )
-        )
-
-    max_forecast_days = max([365, *[int(horizon) for horizon in horizons]])
-    if fitted_horizon_models and max_forecast_days not in fitted_horizon_models:
+    if fitted_horizon_models:
         recursive_horizon = min(fitted_horizon_models)
         future_forecast_frames.append(
             forecast_latest_cohorts_recursive(
                 latest_features=latest_features,
                 model=fitted_horizon_models[recursive_horizon],
                 feature_columns=feature_columns,
-                step_horizon=recursive_horizon,
-                forecast_days=max_forecast_days,
+                step_months=recursive_horizon,
+                forecast_months=forecast_months,
             )
         )
 
     if future_forecast_frames:
         future_forecasts = pd.concat(future_forecast_frames, ignore_index=True)
         future_forecasts = future_forecasts.sort_values(
-            ["forecast_horizon_days", "forecast_method", "make", "model", "model_year", "trim_proxy"]
+            ["forecast_month", "forecast_method", "make", "model", "model_year", "trim_proxy"]
         )
         forecast_path = output_dir / "cohort_future_forecasts.csv"
         future_forecasts.to_csv(forecast_path, index=False)
         report["future_forecast_output"] = forecast_path.name
         report["future_forecast_rows"] = int(future_forecasts.shape[0])
-        report["last_observed_week"] = str(
-            pd.to_datetime(future_forecasts["observed_week_start"]).max().date()
+        report["last_observed_month"] = str(
+            pd.to_datetime(future_forecasts["observed_month_start"]).max().date()
         )
         report["max_forecast_date"] = str(pd.to_datetime(future_forecasts["forecast_date"]).max().date())
     else:
         report["future_forecast_output"] = None
         report["future_forecast_rows"] = 0
-        report["last_observed_week"] = str(pd.to_datetime(weekly["week_start"]).max().date())
+        report["last_observed_month"] = str(pd.to_datetime(monthly["month_start"]).max().date())
         report["max_forecast_date"] = None
 
     return report
@@ -1202,7 +1291,7 @@ def write_reports(output_dir: Path, report: dict[str, Any]) -> None:
                 "categorical_features": CATEGORICAL_FEATURES,
                 "numeric_features": NUMERIC_FEATURES,
                 "feature_columns": report["feature_columns"],
-                "target_family": "target_depreciation_pct_{horizon}d",
+                "target_family": "target_depreciation_pct_{horizon}m",
             },
             indent=2,
         ),
@@ -1216,18 +1305,20 @@ def write_reports(output_dir: Path, report: dict[str, Any]) -> None:
         f"Database: {report['database_path']}",
         f"Rows loaded: {report['rows_loaded']:,}",
         f"Clean history rows: {report['history_rows_after_cleaning']:,}",
-        f"Cohort-week rows: {report['cohort_week_rows']:,}",
+        f"Cohort-month rows: {report['cohort_month_rows']:,}",
         f"Cohorts: {report['cohorts']:,}",
         f"Split date: {report['split_date']}",
+        f"Forecast months: {report['forecast_months']}",
         f"Future forecast output: {report.get('future_forecast_output') or 'none'}",
         f"Max forecast date: {report.get('max_forecast_date') or 'none'}",
         "",
         "## Design",
         "",
         "- Cohort grain: make, model, model year, and trim proxy.",
-        "- Forecast target: future median-price depreciation percentage from the current cohort week.",
+        "- Forecast target: future median-price depreciation percentage from the current cohort month.",
+        "- Forecast output: recursive month-by-month median-price path for months 1 through 60 by default.",
         "- Model family: global gradient boosted regression across all retained cohort time series.",
-        "- Hyperparameter search: representative bounded cohort-week sample with an inner temporal holdout, followed by refit on the full training frame.",
+        "- Hyperparameter search: representative bounded cohort-month sample with an inner temporal holdout, followed by refit on the full training frame.",
         "- Baseline: no-change future price, reported beside model future-price MAE.",
         "- Safeguard: temporal validation requires at least two train and two test rows; otherwise validation is skipped and documented.",
         "",
@@ -1275,6 +1366,7 @@ def write_reports(output_dir: Path, report: dict[str, Any]) -> None:
             "",
             "- Used-car valuation is a hedonic pricing problem: vehicle attributes, mileage, age, and market conditions all affect observed price.",
             "- Global forecasting is a good fit because there are many related cohort series, many of them short or sparse.",
+            "- Sparse/new cohorts borrow signal through the global model and cohort descriptors; exact VIN-level local forecasts are intentionally avoided.",
             "- Simulation studies of global forecasting show LGBM-style models can be competitive on short, heterogeneous series.",
             "- The Manheim index methodology reinforces the need to control for mileage, mix, outliers, and seasonality in used-vehicle price indices.",
         ]
@@ -1289,22 +1381,26 @@ def run_cohort_forecast(
     db_path: Path,
     output_dir: Path,
     sample_size: int | None = DEFAULT_SAMPLE_SIZE,
-    horizons: list[int] | None = None,
+    target_months: list[int] | None = None,
+    forecast_months: int = DEFAULT_FORECAST_MONTHS,
     split_date: str | None = None,
-    min_weekly_vins: int = DEFAULT_MIN_WEEKLY_VINS,
-    min_cohort_weeks: int = DEFAULT_MIN_COHORT_WEEKS,
+    min_monthly_vins: int = DEFAULT_MIN_MONTHLY_VINS,
+    min_cohort_months: int = DEFAULT_MIN_COHORT_MONTHS,
     max_price: int | None = DEFAULT_MAX_PRICE,
+    horizons: list[int] | None = None,
 ) -> dict[str, Any]:
-    horizons = horizons or DEFAULT_HORIZONS
+    if target_months is None:
+        target_months = horizons or DEFAULT_TARGET_MONTHS
     output_dir.mkdir(parents=True, exist_ok=True)
     report = train_cohort_models(
         db_path=db_path,
         output_dir=output_dir,
         sample_size=sample_size,
-        horizons=horizons,
+        target_months=target_months,
+        forecast_months=forecast_months,
         split_date=split_date,
-        min_weekly_vins=min_weekly_vins,
-        min_cohort_weeks=min_cohort_weeks,
+        min_monthly_vins=min_monthly_vins,
+        min_cohort_months=min_cohort_months,
         max_price=max_price,
     )
     report.update(
@@ -1312,7 +1408,8 @@ def run_cohort_forecast(
             "generated_at": datetime.now().isoformat(timespec="seconds"),
             "database_path": str(db_path),
             "sample_size": int(sample_size or 0),
-            "horizons": horizons,
+            "target_months": target_months,
+            "forecast_months": int(forecast_months),
             "sample_strategy": "recent_vins_full_history" if sample_size else "full_price_history",
             "research_sources": RESEARCH_REFERENCES,
         }
@@ -1418,15 +1515,16 @@ def load_gap_frame(db_path: Path, sample_size: int | None) -> tuple[pd.DataFrame
 
 def main() -> None:
     args = parse_args()
-    horizons = [int(value.strip()) for value in args.horizons.split(",") if value.strip()]
+    target_months = [int(value.strip()) for value in args.target_months.split(",") if value.strip()]
     report = run_cohort_forecast(
         db_path=Path(args.db_path).expanduser().resolve(),
         output_dir=Path(args.output_dir).expanduser().resolve(),
         sample_size=args.sample_size,
-        horizons=horizons,
+        target_months=target_months,
+        forecast_months=args.forecast_months,
         split_date=args.split_date,
-        min_weekly_vins=args.min_weekly_vins,
-        min_cohort_weeks=args.min_cohort_weeks,
+        min_monthly_vins=args.min_monthly_vins,
+        min_cohort_months=args.min_cohort_months,
         max_price=args.max_price or None,
     )
     print(f"Saved report to {Path(args.output_dir) / 'cohort_depreciation_model_report.json'}")
@@ -1435,10 +1533,13 @@ def main() -> None:
             print(f"{target}: skipped ({model_report['skipped']})")
         else:
             metrics = model_report["metrics"]
-            print(
-                f"{target}: dep MAE {metrics['depreciation_mae_pct_points']:.2f} pct pts, "
-                f"future price MAE ${metrics['future_price_mae']:,.0f}"
-            )
+            if metrics:
+                print(
+                    f"{target}: dep MAE {metrics['depreciation_mae_pct_points']:.2f} pct pts, "
+                    f"future price MAE ${metrics['future_price_mae']:,.0f}"
+                )
+            else:
+                print(f"{target}: trained; validation metrics unavailable")
 
 
 if __name__ == "__main__":
