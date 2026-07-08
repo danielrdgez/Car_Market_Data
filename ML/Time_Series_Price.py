@@ -60,6 +60,7 @@ MIN_MODEL_ROWS = 50
 MIN_TEMPORAL_TRAIN_ROWS = 2
 MIN_TEMPORAL_TEST_ROWS = 2
 MAX_FEATURE_IMPORTANCE_ROWS = 40
+FEATURE_IMPORTANCE_REPORT_ROWS = 30
 
 COHORT_COLUMNS = ["make", "model", "model_year", "trim_proxy"]
 
@@ -197,6 +198,11 @@ NUMERIC_FEATURES = [
     "total_recalls",
     "total_complaints",
 ]
+
+PRICE_LEAKAGE_FEATURE_COLUMNS = {
+    "nhtsa_BasePrice",
+    "nhtsa_BasePrice_source",
+}
 
 RESEARCH_REFERENCES = [
     {
@@ -1125,7 +1131,7 @@ def train_cohort_models(
     feature_columns = [
         column
         for column in CATEGORICAL_FEATURES + NUMERIC_FEATURES
-        if column in monthly.columns
+        if column in monthly.columns and column not in PRICE_LEAKAGE_FEATURE_COLUMNS
     ]
     cutoff = choose_cutoff(monthly, split_date)
     report: dict[str, Any] = {
@@ -1147,6 +1153,11 @@ def train_cohort_models(
         "minimum_temporal_train_rows": MIN_TEMPORAL_TRAIN_ROWS,
         "minimum_temporal_test_rows": MIN_TEMPORAL_TEST_ROWS,
         "feature_columns": feature_columns,
+        "excluded_price_leakage_columns": sorted(PRICE_LEAKAGE_FEATURE_COLUMNS),
+        "price_feature_policy": (
+            "Current-month cohort price summaries are allowed because they are observed at "
+            "the forecast origin; future target price columns are excluded from model inputs."
+        ),
         "models": {},
     }
 
@@ -1284,6 +1295,16 @@ def write_reports(output_dir: Path, report: dict[str, Any]) -> None:
         json.dumps(report, indent=2, default=str),
         encoding="utf-8",
     )
+    importance_rows = [
+        {"target": target, "rank": rank, **row}
+        for target, model_report in report.get("models", {}).items()
+        for rank, row in enumerate(model_report.get("feature_importance", []), start=1)
+    ]
+    if importance_rows:
+        pd.DataFrame(importance_rows).to_csv(
+            output_dir / "cohort_depreciation_feature_importance.csv",
+            index=False,
+        )
     (output_dir / "cohort_model_features.json").write_text(
         json.dumps(
             {
@@ -1291,6 +1312,8 @@ def write_reports(output_dir: Path, report: dict[str, Any]) -> None:
                 "categorical_features": CATEGORICAL_FEATURES,
                 "numeric_features": NUMERIC_FEATURES,
                 "feature_columns": report["feature_columns"],
+                "excluded_price_leakage_columns": report.get("excluded_price_leakage_columns", []),
+                "price_feature_policy": report.get("price_feature_policy"),
                 "target_family": "target_depreciation_pct_{horizon}m",
             },
             indent=2,
@@ -1316,10 +1339,12 @@ def write_reports(output_dir: Path, report: dict[str, Any]) -> None:
         "",
         "- Cohort grain: make, model, model year, and trim proxy.",
         "- Forecast target: future median-price depreciation percentage from the current cohort month.",
+        "- Price features: current-month cohort price summaries are forecast-origin inputs; future target price columns are never model inputs.",
         "- Forecast output: recursive month-by-month median-price path for months 1 through 60 by default.",
         "- Model family: global gradient boosted regression across all retained cohort time series.",
         "- Hyperparameter search: representative bounded cohort-month sample with an inner temporal holdout, followed by refit on the full training frame.",
         "- Baseline: no-change future price, reported beside model future-price MAE.",
+        "- Leakage control: NHTSA base-price fields are excluded from model inputs.",
         "- Safeguard: temporal validation requires at least two train and two test rows; otherwise validation is skipped and documented.",
         "",
         "## Model Results",
@@ -1359,6 +1384,15 @@ def write_reports(output_dir: Path, report: dict[str, Any]) -> None:
         if importance:
             top_features = ", ".join(row["feature"] for row in importance[:6])
             lines.append(f"  - Top model-native importance: {top_features}")
+            lines.append("  - Top 30 model-native importance:")
+            for row in importance[:FEATURE_IMPORTANCE_REPORT_ROWS]:
+                lines.append(
+                    "    - {feature}: {importance:.4g} ({weight_type})".format(
+                        feature=row["feature"],
+                        importance=row["importance"],
+                        weight_type=row["weight_type"],
+                    )
+                )
     lines.extend(
         [
             "",

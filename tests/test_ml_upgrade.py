@@ -11,11 +11,18 @@ import pandas as pd
 from DataPipeline.DataCleaning import DataCleaningPipeline
 from ML.Price_ML_Models import (
     MAX_PARALLEL_TUNING_ROWS,
+    PRICE_LEAKAGE_FEATURE_COLUMNS as CURRENT_PRICE_LEAKAGE_FEATURE_COLUMNS,
+    build_preprocessors,
     engineer_current_price_features,
+    get_preprocessor_feature_names,
+    make_feature_matrix,
     split_train_test,
     stratified_tuning_sample_positions,
     tuning_search_n_jobs,
 )
+from ML.Time_Series_Price import CATEGORICAL_FEATURES as DEPRECIATION_CATEGORICAL_FEATURES
+from ML.Time_Series_Price import NUMERIC_FEATURES as DEPRECIATION_NUMERIC_FEATURES
+from ML.Time_Series_Price import PRICE_LEAKAGE_FEATURE_COLUMNS as DEPRECIATION_PRICE_LEAKAGE_FEATURE_COLUMNS
 from ML.Time_Series_Price import build_cohort_monthly_frame
 from ML.Time_Series_Price import clean_history_frame
 from ML.Time_Series_Price import load_gap_frame
@@ -592,6 +599,61 @@ class ModelingUpgradeTests(unittest.TestCase):
         self.assertEqual(df.loc[0, "trim_proxy"], "GT350")
         self.assertEqual(df.loc[0, "make_model_year_trim"], "FORD_MUSTANG_2020_GT350")
         self.assertEqual(df.loc[0, "title_mentions_luxury_trim"], 1)
+
+    def test_current_price_feature_matrix_excludes_nhtsa_base_price(self):
+        df = engineer_current_price_features(
+            pd.DataFrame(
+                [
+                    {
+                        "vin": "VINBASEPRICE0001",
+                        "loaddate": date(2026, 1, 5),
+                        "date": date(2026, 1, 4),
+                        "price": 42000,
+                        "mileage": 18000,
+                        "nhtsa_Make": "TOYOTA",
+                        "nhtsa_Model": "CAMRY",
+                        "nhtsa_ModelYear": 2022,
+                        "nhtsa_BodyClass": "Sedan",
+                        "nhtsa_FuelTypePrimary": "Gasoline",
+                        "nhtsa_BasePrice": 41000,
+                        "nhtsa_BasePrice_source": "price_history",
+                    }
+                ]
+            )
+        )
+
+        X, _, _ = make_feature_matrix(df)
+
+        self.assertTrue(CURRENT_PRICE_LEAKAGE_FEATURE_COLUMNS.isdisjoint(X.columns))
+
+    def test_depreciation_feature_allowlists_exclude_nhtsa_base_price(self):
+        depreciation_features = set(DEPRECIATION_CATEGORICAL_FEATURES + DEPRECIATION_NUMERIC_FEATURES)
+
+        self.assertTrue(DEPRECIATION_PRICE_LEAKAGE_FEATURE_COLUMNS.isdisjoint(depreciation_features))
+
+    def test_target_encoded_feature_names_map_to_source_columns(self):
+        X = pd.DataFrame(
+            {
+                "mileage": [10_000, 20_000, 30_000, 40_000],
+                "nhtsa_Make": ["TOYOTA", "FORD", "HONDA", "BMW"],
+                "nhtsa_Model": ["CAMRY", "F-150", "ACCORD", "X5"],
+                "trim_proxy": ["LE", "XLT", "EX", "M SPORT"],
+                "body_class": ["Sedan", "Truck", "Sedan", "SUV"],
+            }
+        )
+        y = pd.Series([25_000, 42_000, 28_000, 65_000])
+        tree_preprocessor, _, _ = build_preprocessors(X)
+        tree_preprocessor.fit(X, y)
+
+        feature_names = get_preprocessor_feature_names(
+            tree_preprocessor,
+            tree_preprocessor.transform(X).shape[1],
+        )
+
+        self.assertIn("target_encoded__nhtsa_Make", feature_names)
+        self.assertIn("target_encoded__nhtsa_Model", feature_names)
+        self.assertIn("target_encoded__trim_proxy", feature_names)
+        self.assertFalse(any(name.startswith("cat_high__") and name.split("__", 1)[1].isdigit() for name in feature_names))
 
     def test_large_cv_search_uses_single_process_to_avoid_pickling_pressure(self):
         self.assertEqual(tuning_search_n_jobs(MAX_PARALLEL_TUNING_ROWS), -1)

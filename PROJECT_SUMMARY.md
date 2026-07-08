@@ -176,7 +176,7 @@ Important design choices:
 
 ### Streamlit Dashboard
 
-`streamlit_app.py` provides an interactive UI over the cleaned database and generated model artifacts. The dashboard uses make, model, year, and trim-proxy filters, then shows latest VIN-level actuals with price, mileage, title, NHTSA base price, recall counts, complaint counts, cohort price distribution, price-mileage position, and VIN price history. The model page reads `MODELS_OUTPUT/model_report.json`, current-price `.joblib` artifacts, `cohort_depreciation_model_report.json`, and `cohort_future_forecasts.csv` to show validation metrics, filter-scoped current-price scoring, selected-VIN price predictions across trained current-price models, and future cohort median-price forecasts.
+`streamlit_app.py` provides an interactive UI over the cleaned database and generated model artifacts. The dashboard uses make, model, year, and trim-proxy filters, then shows latest VIN-level actuals with price, mileage, title, NHTSA base price, transmission, recall counts, complaint counts, cohort price distribution, price-mileage position, and VIN price history from both `price_history` and `listing_history`. The model page reads `MODELS_OUTPUT/model_report.json`, current-price `.joblib` artifacts, `cohort_depreciation_model_report.json`, and `cohort_future_forecasts.csv` to show validation metrics, filter-scoped current-price scoring, selected-VIN price predictions across trained current-price models, and future cohort median-price forecasts with historical cohort medians.
 
 ## Validation and Testing
 

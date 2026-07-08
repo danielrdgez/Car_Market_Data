@@ -83,7 +83,11 @@ DEFAULT_PLAYLIST_IDS: List[str] = ['PLdmWqCdsjCu4xf48gB1CvyGXHApkEj8ck', 'PLdmWq
                                    'PLRsapyZqDs1rWoLJB2miI4tx_Q4_nAOXe',
                                    'PLVa4b_Vn4gbBWaieOY6Z_zd37XlbHvsG6', 'PLVa4b_Vn4gbDD5IrxxVnYU7GVr_xjp9Zx',
                                    'PLVa4b_Vn4gbCcL-FHtFY9837w0Hw5mAiG',
-                                   'PLuLtF2Rwd40U_7Tiia8CFUr62nXVrfQN-']
+                                   'PLuLtF2Rwd40U_7Tiia8CFUr62nXVrfQN-', 'PLM8vs0dTZFTJ46frL-sD8u3_yT-PWNJSw',
+                                   'PL2ir4svMoaYhRAuKykEGRgsrCk__OJRz3',
+                                   'PLJLJaYBuTkgut9r9dQS8Prk1SxKs-uaFu', 'PLsSQoIGhBLpT2eTLmGYwTYGAIKBOJjHnX',
+                                   'PLsSQoIGhBLpQwAPiW1fCPh4LEWxlbp9Cx',
+                                   'PLsSQoIGhBLpSW5q7K9sKS8j9VnXc3VWVw', 'PLsSQoIGhBLpTYYZtQRbxl2NjIl-gRhXCN']
 DEFAULT_VIDEO_IDS: List[str] = []
 
 

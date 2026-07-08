@@ -58,6 +58,7 @@ RANDOM_FOREST_FULL_FIT_MAX_ROWS = 300_000
 RANDOM_FOREST_MAX_CATEGORIES_PER_FEATURE = 25
 RANDOM_FOREST_MAX_LEAF_NODES = 32_768
 MAX_MODEL_WEIGHT_ROWS = 40
+READABLE_MODEL_WEIGHT_REPORT_ROWS = 30
 
 DROP_FEATURE_COLUMNS = {
     "price",
@@ -66,6 +67,11 @@ DROP_FEATURE_COLUMNS = {
     "date",
     "loaddate",
     "Vehicle_Entity",
+}
+
+PRICE_LEAKAGE_FEATURE_COLUMNS = {
+    "nhtsa_BasePrice",
+    "nhtsa_BasePrice_source",
 }
 
 TARGET_ENCODE_TOKENS = (
@@ -285,7 +291,11 @@ def load_modeling_frame(
     try:
         profile = build_data_profile(conn, sample_size, sample_strategy)
         listings_cols = _table_columns(conn, "listings")
-        nhtsa_cols = [c for c in _table_columns(conn, "nhtsa_enrichment") if c != "vin"]
+        nhtsa_cols = [
+            c
+            for c in _table_columns(conn, "nhtsa_enrichment")
+            if c != "vin" and c not in PRICE_LEAKAGE_FEATURE_COLUMNS
+        ]
 
         listing_select = [f"l.{c}" for c in listings_cols]
         nhtsa_select = [f"n.{c}" for c in nhtsa_cols]
@@ -537,7 +547,8 @@ def split_train_test(
 
 def make_feature_matrix(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series, pd.DataFrame]:
     y = df["price"].astype("float64")
-    feature_df = df.drop(columns=[c for c in DROP_FEATURE_COLUMNS if c in df.columns], errors="ignore")
+    drop_columns = DROP_FEATURE_COLUMNS | PRICE_LEAKAGE_FEATURE_COLUMNS
+    feature_df = df.drop(columns=[c for c in drop_columns if c in df.columns], errors="ignore")
     return feature_df, y, df[["vin", "price", "price_band", "nhtsa_Make", "nhtsa_ModelYear"]].copy()
 
 
@@ -962,6 +973,10 @@ def final_fit_positions_for_model(
 
 
 def get_preprocessor_feature_names(preprocessor: Any, expected_count: int | None = None) -> list[str]:
+    readable_names = get_column_transformer_feature_names(preprocessor)
+    if readable_names and (expected_count is None or len(readable_names) == expected_count):
+        return readable_names
+
     try:
         names = list(preprocessor.get_feature_names_out())
     except Exception:
@@ -969,6 +984,45 @@ def get_preprocessor_feature_names(preprocessor: Any, expected_count: int | None
     if expected_count is not None and len(names) != expected_count:
         names = [f"feature_{idx}" for idx in range(expected_count)]
     return [str(name) for name in names]
+
+
+def get_column_transformer_feature_names(preprocessor: Any) -> list[str]:
+    """Return report-friendly feature names, including target-encoded source fields."""
+    if isinstance(preprocessor, Pipeline):
+        if "features" in preprocessor.named_steps:
+            return get_column_transformer_feature_names(preprocessor.named_steps["features"])
+        if "preprocessor" in preprocessor.named_steps:
+            return get_column_transformer_feature_names(preprocessor.named_steps["preprocessor"])
+
+    if not hasattr(preprocessor, "transformers_"):
+        return []
+
+    feature_names: list[str] = []
+    for block_name, transformer, columns in preprocessor.transformers_:
+        if block_name == "remainder" and transformer == "drop":
+            continue
+        if columns is None:
+            continue
+        if isinstance(columns, slice):
+            continue
+        if isinstance(columns, (str, bytes)):
+            source_columns = [str(columns)]
+        else:
+            source_columns = [str(column) for column in list(columns)]
+        if not source_columns:
+            continue
+
+        if block_name == "cat_high":
+            feature_names.extend([f"target_encoded__{column}" for column in source_columns])
+            continue
+
+        try:
+            names = list(transformer.get_feature_names_out(source_columns))
+        except Exception:
+            names = [f"{block_name}__{column}" for column in source_columns]
+        feature_names.extend([str(name) for name in names])
+
+    return feature_names
 
 
 def extract_model_feature_weights(model: Pipeline, top_n: int = MAX_MODEL_WEIGHT_ROWS) -> list[dict[str, Any]]:
@@ -1202,6 +1256,7 @@ def train_current_price_models(
         "model_feature_weights": model_feature_weights,
         "leakage_controls": {
             "dropped_answer_derived_columns": ["price", "price_band"],
+            "dropped_price_leakage_columns": sorted(PRICE_LEAKAGE_FEATURE_COLUMNS),
             "price_band_usage": "diagnostic segmentation only; never included in model inputs",
             "vin_overlap": split_metadata["vin_overlap"],
         },
@@ -1210,6 +1265,7 @@ def train_current_price_models(
         "notes": [
             "Training defaults to the latest listing row per VIN to avoid duplicate VIN overweighting.",
             "Price bands are created only after observing price and are kept out of the feature matrix to avoid target leakage.",
+            "NHTSA base-price fields are excluded because the cleaned base price can be filled from observed price history.",
             "Hyperparameters are tuned on a representative bounded sample, then refit on the full training split.",
             "RandomForest is sample-bounded and leaf-bounded on large full-database runs because scikit-learn stores every fitted tree node in memory.",
             "The high-value router is useful only if it improves the >$150k segment without hurting global MAE/RMSLE.",
@@ -1226,6 +1282,13 @@ def train_current_price_models(
 def write_reports(output_dir: Path, report: dict[str, Any]) -> None:
     json_path = output_dir / "model_report.json"
     json_path.write_text(json.dumps(report, indent=2, default=str), encoding="utf-8")
+    weight_rows = [
+        {"model": model_name, "rank": rank, **row}
+        for model_name, rows in report.get("model_feature_weights", {}).items()
+        for rank, row in enumerate(rows, start=1)
+    ]
+    if weight_rows:
+        pd.DataFrame(weight_rows).to_csv(output_dir / "current_price_model_feature_weights.csv", index=False)
 
     best_name = report["recommended_model"]
     best_metrics = report["models"][best_name]
@@ -1267,16 +1330,30 @@ def write_reports(output_dir: Path, report: dict[str, Any]) -> None:
     weights = report.get("model_feature_weights", {}).get(best_name, [])
     if weights:
         md.extend(["", "## Top Feature Weights For Best Model"])
-        for row in weights[:12]:
+        for row in weights[:READABLE_MODEL_WEIGHT_REPORT_ROWS]:
             md.append(
                 f"- {row['feature']}: {row['weight']:.4g} ({row['weight_type']})"
             )
+    readable_weights = {
+        name: rows
+        for name, rows in report.get("model_feature_weights", {}).items()
+        if name.startswith("Readable_") and rows
+    }
+    if readable_weights:
+        md.extend(["", "## Top 30 Readable Model Weights"])
+        for name, rows in readable_weights.items():
+            md.extend(["", f"### {name}"])
+            for row in rows[:READABLE_MODEL_WEIGHT_REPORT_ROWS]:
+                md.append(
+                    f"- {row['feature']}: {row['weight']:.4g} ({row['weight_type']})"
+                )
     md.extend(
         [
             "",
             "## Notes",
             "- The current-price benchmark now uses leakage-safe VIN handling.",
             "- Answer-derived `price_band` is excluded from model features and used only for segment diagnostics.",
+            "- `nhtsa_BasePrice` and `nhtsa_BasePrice_source` are excluded because base price can be filled from observed price history.",
             "- Hyperparameters are tuned on a representative bounded sample, then refit on the full training split.",
             "- Full-database runs are opt-in with `--sample-size 0`.",
             "",
