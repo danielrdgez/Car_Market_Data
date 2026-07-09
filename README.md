@@ -104,14 +104,14 @@ python -m unittest tests\test_ml_upgrade.py
 5. `DataPipeline/SentimentAnalysis.py` discovers playlist videos, resumes comment collection at the video level, and stores progress in `CAR_YOUTUBE_COMMENTS.db`.
 6. `DataPipeline/absa_pipeline.py` scores only new comments by `comment_id` and rebuilds vehicle-level sentiment indexes from stored scored rows.
 7. `ML/Price_ML_Models.py` trains leakage-aware current-price models and writes reports to `MODELS_OUTPUT/`.
-8. `ML/Time_Series_Price.py` trains global cohort-level monthly depreciation forecasts from historical price trajectories.
-9. `streamlit_app.py` reads `CAR_DATA_CLEANED.db` and `MODELS_OUTPUT/` artifacts to present filterable VIN actuals, NHTSA KPIs, global and filter-scoped model metrics, current-price predictions, and cohort future-price forecasts.
+8. `ML/Time_Series_Price.py` trains cohort-level monthly depreciation forecasts from historical price trajectories with global ML, SARIMAX, Prophet, and TimesFM model families when their dependencies are installed.
+9. `streamlit_app.py` reads `CAR_DATA_CLEANED.db` and `MODELS_OUTPUT/` artifacts to present filterable VIN actuals, NHTSA KPIs, global and filter-scoped model metrics, current-price predictions, cohort future-price forecasts, and time-series backtesting KPIs.
 
 ## Modeling Approach
 
-The current-price pipeline uses bounded SQLite reads by default, engineered mileage and age features, location and listing metadata, NHTSA categorical and numeric attributes, cleaned title/trim features, target encoding for high-cardinality fields, and leakage-safe train/test handling. Candidate models include readable linear baselines, Random Forest, LightGBM, and a high-value vehicle routing model.
+The current-price pipeline uses bounded SQLite reads by default, engineered mileage and age features, location and listing metadata, NHTSA categorical and numeric attributes, cleaned title/trim features, target encoding for high-cardinality fields, and leakage-safe train/test handling. Candidate models are Ridge, ElasticNet, RandomForest, and LightGBM; each candidate first trains a leakage-safe classifier to route everyday versus high-value vehicles before fitting separate segment regressors.
 
-The depreciation pipeline builds monthly cohorts by make, model, model year, and cleaned trim proxy. It trains a global one-month depreciation model across related vehicle cohorts, then recursively emits a month-by-month median-price forecast for the next 60 months by default. Sparse and newer cohorts borrow signal from related make/model/year/trim cohorts through the global model instead of fitting VIN-level local forecasts.
+The depreciation pipeline builds monthly cohorts by make, model, model year, and cleaned trim proxy. It trains a global one-month depreciation model across related vehicle cohorts, then recursively emits a month-by-month median-price forecast for the next 60 months by default. It also benchmarks local SARIMAX, Prophet, and TimesFM cohort forecasts when dependencies and sufficient cohort history are available. Forecast origins use each cohort's latest retained price-history month, and the default run does not impose a global upper-price cap so high-value cohorts keep their full observed history. Sparse and newer cohorts borrow signal from related make/model/year/trim cohorts through the global model; local model families are capped by default for bounded iteration and can be run across all eligible cohorts with `--max-local-model-cohorts 0`.
 
 ## Sentiment and NLP
 
@@ -135,7 +135,9 @@ Set `YOUTUBE_API_KEY` or `GOOGLE_API_KEY` in the environment or `.env` before ru
 - `CAR_DATA_OUTPUT/CAR_YOUTUBE_COMMENTS.db`: YouTube comment and sentiment-derived tables, including `youtube_video_fetch_state`, `youtube_playlist_fetch_state`, `youtube_comments_scored`, and `vehicle_sentiment_index`.
 - `MODELS_OUTPUT/model_report.json` and `MODELS_OUTPUT/model_report.md`: current-price model reports.
 - `MODELS_OUTPUT/cohort_depreciation_model_report.json` and `.md`: depreciation model reports.
-- `MODELS_OUTPUT/cohort_future_forecasts.csv`: monthly future cohort median-price forecasts used by the dashboard.
+- `MODELS_OUTPUT/cohort_future_forecasts.csv`: monthly future cohort median-price forecasts by model family used by the dashboard.
+- `MODELS_OUTPUT/cohort_backtesting_results.csv`: row-level cohort/model/horizon backtest predictions and actuals.
+- `MODELS_OUTPUT/cohort_backtesting_kpis.csv`: aggregate and cohort-level backtesting KPIs for depreciation forecasts.
 - `MODELS_OUTPUT/*.joblib`: trained model artifacts.
 
 ## Notes for Contributors and Agents

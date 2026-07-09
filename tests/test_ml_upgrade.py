@@ -10,24 +10,28 @@ import pandas as pd
 
 from DataPipeline.DataCleaning import DataCleaningPipeline
 from ML.Price_ML_Models import (
+    HighValueRoutedRegressor,
     MAX_PARALLEL_TUNING_ROWS,
     PRICE_LEAKAGE_FEATURE_COLUMNS as CURRENT_PRICE_LEAKAGE_FEATURE_COLUMNS,
     build_preprocessors,
     engineer_current_price_features,
     get_preprocessor_feature_names,
     make_feature_matrix,
+    model_candidates,
     split_train_test,
     stratified_tuning_sample_positions,
     tuning_search_n_jobs,
 )
 from ML.Time_Series_Price import CATEGORICAL_FEATURES as DEPRECIATION_CATEGORICAL_FEATURES
+from ML.Time_Series_Price import DEFAULT_MAX_PRICE
 from ML.Time_Series_Price import NUMERIC_FEATURES as DEPRECIATION_NUMERIC_FEATURES
 from ML.Time_Series_Price import PRICE_LEAKAGE_FEATURE_COLUMNS as DEPRECIATION_PRICE_LEAKAGE_FEATURE_COLUMNS
+from ML.Time_Series_Price import backtesting_kpi_frame
 from ML.Time_Series_Price import build_cohort_monthly_frame
 from ML.Time_Series_Price import clean_history_frame
 from ML.Time_Series_Price import load_gap_frame
-from ML.Time_Series_Price import clean_history_frame
 from ML.Time_Series_Price import load_history_frame
+from ML.Time_Series_Price import parse_model_families
 from ML.Time_Series_Price import stratified_depreciation_tuning_sample_positions
 
 
@@ -655,6 +659,26 @@ class ModelingUpgradeTests(unittest.TestCase):
         self.assertIn("target_encoded__trim_proxy", feature_names)
         self.assertFalse(any(name.startswith("cat_high__") and name.split("__", 1)[1].isdigit() for name in feature_names))
 
+    def test_current_price_candidates_are_all_high_value_routed_without_prefixes(self):
+        X = pd.DataFrame(
+            {
+                "mileage": [10_000, 20_000, 30_000, 40_000],
+                "nhtsa_Make": ["TOYOTA", "FORD", "BMW", "PORSCHE"],
+                "nhtsa_Model": ["CAMRY", "F-150", "X5", "911"],
+                "trim_proxy": ["LE", "XLT", "M SPORT", "TURBO"],
+                "body_class": ["Sedan", "Truck", "SUV", "Coupe"],
+            }
+        )
+        tree_preprocessor, linear_preprocessor, _ = build_preprocessors(X)
+
+        candidates = model_candidates(tree_preprocessor, linear_preprocessor)
+
+        self.assertEqual(set(candidates), {"Ridge", "ElasticNet", "LightGBM", "RandomForest"})
+        for name, (pipeline, param_grid) in candidates.items():
+            self.assertIsInstance(pipeline.named_steps["model"], HighValueRoutedRegressor)
+            self.assertFalse(name.startswith(("Readable_", "Tree_", "Advanced_", "Segmented_")))
+            self.assertIn("model__probability_cutoff", param_grid)
+
     def test_large_cv_search_uses_single_process_to_avoid_pickling_pressure(self):
         self.assertEqual(tuning_search_n_jobs(MAX_PARALLEL_TUNING_ROWS), -1)
         self.assertEqual(tuning_search_n_jobs(MAX_PARALLEL_TUNING_ROWS + 1), 1)
@@ -718,6 +742,63 @@ class ModelingUpgradeTests(unittest.TestCase):
         self.assertEqual(set(sampled["make"]), {"TOYOTA", "FORD", "PORSCHE"})
         self.assertEqual(set(sampled["trim_proxy"]), {"LE", "XLT", "BASE"})
 
+    def test_depreciation_model_family_parser_rejects_unknown_models(self):
+        self.assertEqual(parse_model_families("global_ml,sarimax,prophet,timesfm"), [
+            "global_ml",
+            "sarimax",
+            "prophet",
+            "timesfm",
+        ])
+        with self.assertRaises(ValueError):
+            parse_model_families("global_ml,not_a_model")
+
+    def test_backtesting_kpi_frame_reports_model_and_cohort_scopes(self):
+        rows = pd.DataFrame(
+            [
+                {
+                    "model_key": "target_depreciation_pct_1m",
+                    "model_family": "global_ml",
+                    "forecast_method": "recursive_global_ml_model",
+                    "forecast_month": 1,
+                    "make": "TOYOTA",
+                    "model": "CAMRY",
+                    "model_year": 2022,
+                    "trim_proxy": "LE",
+                    "cohort_id": "TOYOTA|CAMRY|2022|LE",
+                    "observed_median_price": 30000,
+                    "actual_median_price": 29000,
+                    "predicted_median_price": 29200,
+                    "actual_depreciation_pct": -1000 / 30000,
+                    "predicted_depreciation_pct": -800 / 30000,
+                },
+                {
+                    "model_key": "target_depreciation_pct_1m",
+                    "model_family": "global_ml",
+                    "forecast_method": "recursive_global_ml_model",
+                    "forecast_month": 1,
+                    "make": "HONDA",
+                    "model": "ACCORD",
+                    "model_year": 2021,
+                    "trim_proxy": "EX",
+                    "cohort_id": "HONDA|ACCORD|2021|EX",
+                    "observed_median_price": 28000,
+                    "actual_median_price": 27400,
+                    "predicted_median_price": 27600,
+                    "actual_depreciation_pct": -600 / 28000,
+                    "predicted_depreciation_pct": -400 / 28000,
+                },
+            ]
+        )
+
+        kpis = backtesting_kpi_frame(rows)
+        scopes = set(kpis["kpi_scope"])
+        summary = kpis[kpis["kpi_scope"].eq("model_horizon")].iloc[0]
+
+        self.assertEqual(scopes, {"model_horizon", "cohort_horizon"})
+        self.assertEqual(summary["backtest_rows"], 2)
+        self.assertEqual(summary["backtest_cohorts"], 2)
+        self.assertIn("future_price_mae_skill_vs_naive", kpis.columns)
+
     def test_depreciation_frame_uses_cleaned_trim_and_monthly_target(self):
         rows = []
         for idx, month in enumerate(pd.date_range("2025-01-10", periods=4, freq="MS")):
@@ -768,6 +849,59 @@ class ModelingUpgradeTests(unittest.TestCase):
         self.assertIn("target_depreciation_pct_1m", monthly.columns)
         self.assertNotIn("target_depreciation_pct_30d", monthly.columns)
         self.assertEqual(monthly["month_start"].dt.day.unique().tolist(), [1])
+
+    def test_depreciation_default_preserves_high_value_future_origin_months(self):
+        rows = []
+        prices = [235000, 265000, 325000, 410000]
+        for idx, (month, price) in enumerate(zip(pd.date_range("2026-01-01", periods=4, freq="MS"), prices)):
+            rows.append(
+                {
+                    "vin": "VINHIGHVALUE001",
+                    "history_date": month,
+                    "mileage": 8000 + idx * 250,
+                    "price": price,
+                    "trend": "none",
+                    "title": "2020 Ferrari 458 Spider",
+                    "vehicleTitle": "Clean",
+                    "vehicleTitleDesc": "Clean title",
+                    "trim_combined": "SPIDER",
+                    "nhtsa_trim_combined": "SPIDER",
+                    "title_trim": "SPIDER",
+                    "nhtsa_Trim": "SPIDER",
+                    "nhtsa_Trim2": None,
+                    "nhtsa_Make": "FERRARI",
+                    "nhtsa_Model": "458",
+                    "nhtsa_ModelYear": 2020,
+                    "nhtsa_BodyClass": "Convertible/Cabriolet",
+                    "nhtsa_DriveType": "RWD",
+                    "nhtsa_FuelTypePrimary": "Gasoline",
+                    "nhtsa_ElectrificationLevel": None,
+                    "sellerType": "Dealer",
+                    "sourceName": "autotempest",
+                    "nhtsa_EngineHP": 570,
+                    "nhtsa_EngineCylinders": 8,
+                    "nhtsa_total_recalls": 0,
+                    "nhtsa_total_complaints": 0,
+                    "sentiment_score": None,
+                    "sentiment_comment_count": 0,
+                    "sentiment_video_count": 0,
+                }
+            )
+
+        default_history = clean_history_frame(pd.DataFrame(rows), max_price=DEFAULT_MAX_PRICE)
+        default_monthly = build_cohort_monthly_frame(
+            default_history,
+            target_months=[1],
+            min_monthly_vins=1,
+            min_cohort_months=3,
+        )
+
+        capped_history = clean_history_frame(pd.DataFrame(rows), max_price=250000)
+
+        self.assertEqual(DEFAULT_MAX_PRICE, 0)
+        self.assertEqual(default_monthly["month_start"].max(), pd.Timestamp("2026-04-01"))
+        self.assertEqual(default_monthly.shape[0], 4)
+        self.assertEqual(capped_history["history_date"].max(), pd.Timestamp("2026-01-01"))
 
 
 if __name__ == "__main__":

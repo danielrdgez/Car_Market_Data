@@ -639,20 +639,49 @@ class HighValueRoutedRegressor(BaseEstimator, RegressorMixin):
 
     def __init__(
         self,
+        regressor: BaseEstimator | None = None,
         threshold: int = HIGH_VALUE_THRESHOLD,
         probability_cutoff: float = 0.35,
         min_high_value_rows: int = 50,
         random_state: int = RANDOM_STATE,
     ):
+        self.regressor = regressor
         self.threshold = threshold
         self.probability_cutoff = probability_cutoff
         self.min_high_value_rows = min_high_value_rows
         self.random_state = random_state
 
-    def fit(self, X: pd.DataFrame, y: pd.Series) -> "HighValueRoutedRegressor":
+    def _default_regressor(self) -> TransformedTargetRegressor:
+        return TransformedTargetRegressor(
+            regressor=LGBMRegressor(
+                objective="regression",
+                n_estimators=700,
+                learning_rate=0.05,
+                num_leaves=63,
+                min_child_samples=50,
+                subsample=0.85,
+                colsample_bytree=0.85,
+                reg_lambda=1.0,
+                random_state=self.random_state,
+                n_jobs=-1,
+                verbose=-1,
+            ),
+            func=np.log1p,
+            inverse_func=np.expm1,
+        )
+
+    @staticmethod
+    def _row_subset(X: Any, mask: np.ndarray) -> Any:
+        if hasattr(X, "iloc"):
+            return X.iloc[mask]
+        return X[mask]
+
+    def fit(self, X: Any, y: pd.Series) -> "HighValueRoutedRegressor":
         y_array = np.asarray(y, dtype="float64")
         high_mask = y_array > self.threshold
         high_count = int(high_mask.sum())
+        low_count = int((~high_mask).sum())
+        base_regressor = self.regressor if self.regressor is not None else self._default_regressor()
 
         self.classifier_ = LGBMClassifier(
             objective="binary",
@@ -665,41 +694,35 @@ class HighValueRoutedRegressor(BaseEstimator, RegressorMixin):
             n_jobs=-1,
             verbose=-1,
         )
-        self.low_regressor_ = LGBMRegressor(
-            objective="regression",
-            n_estimators=700,
-            learning_rate=0.05,
-            num_leaves=63,
-            min_child_samples=50,
-            subsample=0.85,
-            colsample_bytree=0.85,
-            reg_lambda=1.0,
-            random_state=self.random_state,
-            n_jobs=-1,
-            verbose=-1,
-        )
+        self.low_regressor_ = clone(base_regressor)
         self.high_regressor_ = clone(self.low_regressor_)
         self.global_regressor_ = clone(self.low_regressor_)
 
-        self.global_regressor_.fit(X, np.log1p(y_array))
-        self.low_regressor_.fit(X[~high_mask], np.log1p(y_array[~high_mask]))
-        self.has_high_value_expert_ = high_count >= self.min_high_value_rows
+        self.global_regressor_.fit(X, y_array)
+        self.has_low_value_expert_ = low_count > 0
+        self.has_high_value_expert_ = (
+            high_count >= self.min_high_value_rows
+            and low_count > 0
+        )
+
+        if self.has_low_value_expert_:
+            self.low_regressor_.fit(self._row_subset(X, ~high_mask), y_array[~high_mask])
 
         if self.has_high_value_expert_:
             self.classifier_.fit(X, high_mask.astype("int8"))
-            self.high_regressor_.fit(X[high_mask], np.log1p(y_array[high_mask]))
+            self.high_regressor_.fit(self._row_subset(X, high_mask), y_array[high_mask])
 
         return self
 
-    def predict(self, X: pd.DataFrame) -> np.ndarray:
-        global_preds = np.expm1(self.global_regressor_.predict(X))
-        low_preds = np.expm1(self.low_regressor_.predict(X))
+    def predict(self, X: Any) -> np.ndarray:
+        global_preds = self.global_regressor_.predict(X)
 
-        if not self.has_high_value_expert_:
+        if not self.has_low_value_expert_ or not self.has_high_value_expert_:
             return np.clip(global_preds, a_min=0, a_max=None)
 
+        low_preds = self.low_regressor_.predict(X)
         high_probability = self.classifier_.predict_proba(X)[:, 1]
-        high_preds = np.expm1(self.high_regressor_.predict(X))
+        high_preds = self.high_regressor_.predict(X)
         routed_preds = np.where(
             high_probability >= self.probability_cutoff,
             high_preds,
@@ -712,118 +735,94 @@ class HighValueRoutedRegressor(BaseEstimator, RegressorMixin):
 
 
 def model_candidates(tree_preprocessor: ColumnTransformer, linear_preprocessor: Pipeline) -> dict[str, tuple[Pipeline, dict[str, list[Any]]]]:
-    ridge = Pipeline(
-        [
-            ("preprocessor", clone(linear_preprocessor)),
-            (
-                "model",
-                TransformedTargetRegressor(
-                    regressor=Ridge(random_state=RANDOM_STATE),
-                    func=np.log1p,
-                    inverse_func=np.expm1,
-                ),
-            ),
-        ]
+    def routed_pipeline(preprocessor: Any, regressor: BaseEstimator) -> Pipeline:
+        return Pipeline(
+            [
+                ("preprocessor", clone(preprocessor)),
+                ("model", HighValueRoutedRegressor(regressor=regressor)),
+            ]
+        )
+
+    router_params = {
+        "model__probability_cutoff": [0.25, 0.35, 0.5],
+        "model__min_high_value_rows": [25, 50, 100],
+    }
+    ridge = TransformedTargetRegressor(
+        regressor=Ridge(random_state=RANDOM_STATE),
+        func=np.log1p,
+        inverse_func=np.expm1,
     )
-    elastic = Pipeline(
-        [
-            ("preprocessor", clone(linear_preprocessor)),
-            (
-                "model",
-                TransformedTargetRegressor(
-                    regressor=ElasticNet(max_iter=5_000, random_state=RANDOM_STATE),
-                    func=np.log1p,
-                    inverse_func=np.expm1,
-                ),
-            ),
-        ]
+    elastic = TransformedTargetRegressor(
+        regressor=ElasticNet(max_iter=5_000, random_state=RANDOM_STATE),
+        func=np.log1p,
+        inverse_func=np.expm1,
     )
-    lightgbm = Pipeline(
-        [
-            ("preprocessor", clone(tree_preprocessor)),
-            (
-                "model",
-                TransformedTargetRegressor(
-                    regressor=LGBMRegressor(
-                        objective="regression",
-                        n_estimators=700,
-                        learning_rate=0.05,
-                        num_leaves=63,
-                        min_child_samples=50,
-                        subsample=0.85,
-                        colsample_bytree=0.85,
-                        reg_lambda=1.0,
-                        random_state=RANDOM_STATE,
-                        n_jobs=-1,
-                        verbose=-1,
-                    ),
-                    func=np.log1p,
-                    inverse_func=np.expm1,
-                ),
-            ),
-        ]
+    lightgbm = TransformedTargetRegressor(
+        regressor=LGBMRegressor(
+            objective="regression",
+            n_estimators=700,
+            learning_rate=0.05,
+            num_leaves=63,
+            min_child_samples=50,
+            subsample=0.85,
+            colsample_bytree=0.85,
+            reg_lambda=1.0,
+            random_state=RANDOM_STATE,
+            n_jobs=-1,
+            verbose=-1,
+        ),
+        func=np.log1p,
+        inverse_func=np.expm1,
     )
-    random_forest = Pipeline(
-        [
-            ("preprocessor", clone(tree_preprocessor)),
-            (
-                "model",
-                TransformedTargetRegressor(
-                    regressor=RandomForestRegressor(
-                        n_estimators=250,
-                        min_samples_leaf=5,
-                        max_depth=24,
-                        max_leaf_nodes=RANDOM_FOREST_MAX_LEAF_NODES,
-                        max_samples=0.5,
-                        max_features="sqrt",
-                        n_jobs=2,
-                        random_state=RANDOM_STATE,
-                    ),
-                    func=np.log1p,
-                    inverse_func=np.expm1,
-                ),
-            ),
-        ]
-    )
-    high_value_router = Pipeline(
-        [
-            ("preprocessor", clone(tree_preprocessor)),
-            ("model", HighValueRoutedRegressor()),
-        ]
+    random_forest = TransformedTargetRegressor(
+        regressor=RandomForestRegressor(
+            n_estimators=250,
+            min_samples_leaf=5,
+            max_depth=24,
+            max_leaf_nodes=RANDOM_FOREST_MAX_LEAF_NODES,
+            max_samples=0.5,
+            max_features="sqrt",
+            n_jobs=2,
+            random_state=RANDOM_STATE,
+        ),
+        func=np.log1p,
+        inverse_func=np.expm1,
     )
 
     return {
-        "Readable_Ridge": (ridge, {"model__regressor__alpha": [0.3, 1.0, 3.0, 10.0, 30.0]}),
-        "Readable_ElasticNet": (
-            elastic,
+        "Ridge": (
+            routed_pipeline(linear_preprocessor, ridge),
             {
-                "model__regressor__alpha": [0.0005, 0.001, 0.005, 0.01],
-                "model__regressor__l1_ratio": [0.1, 0.3, 0.5, 0.7],
+                **router_params,
+                "model__regressor__regressor__alpha": [0.3, 1.0, 3.0, 10.0, 30.0],
             },
         ),
-        "Advanced_LightGBM": (
-            lightgbm,
+        "ElasticNet": (
+            routed_pipeline(linear_preprocessor, elastic),
             {
-                "model__regressor__num_leaves": [31, 63, 127],
-                "model__regressor__learning_rate": [0.03, 0.05, 0.08],
-                "model__regressor__min_child_samples": [25, 50, 100],
-                "model__regressor__reg_lambda": [0.5, 1.0, 2.0],
+                **router_params,
+                "model__regressor__regressor__alpha": [0.0005, 0.001, 0.005, 0.01],
+                "model__regressor__regressor__l1_ratio": [0.1, 0.3, 0.5, 0.7],
             },
         ),
-        "Tree_RandomForest": (
-            random_forest,
+        "LightGBM": (
+            routed_pipeline(tree_preprocessor, lightgbm),
             {
-                "model__regressor__n_estimators": [150, 250],
-                "model__regressor__min_samples_leaf": [10, 25, 50],
-                "model__regressor__max_leaf_nodes": [16_384, RANDOM_FOREST_MAX_LEAF_NODES],
-                "model__regressor__max_features": ["sqrt", 0.5],
+                **router_params,
+                "model__regressor__regressor__num_leaves": [31, 63, 127],
+                "model__regressor__regressor__learning_rate": [0.03, 0.05, 0.08],
+                "model__regressor__regressor__min_child_samples": [25, 50, 100],
+                "model__regressor__regressor__reg_lambda": [0.5, 1.0, 2.0],
             },
         ),
-        "Segmented_HighValue_LightGBM": (
-            high_value_router,
+        "RandomForest": (
+            routed_pipeline(tree_preprocessor, random_forest),
             {
-                "model__probability_cutoff": [0.25, 0.35, 0.5],
-                "model__min_high_value_rows": [25, 50, 100],
+                **router_params,
+                "model__regressor__regressor__n_estimators": [150, 250],
+                "model__regressor__regressor__min_samples_leaf": [10, 25, 50],
+                "model__regressor__regressor__max_leaf_nodes": [16_384, RANDOM_FOREST_MAX_LEAF_NODES],
+                "model__regressor__regressor__max_features": ["sqrt", 0.5],
             },
         ),
     }
@@ -967,7 +966,7 @@ def final_fit_positions_for_model(
     train_segments: pd.DataFrame,
     row_count: int,
 ) -> np.ndarray:
-    if name != "Tree_RandomForest" or row_count <= RANDOM_FOREST_FULL_FIT_MAX_ROWS:
+    if name != "RandomForest" or row_count <= RANDOM_FOREST_FULL_FIT_MAX_ROWS:
         return np.arange(row_count)
     return stratified_tuning_sample_positions(train_segments, RANDOM_FOREST_FULL_FIT_MAX_ROWS)
 
@@ -1025,6 +1024,17 @@ def get_column_transformer_feature_names(preprocessor: Any) -> list[str]:
     return feature_names
 
 
+def fitted_regressor_weights(estimator: Any) -> tuple[np.ndarray | None, str]:
+    """Return weights from a fitted regressor, unwrapping target transformers."""
+    if hasattr(estimator, "regressor_"):
+        estimator = estimator.regressor_
+    if hasattr(estimator, "coef_"):
+        return np.ravel(estimator.coef_).astype("float64"), "coefficient"
+    if hasattr(estimator, "feature_importances_"):
+        return np.ravel(estimator.feature_importances_).astype("float64"), "feature_importance"
+    return None, "feature_importance"
+
+
 def extract_model_feature_weights(model: Pipeline, top_n: int = MAX_MODEL_WEIGHT_ROWS) -> list[dict[str, Any]]:
     """Return coefficient or feature-importance rows for fitted sklearn pipelines."""
     if "preprocessor" not in model.named_steps or "model" not in model.named_steps:
@@ -1032,17 +1042,13 @@ def extract_model_feature_weights(model: Pipeline, top_n: int = MAX_MODEL_WEIGHT
 
     model_step = model.named_steps["model"]
     estimator = getattr(model_step, "regressor_", model_step)
-    weight_type = "feature_importance"
+    weights, weight_type = fitted_regressor_weights(estimator)
 
-    if hasattr(estimator, "coef_"):
-        weights = np.ravel(estimator.coef_).astype("float64")
-        weight_type = "coefficient"
-    elif hasattr(estimator, "feature_importances_"):
-        weights = np.ravel(estimator.feature_importances_).astype("float64")
-    elif hasattr(estimator, "global_regressor_") and hasattr(estimator.global_regressor_, "feature_importances_"):
-        weights = np.ravel(estimator.global_regressor_.feature_importances_).astype("float64")
-        weight_type = "global_feature_importance"
-    else:
+    if weights is None and hasattr(estimator, "global_regressor_"):
+        weights, nested_weight_type = fitted_regressor_weights(estimator.global_regressor_)
+        weight_type = f"global_{nested_weight_type}"
+
+    if weights is None:
         return []
 
     feature_names = get_preprocessor_feature_names(model.named_steps["preprocessor"], len(weights))
@@ -1257,7 +1263,12 @@ def train_current_price_models(
         "leakage_controls": {
             "dropped_answer_derived_columns": ["price", "price_band"],
             "dropped_price_leakage_columns": sorted(PRICE_LEAKAGE_FEATURE_COLUMNS),
-            "price_band_usage": "diagnostic segmentation only; never included in model inputs",
+            "price_band_usage": "diagnostic segmentation and high-value classifier labels only; never included in model inputs",
+            "high_value_routing": (
+                "Every candidate model first trains a leakage-safe classifier on training labels "
+                f"for price > ${HIGH_VALUE_THRESHOLD:,}, then routes predictions to separately "
+                "fit everyday or high-value regressors."
+            ),
             "vin_overlap": split_metadata["vin_overlap"],
         },
         "models": metrics,
@@ -1268,7 +1279,7 @@ def train_current_price_models(
             "NHTSA base-price fields are excluded because the cleaned base price can be filled from observed price history.",
             "Hyperparameters are tuned on a representative bounded sample, then refit on the full training split.",
             "RandomForest is sample-bounded and leaf-bounded on large full-database runs because scikit-learn stores every fitted tree node in memory.",
-            "The high-value router is useful only if it improves the >$150k segment without hurting global MAE/RMSLE.",
+            "All current-price candidates use the same high-value classifier router before model-specific regressors.",
             "CatBoost remains a strong future candidate for categorical-heavy modeling but is not required for this dependency set.",
         ],
         "research_sources": RESEARCH_REFERENCES,
@@ -1337,10 +1348,10 @@ def write_reports(output_dir: Path, report: dict[str, Any]) -> None:
     readable_weights = {
         name: rows
         for name, rows in report.get("model_feature_weights", {}).items()
-        if name.startswith("Readable_") and rows
+        if name in {"Ridge", "ElasticNet"} and rows
     }
     if readable_weights:
-        md.extend(["", "## Top 30 Readable Model Weights"])
+        md.extend(["", "## Top 30 Linear Model Weights"])
         for name, rows in readable_weights.items():
             md.extend(["", f"### {name}"])
             for row in rows[:READABLE_MODEL_WEIGHT_REPORT_ROWS]:
@@ -1352,7 +1363,8 @@ def write_reports(output_dir: Path, report: dict[str, Any]) -> None:
             "",
             "## Notes",
             "- The current-price benchmark now uses leakage-safe VIN handling.",
-            "- Answer-derived `price_band` is excluded from model features and used only for segment diagnostics.",
+            "- Answer-derived `price_band` is excluded from model features and used only for diagnostics and high-value router labels during training.",
+            "- Every candidate model uses a leakage-safe classifier router before separately fit everyday/high-value regressors.",
             "- `nhtsa_BasePrice` and `nhtsa_BasePrice_source` are excluded because base price can be filled from observed price history.",
             "- Hyperparameters are tuned on a representative bounded sample, then refit on the full training split.",
             "- Full-database runs are opt-in with `--sample-size 0`.",

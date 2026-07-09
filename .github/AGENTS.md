@@ -52,6 +52,7 @@ run_pipeline_scheduler.bat --dry-run
 - Preserve `nhtsa_BasePrice` provenance; missing cleaned base prices can be filled from earliest cleaned price history, then earliest cleaned listing history.
 - Keep depreciation forecasts cohort-level and monthly out to five years by default, not VIN-level or fixed 30/60/90-day buckets.
 - Preserve direct script execution with `if __name__ == "__main__": main()`.
+- For depreciation model changes, preserve the monthly cohort forecast and backtesting output contracts: `cohort_future_forecasts.csv`, `cohort_backtesting_results.csv`, and `cohort_backtesting_kpis.csv`.
 - Keep code and markdown professional, concise, and emoji-free.
 
 ## Research and Modeling Standards

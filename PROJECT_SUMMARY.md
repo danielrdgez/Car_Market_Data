@@ -157,8 +157,8 @@ Important design choices:
 - Latest-row-per-VIN deduplication by default.
 - Time cutoff validation when possible, with VIN overlap removed from train rows.
 - Group shuffle fallback by VIN.
-- Target-derived `price_band` is used only for diagnostics and excluded from model inputs.
-- Candidate models include Ridge, ElasticNet, LightGBM, Random Forest, and a segmented high-value LightGBM router.
+- Target-derived `price_band` is excluded from model inputs; it is used for diagnostics and for training the high-value classifier labels inside the training split.
+- Candidate models include Ridge, ElasticNet, LightGBM, and RandomForest, and every candidate uses the same leakage-safe everyday/high-value classifier router before fitting segment-specific regressors.
 - Outputs include JSON and Markdown reports plus `.joblib` model artifacts.
 
 `ML/Time_Series_Price.py` trains cohort-level depreciation forecasts.
@@ -169,6 +169,9 @@ Important design choices:
 - Monthly cohort frames are built from price history.
 - Features include market index, cohort lags, rolling prices, mileage, volume, NHTSA attributes, recall/complaint counts, and optional sentiment signals.
 - Models forecast one-month depreciation percentages and recursively emit a monthly median-price path up to five years ahead by default.
+- The time-series benchmark now includes global ML, SARIMAX, Prophet, and TimesFM model families when optional dependencies are installed and cohorts have enough monthly support.
+- Backtesting outputs are written as row-level cohort/model/horizon results plus KPI tables with future-price MAE, WAPE, bias, depreciation error, R2, and skill against a no-change baseline.
+- Forecast origins use each cohort's latest retained price-history month; normal runs keep high-value histories because `--max-price` defaults to disabled and is only an opt-in sensitivity cap.
 - The script uses global models across cohorts to share signal across sparse vehicle segments.
 - Target-specific hyperparameters are tuned on a representative bounded cohort-month sample with an inner temporal holdout, then refit on the full training frame.
 
@@ -176,7 +179,7 @@ Important design choices:
 
 ### Streamlit Dashboard
 
-`streamlit_app.py` provides an interactive UI over the cleaned database and generated model artifacts. The dashboard uses make, model, year, and trim-proxy filters, then shows latest VIN-level actuals with price, mileage, title, NHTSA base price, transmission, recall counts, complaint counts, cohort price distribution, price-mileage position, and VIN price history from both `price_history` and `listing_history`. The model page reads `MODELS_OUTPUT/model_report.json`, current-price `.joblib` artifacts, `cohort_depreciation_model_report.json`, and `cohort_future_forecasts.csv` to show validation metrics, filter-scoped current-price scoring, selected-VIN price predictions across trained current-price models, and future cohort median-price forecasts with historical cohort medians.
+`streamlit_app.py` provides an interactive UI over the cleaned database and generated model artifacts. The dashboard uses make, model, year, and trim-proxy filters, then shows latest VIN-level actuals with price, mileage, title, NHTSA base price, transmission, recall counts, complaint counts, cohort price distribution, price-mileage position, and VIN price history from both `price_history` and `listing_history`. The model page reads `MODELS_OUTPUT/model_report.json`, current-price `.joblib` artifacts, `cohort_depreciation_model_report.json`, `cohort_future_forecasts.csv`, `cohort_backtesting_results.csv`, and `cohort_backtesting_kpis.csv` to show validation metrics, filter-scoped current-price scoring, selected-VIN price predictions across trained current-price models, future cohort median-price forecasts by model family, and backtesting KPIs for time-series model comparison.
 
 ## Validation and Testing
 
