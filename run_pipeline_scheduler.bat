@@ -10,7 +10,10 @@ pushd "%SCRIPT_DIR%" >nul || (
 
 :: Find Python executable
 set "PY_CMD="
-where py >nul 2>&1 && set "PY_CMD=py -3"
+if exist "%SCRIPT_DIR%.venv\Scripts\python.exe" set "PY_CMD=%SCRIPT_DIR%.venv\Scripts\python.exe"
+if not defined PY_CMD (
+    where py >nul 2>&1 && set "PY_CMD=py -3"
+)
 if not defined PY_CMD (
     where python >nul 2>&1 && set "PY_CMD=python"
 )
@@ -19,6 +22,16 @@ if not defined PY_CMD (
     echo [ERROR] Python was not found. Install Python or add it to PATH.
     popd >nul
     exit /b 9009
+)
+
+%PY_CMD% -c "import playwright" >nul 2>&1
+if errorlevel 1 (
+    echo [ERROR] The selected Python interpreter does not have 'playwright' installed.
+    echo [ERROR] Active interpreter: %PY_CMD%
+    echo [ERROR] Recommended fix: .venv\Scripts\python.exe -m pip install -r requirements.txt
+    echo [ERROR] If you are using a fresh environment, also run: .venv\Scripts\python.exe -m playwright install
+    popd >nul
+    exit /b 1
 )
 
 set "DRY_RUN=0"

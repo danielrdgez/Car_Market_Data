@@ -69,6 +69,8 @@ run_pipeline_scheduler.bat --dry-run
 - Update `README.md`, `PROJECT_SUMMARY.md`, root `AGENTS.md`, and relevant `.github` instructions when workflows, schemas, or modeling practices change.
 - Do not create extra markdown files unless requested.
 - When adding new packages, update `requirements.txt` in the same change.
+- Prefer the repo-local `.venv` when launching pipeline or scraper commands; `py -3` may resolve to a different interpreter on Windows.
+- Playwright setup has two parts: the Python package from `requirements.txt` and the browser binaries from `python -m playwright install`.
 
 ## Gotchas
 

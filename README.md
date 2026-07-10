@@ -54,9 +54,12 @@ Car-Price-Data-Visualization-Learning/
 Create or activate a Python environment, then install dependencies:
 
 ```powershell
-pip install -r requirements.txt
+.\\.venv\\Scripts\\python.exe -m pip install -r requirements.txt
+python -m playwright install
 python Utilities\health_check.py
 ```
+
+The Windows scheduler script prefers the repo-local `.venv` when it exists, so keeping that environment populated is the safest way to run the pipeline end to end.
 
 Run the core data pipeline:
 

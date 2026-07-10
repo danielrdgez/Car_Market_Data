@@ -1,3 +1,5 @@
+# Install Playwright browser binaries separately after `pip install -r requirements.txt`:
+#   python -m playwright install
 ipykernel>=6.0.0
 numpy>=2.1.0
 nbformat>=4.2.0
