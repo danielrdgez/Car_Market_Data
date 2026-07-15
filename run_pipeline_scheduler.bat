@@ -38,13 +38,13 @@ set "DRY_RUN=0"
 if /I "%~1"=="--dry-run" set "DRY_RUN=1"
 
 echo ================================================================
-echo Starting pipeline: Playwright_test -^> NHTSA_enrichment -^> DataCleaning
+echo Starting pipeline: Playwright_test -^> NHTSA_enrichment -^> VehicleNormalization -^> DataCleaning
 echo Working directory: %CD%
 echo Python command   : %PY_CMD%
 echo ================================================================
 
 :: --- STEP 1: PLAYWRIGHT SCRAPING ---
-echo [1/3] Running Playwright_test...
+echo [1/4] Running Playwright_test...
 if "%DRY_RUN%"=="1" (
     echo [DRY RUN] %PY_CMD% "DataPipeline\Playwright_test.py"
 ) else (
@@ -58,7 +58,7 @@ if "%DRY_RUN%"=="1" (
 )
 
 :: --- STEP 2: NHTSA ENRICHMENT ---
-echo [2/3] Running NHTSA_enrichment...
+echo [2/4] Running NHTSA_enrichment...
 if "%DRY_RUN%"=="1" (
     echo [DRY RUN] %PY_CMD% "DataPipeline\NHTSA_enrichment.py"
 ) else (
@@ -71,12 +71,28 @@ if "%DRY_RUN%"=="1" (
     )
 )
 
-:: --- STEP 3: DATA CLEANING ---
-echo [3/3] Running DataCleaning...
+:: --- STEP 3: EPA VEHICLE REFERENCE REFRESH ---
+:: Refresh and validate the shared cache before cleaning imports it into SQLite.
+echo [3/4] Running VehicleNormalization EPA refresh...
 if "%DRY_RUN%"=="1" (
-    echo [DRY RUN] %PY_CMD% "DataPipeline\DataCleaning.py"
+    echo [DRY RUN] %PY_CMD% "DataPipeline\VehicleNormalization.py"
 ) else (
-    %PY_CMD% "DataPipeline\DataCleaning.py"
+    %PY_CMD% "DataPipeline\VehicleNormalization.py"
+    if errorlevel 1 (
+        set "ERR=%errorlevel%"
+        echo [ERROR] VehicleNormalization failed with exit code %ERR%.
+        popd >nul
+        exit /b %ERR%
+    )
+)
+
+:: --- STEP 4: DATA CLEANING ---
+:: EPA was refreshed above, so use the validated cache and import it into CAR_DATA_CLEANED.db.
+echo [4/4] Running DataCleaning...
+if "%DRY_RUN%"=="1" (
+    echo [DRY RUN] %PY_CMD% "DataPipeline\DataCleaning.py" --no-epa-refresh
+) else (
+    %PY_CMD% "DataPipeline\DataCleaning.py" --no-epa-refresh
     if errorlevel 1 (
         set "ERR=%errorlevel%"
         echo [ERROR] DataCleaning failed with exit code %ERR%.

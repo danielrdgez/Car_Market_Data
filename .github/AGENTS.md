@@ -17,7 +17,8 @@ This file mirrors the root `AGENTS.md` for tools that read instructions from `.g
 - Button completion is behavioral: stop after `EXHAUSTION_STRIKE_COUNT` consecutive zero-row responses.
 - Dedup is two-layered: in-memory `VINCache` plus DB-sourced `get_seen_vins()`.
 - Acquisition writes use `CarDatabase(thread_safe=True)` with thread-local SQLite connections and a shared write lock.
-- `DataCleaning.py` builds `CAR_DATA_OUTPUT/CAR_DATA_CLEANED.db` with normalized data, contextual price-outlier filtering, durable trim features, and modeling indexes.
+- `DataCleaning.py` builds `CAR_DATA_OUTPUT/CAR_DATA_CLEANED.db` with NHTSA-anchored make/model, title-derived canonical trim, EPA validation, VIN consensus identity, contextual price-outlier filtering, and modeling indexes.
+- `VehicleNormalization.py` refreshes/caches the official EPA catalog and owns the versioned canonical identity rules.
 - `Price_ML_Models.py` trains leakage-aware current-price models.
 - `Time_Series_Price.py` trains cohort-level depreciation forecasts.
 
@@ -48,7 +49,10 @@ run_pipeline_scheduler.bat --dry-run
 - Keep all NHTSA-derived fields prefixed with `nhtsa_`.
 - Prefer incremental persistence over large in-memory accumulation.
 - For data cleaning work, prefer Polars by default and keep Pandas where modeling/notebook code already depends on it.
-- For price outliers, prefer robust cohort-aware checks over only global cutoffs; preserve title-derived trim fields and NHTSA trim provenance for modeling.
+- For price outliers, prefer robust canonical cohort-aware checks over only global cutoffs.
+- NHTSA make/model are canonical anchors and must not be overwritten from titles. Titles must be checked for agreement and are the only source of canonical trim text.
+- EPA validates or standardizes title-derived identity. Raw NHTSA trims remain untouched diagnostic fields and must not enter the predictive trim feature.
+- Do not run model training for routine verification; if a smoke run is necessary, cap it at 5,000 rows. Document full runs with `--sample-size 0`.
 - Preserve `nhtsa_BasePrice` provenance; missing cleaned base prices can be filled from earliest cleaned price history, then earliest cleaned listing history.
 - Keep depreciation forecasts cohort-level and monthly out to five years by default, not VIN-level or fixed 30/60/90-day buckets.
 - Preserve direct script execution with `if __name__ == "__main__": main()`.

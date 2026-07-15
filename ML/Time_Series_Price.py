@@ -1,8 +1,8 @@
 """
-Train make/model/year/trim cohort depreciation forecasts from price history.
+Train canonical make/model/year/trim cohort depreciation forecasts from price history.
 
 The model grain is a monthly cohort, not an individual VIN. Cohorts are built
-from NHTSA make, model, model year, and the cleaned trim proxy when available.
+from the VIN-keyed canonical vehicle identity selected from listing titles.
 The script trains global forecasting models across all cohorts so sparse or
 newer cohorts can borrow signal from richer related cohorts.
 """
@@ -74,6 +74,7 @@ DEFAULT_MIN_MONTHLY_VINS = 1
 DEFAULT_MIN_COHORT_MONTHS = 3
 DEFAULT_MAX_PRICE = 0
 DEFAULT_TIME_SERIES_MODELS = ["global_ml", "sarimax", "prophet", "timesfm"]
+MIN_ROLLING_HISTORY_MONTHS = 6
 DEFAULT_MAX_LOCAL_MODEL_COHORTS = 250
 DEFAULT_TIMESFM_MODEL_ID = "google/timesfm-2.5-200m-pytorch"
 MIN_MODEL_ROWS = 50
@@ -229,6 +230,16 @@ PRICE_LEAKAGE_FEATURE_COLUMNS = {
 
 RESEARCH_REFERENCES = [
     {
+        "title": "Forecasting: Principles and Practice — Time series cross-validation",
+        "url": "https://otexts.com/fpp3/tscv.html",
+        "reason": "Supports rolling forecasting-origin evaluation with training data restricted to observations available at each origin.",
+    },
+    {
+        "title": "Out-of-sample tests of forecasting accuracy: An analysis and review",
+        "url": "https://doi.org/10.1016/S0169-2070(00)00065-0",
+        "reason": "Supports multiple rolling origins and explicit out-of-sample backtest design.",
+    },
+    {
         "title": "Principles and Algorithms for Forecasting Groups of Time Series: Locality and Globality",
         "url": "https://arxiv.org/abs/2008.00444",
         "reason": "Supports global models across related series, especially when many cohorts are short or sparse.",
@@ -349,6 +360,12 @@ def parse_args() -> argparse.Namespace:
         "--timesfm-model-id",
         default=DEFAULT_TIMESFM_MODEL_ID,
         help="Hugging Face model ID used by the TimesFM forecaster.",
+    )
+    parser.add_argument(
+        "--min-rolling-history-months",
+        type=int,
+        default=MIN_ROLLING_HISTORY_MONTHS,
+        help="Minimum canonical-cohort months before a rolling backtest origin.",
     )
     return parser.parse_args()
 
@@ -492,6 +509,7 @@ def load_history_frame(db_path: Path, sample_size: int | None) -> pd.DataFrame:
         listing_cols = _table_columns(conn, "listings")
         nhtsa_cols = _table_columns(conn, "nhtsa_enrichment")
         has_sentiment = _table_exists(conn, "vehicle_sentiment")
+        has_vehicle_identity = _table_exists(conn, "vehicle_identity")
 
         latest_listing_columns = [
             "l.vin AS vin",
@@ -501,6 +519,18 @@ def load_history_frame(db_path: Path, sample_size: int | None) -> pd.DataFrame:
             _select_or_null(listing_cols, "l", "title_trim"),
             _select_or_null(listing_cols, "l", "trim_combined"),
             _select_or_null(listing_cols, "l", "trim_source"),
+            _select_or_null(listing_cols, "l", "canonical_make"),
+            _select_or_null(listing_cols, "l", "canonical_model"),
+            _select_or_null(listing_cols, "l", "canonical_year"),
+            _select_or_null(listing_cols, "l", "canonical_trim"),
+            _select_or_null(listing_cols, "l", "canonical_trim_source"),
+            _select_or_null(listing_cols, "l", "canonical_match_confidence"),
+            _select_or_null(listing_cols, "l", "epa_vehicle_id"),
+            _select_or_null(listing_cols, "l", "normalization_version"),
+            _select_or_null(listing_cols, "l", "nhtsa_year_agrees"),
+            _select_or_null(listing_cols, "l", "nhtsa_make_agrees"),
+            _select_or_null(listing_cols, "l", "nhtsa_model_agrees"),
+            _select_or_null(listing_cols, "l", "nhtsa_trim_agrees"),
             _select_or_null(listing_cols, "l", "sellerType"),
             _select_or_null(listing_cols, "l", "sourceName"),
             _select_or_null(listing_cols, "l", "listingType"),
@@ -548,6 +578,42 @@ def load_history_frame(db_path: Path, sample_size: int | None) -> pd.DataFrame:
             if has_sentiment
             else ""
         )
+        identity_select_columns = (
+            [
+                "vi.canonical_make AS canonical_make",
+                "vi.canonical_model AS canonical_model",
+                "vi.canonical_year AS canonical_year",
+                "vi.canonical_trim AS canonical_trim",
+                "vi.canonical_trim_source AS canonical_trim_source",
+                "vi.canonical_match_confidence AS canonical_match_confidence",
+                "vi.epa_vehicle_id AS epa_vehicle_id",
+                "vi.normalization_version AS normalization_version",
+                "vi.nhtsa_year_agrees AS nhtsa_year_agrees",
+                "vi.nhtsa_make_agrees AS nhtsa_make_agrees",
+                "vi.nhtsa_model_agrees AS nhtsa_model_agrees",
+                "vi.nhtsa_trim_agrees AS nhtsa_trim_agrees",
+            ]
+            if has_vehicle_identity
+            else [
+                "ll.canonical_make AS canonical_make",
+                "ll.canonical_model AS canonical_model",
+                "ll.canonical_year AS canonical_year",
+                "ll.canonical_trim AS canonical_trim",
+                "ll.canonical_trim_source AS canonical_trim_source",
+                "ll.canonical_match_confidence AS canonical_match_confidence",
+                "ll.epa_vehicle_id AS epa_vehicle_id",
+                "ll.normalization_version AS normalization_version",
+                "ll.nhtsa_year_agrees AS nhtsa_year_agrees",
+                "ll.nhtsa_make_agrees AS nhtsa_make_agrees",
+                "ll.nhtsa_model_agrees AS nhtsa_model_agrees",
+                "ll.nhtsa_trim_agrees AS nhtsa_trim_agrees",
+            ]
+        )
+        identity_join = (
+            "LEFT JOIN vehicle_identity AS vi ON ph.vin = vi.vin"
+            if has_vehicle_identity
+            else ""
+        )
 
         query = f"""
             WITH RECURSIVE
@@ -586,12 +652,14 @@ def load_history_frame(db_path: Path, sample_size: int | None) -> pd.DataFrame:
                 ll.sellerType,
                 ll.sourceName,
                 ll.listingType,
+                {', '.join(identity_select_columns)},
                 {', '.join(nhtsa_select_columns + sentiment_select_columns)}
             FROM sample_history AS ph
             LEFT JOIN latest_listing AS ll
                 ON ph.vin = ll.vin
             LEFT JOIN nhtsa_enrichment AS n
                 ON ph.vin = n.vin
+            {identity_join}
             {sentiment_join}
         """
         return pd.read_sql_query(query, conn)
@@ -607,7 +675,11 @@ def clean_history_frame(df: pd.DataFrame, max_price: int | None) -> pd.DataFrame
     history["history_date"] = pd.to_datetime(history["history_date"], errors="coerce")
     history["price"] = pd.to_numeric(history["price"], errors="coerce")
     history["mileage"] = pd.to_numeric(history["mileage"], errors="coerce")
-    history["model_year"] = pd.to_numeric(history["nhtsa_ModelYear"], errors="coerce")
+    required_identity = {"canonical_make", "canonical_model", "canonical_year", "canonical_trim"}
+    missing_identity = sorted(required_identity - set(history.columns))
+    if missing_identity:
+        raise ValueError("Cleaned database lacks canonical identity columns: " + ", ".join(missing_identity))
+    history["model_year"] = pd.to_numeric(history["canonical_year"], errors="coerce")
 
     history = history.dropna(subset=["vin", "history_date", "price", "model_year"])
     history = history[history["price"].between(1_000, max_price or np.inf)]
@@ -618,45 +690,19 @@ def clean_history_frame(df: pd.DataFrame, max_price: int | None) -> pd.DataFrame
     history = history.dropna(subset=["mileage"])
     history = history[history["mileage"].ge(0)]
 
-    history["make"] = history["nhtsa_Make"].map(normalize_label)
-    history["model"] = history["nhtsa_Model"].map(normalize_label)
+    history["make"] = history["canonical_make"].map(normalize_label)
+    history["model"] = history["canonical_model"].map(normalize_label)
     history["model_year"] = history["model_year"].astype("int16")
     history = history[history["make"].ne("UNKNOWN") & history["model"].ne("UNKNOWN")]
 
-    title_source = (
-        history["title"].fillna("")
-        + " "
-        + history["vehicleTitle"].fillna("")
-        + " "
-        + history["vehicleTitleDesc"].fillna("")
+    history["trim_proxy"] = history["canonical_trim"].map(
+        lambda value: normalize_label(value, "UNKNOWN_TRIM").replace(" ", "_")
     )
-    parsed_trim = pd.Series(
-        [
-            parse_trim_proxy(title, make, model, year)
-            for title, make, model, year in zip(
-                title_source,
-                history["make"],
-                history["model"],
-                history["model_year"],
-            )
-        ],
-        index=history.index,
+    expected_trim = history["canonical_trim"].map(
+        lambda value: normalize_label(value, "UNKNOWN_TRIM").replace(" ", "_")
     )
-    trim_candidates = [
-        history.get("trim_combined"),
-        history.get("nhtsa_trim_combined"),
-        history.get("nhtsa_Trim"),
-        history.get("nhtsa_Trim2"),
-        history.get("title_trim"),
-        parsed_trim,
-    ]
-    history["trim_proxy"] = "UNKNOWN_TRIM"
-    for candidate in trim_candidates:
-        if candidate is None:
-            continue
-        normalized = candidate.map(lambda value: normalize_label(value, "UNKNOWN_TRIM").replace(" ", "_"))
-        usable = normalized.notna() & normalized.ne("UNKNOWN_TRIM") & normalized.ne("")
-        history.loc[history["trim_proxy"].eq("UNKNOWN_TRIM") & usable, "trim_proxy"] = normalized[usable]
+    if not history["trim_proxy"].equals(expected_trim):
+        raise AssertionError("Time-series cohorts must use canonical_trim only")
 
     history["body_class"] = history["nhtsa_BodyClass"].map(normalize_label)
     history["drive_type"] = history["nhtsa_DriveType"].map(normalize_label)
@@ -1155,6 +1201,94 @@ def supervised_backtest_rows(
     return rows
 
 
+def eligible_rolling_origins(
+    monthly: pd.DataFrame,
+    horizon: int,
+    min_history_months: int = MIN_ROLLING_HISTORY_MONTHS,
+) -> list[pd.Timestamp]:
+    """Return origins with prior canonical-cohort history and observable targets.
+
+    The origin itself is an observed month. Eligibility is calculated per cohort,
+    then reduced to the distinct origins used to refit global models.
+    """
+    target_col = f"target_median_price_{int(horizon)}m"
+    required = set(COHORT_COLUMNS + ["month_start", target_col])
+    if not required.issubset(monthly.columns):
+        return []
+    ranked = monthly.sort_values(COHORT_COLUMNS + ["month_start"]).copy()
+    ranked["_history_months"] = ranked.groupby(COHORT_COLUMNS, dropna=False).cumcount() + 1
+    eligible = ranked[
+        ranked["_history_months"].ge(int(min_history_months))
+        & ranked[target_col].notna()
+    ]
+    return sorted(pd.to_datetime(eligible["month_start"], errors="coerce").dropna().unique())
+
+
+def rolling_origin_metadata(
+    rows: pd.DataFrame,
+    origin: pd.Timestamp,
+    train_start: pd.Timestamp,
+    min_history_months: int,
+) -> pd.DataFrame:
+    """Append auditable rolling-origin metadata without changing legacy columns."""
+    if rows.empty:
+        return rows
+    rows = rows.copy()
+    rows["backtest_scheme"] = "expanding_rolling_origin"
+    rows["rolling_origin_month"] = pd.Timestamp(origin)
+    rows["train_window_start"] = pd.Timestamp(train_start)
+    rows["train_window_end"] = pd.Timestamp(origin)
+    rows["minimum_history_months"] = int(min_history_months)
+    return rows
+
+
+def rolling_origin_global_backtest(
+    model_df: pd.DataFrame,
+    feature_columns: list[str],
+    target_col: str,
+    future_price_col: str,
+    horizon: int,
+    tuned_params: dict[str, Any] | None,
+    min_history_months: int = MIN_ROLLING_HISTORY_MONTHS,
+) -> pd.DataFrame:
+    """Refit the global model at each eligible origin without future leakage."""
+    rows: list[pd.DataFrame] = []
+    origins = eligible_rolling_origins(model_df, horizon, min_history_months)
+    if not origins:
+        return pd.DataFrame()
+    first_month = pd.to_datetime(model_df["month_start"], errors="coerce").min()
+    for origin in origins:
+        origin = pd.Timestamp(origin)
+        train_end = origin - pd.DateOffset(months=int(horizon))
+        train = model_df[pd.to_datetime(model_df["month_start"], errors="coerce") <= train_end]
+        test = model_df[pd.to_datetime(model_df["month_start"], errors="coerce").eq(origin)].copy()
+        if train.shape[0] < MIN_TEMPORAL_TRAIN_ROWS or test.empty:
+            continue
+        # A cohort must have six observed months at the origin, not merely six
+        # rows elsewhere in the global panel.
+        prior = model_df[pd.to_datetime(model_df["month_start"], errors="coerce") <= origin]
+        history_counts = prior.groupby(COHORT_COLUMNS, dropna=False).size().rename("_history_months")
+        test = test.join(history_counts, on=COHORT_COLUMNS)
+        test = test[test["_history_months"].ge(int(min_history_months))].drop(columns="_history_months")
+        if test.empty:
+            continue
+        model, _ = build_regression_pipeline(train[feature_columns], train[target_col], tuned_params)
+        model.fit(train[feature_columns], train[target_col])
+        pred_dep = model.predict(test[feature_columns])
+        scored = supervised_backtest_rows(
+            test=test,
+            pred_dep=pred_dep,
+            horizon=horizon,
+            target_col=target_col,
+            future_price_col=future_price_col,
+            model_key=target_col,
+            model_family="global_ml",
+            forecast_method="recursive_global_ml_model",
+        )
+        rows.append(rolling_origin_metadata(scored, origin, first_month, min_history_months))
+    return pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()
+
+
 def local_backtest_rows(
     cohort_row: pd.Series,
     origin_month: pd.Timestamp,
@@ -1566,22 +1700,17 @@ def run_local_forecaster(
             if series.shape[0] < MIN_LOCAL_MODEL_MONTHS:
                 continue
             latest_row = latest_lookup[key]
-            train_series = series[series.index < pd.Timestamp(cutoff)]
             actual_lookup = {pd.Timestamp(index): float(value) for index, value in series.items()}
 
             if model_family == "sarimax":
                 future_pred = forecast_sarimax_series(series, forecast_steps)
-                backtest_pred = forecast_sarimax_series(train_series, max_target_month) if train_series.shape[0] >= MIN_LOCAL_MODEL_MONTHS else np.array([])
+                backtest_pred = np.array([])
             elif model_family == "prophet":
                 future_pred = forecast_prophet_series(series, forecast_steps)
-                backtest_pred = forecast_prophet_series(train_series, max_target_month) if train_series.shape[0] >= MIN_LOCAL_MODEL_MONTHS else np.array([])
+                backtest_pred = np.array([])
             else:
                 future_pred = forecast_timesfm_batch(timesfm_model, [series], forecast_steps)[0]
-                backtest_pred = (
-                    forecast_timesfm_batch(timesfm_model, [train_series], max_target_month)[0]
-                    if train_series.shape[0] >= MIN_LOCAL_MODEL_MONTHS
-                    else np.array([])
-                )
+                backtest_pred = np.array([])
 
             future_frames.append(
                 _forecast_output_from_predictions(
@@ -1591,13 +1720,22 @@ def run_local_forecaster(
                     model_family=model_family,
                 )
             )
-            if backtest_pred.size:
+            for origin_position in range(MIN_LOCAL_MODEL_MONTHS - 1, len(series)):
+                train_series = series.iloc[: origin_position + 1]
                 origin_month = pd.Timestamp(train_series.index.max())
-                observed_price = float(train_series.iloc[-1])
+                if not any(pd.Timestamp(origin_month + pd.DateOffset(months=h)) in actual_lookup for h in target_months):
+                    continue
+                if model_family == "sarimax":
+                    backtest_pred = forecast_sarimax_series(train_series, max_target_month)
+                elif model_family == "prophet":
+                    backtest_pred = forecast_prophet_series(train_series, max_target_month)
+                else:
+                    backtest_pred = forecast_timesfm_batch(timesfm_model, [train_series], max_target_month)[0]
+                origin_row = group[group["month_start"].eq(origin_month)].iloc[-1]
                 backtest = local_backtest_rows(
-                    cohort_row=latest_row,
+                    cohort_row=origin_row,
                     origin_month=origin_month,
-                    observed_price=observed_price,
+                    observed_price=float(train_series.iloc[-1]),
                     predictions=backtest_pred,
                     actual_by_month=actual_lookup,
                     target_months=target_months,
@@ -1606,7 +1744,14 @@ def run_local_forecaster(
                     forecast_method=forecast_method,
                 )
                 if not backtest.empty:
-                    backtest_frames.append(backtest)
+                    backtest_frames.append(
+                        rolling_origin_metadata(
+                            backtest,
+                            origin_month,
+                            pd.Timestamp(train_series.index.min()),
+                            MIN_ROLLING_HISTORY_MONTHS,
+                        )
+                    )
             fitted_count += 1
         except Exception as exc:  # pragma: no cover - defensive per-cohort guardrail
             if len(errors) < 12:
@@ -1638,6 +1783,7 @@ def train_cohort_models(
     time_series_models: list[str],
     max_local_model_cohorts: int,
     timesfm_model_id: str,
+    min_rolling_history_months: int = MIN_ROLLING_HISTORY_MONTHS,
 ) -> dict[str, Any]:
     raw = load_history_frame(db_path, sample_size)
     history = clean_history_frame(raw, max_price=max_price)
@@ -1676,8 +1822,56 @@ def train_cohort_models(
         "minimum_model_rows": MIN_MODEL_ROWS,
         "minimum_temporal_train_rows": MIN_TEMPORAL_TRAIN_ROWS,
         "minimum_temporal_test_rows": MIN_TEMPORAL_TEST_ROWS,
+        "backtesting": {
+            "scheme": "expanding_rolling_origin",
+            "minimum_history_months": int(min_rolling_history_months),
+            "training_rule": "Each origin fits only rows whose target month is observed by that origin.",
+        },
         "feature_columns": feature_columns,
         "excluded_price_leakage_columns": sorted(PRICE_LEAKAGE_FEATURE_COLUMNS),
+        "identity_normalization": {
+            "versions": {
+                str(key): int(value)
+                for key, value in raw.get("normalization_version", pd.Series(dtype="string"))
+                .fillna("NULL")
+                .astype("string")
+                .value_counts()
+                .items()
+            },
+            "trim_coverage_rate": float(history["trim_proxy"].ne("UNKNOWN_TRIM").mean()),
+            "source_distribution": {
+                str(key): int(value)
+                for key, value in raw.get("canonical_trim_source", pd.Series(dtype="string"))
+                .fillna("NULL").astype("string").value_counts().items()
+            },
+            "confidence_distribution": {
+                str(key): int(value)
+                for key, value in raw.get("canonical_match_confidence", pd.Series(dtype="string"))
+                .fillna("NULL").astype("string").value_counts().items()
+            },
+            "epa_match_rate": float(
+                raw.get("epa_vehicle_id", pd.Series(index=raw.index, dtype="object")).notna().mean()
+            ),
+            "nhtsa_disagreement": {
+                column: {
+                    "observed_rows": int(pd.to_numeric(raw[column], errors="coerce").notna().sum()),
+                    "disagreement_rate": float(
+                        pd.to_numeric(raw[column], errors="coerce").dropna().eq(0).mean()
+                    )
+                    if pd.to_numeric(raw[column], errors="coerce").notna().any()
+                    else None,
+                }
+                for column in [
+                    "nhtsa_year_agrees",
+                    "nhtsa_make_agrees",
+                    "nhtsa_model_agrees",
+                    "nhtsa_trim_agrees",
+                ]
+                if column in raw.columns
+            },
+            "cohort_identity_source": "vehicle_identity VIN consensus with canonical listing fallback",
+            "identity_precedence": "NHTSA make/model anchors; title-derived trim; EPA validation/standardization",
+        },
         "price_feature_policy": (
             "Current-month cohort price summaries are allowed because they are observed at "
             "the forecast origin; future target price columns are excluded from model inputs."
@@ -1742,29 +1936,18 @@ def train_cohort_models(
             )
             model, model_name = build_regression_pipeline(X_train, y_train, tuned_params)
             model.fit(X_train, y_train)
-            metrics: dict[str, float] = {}
-            if not test.empty:
-                X_test = test[feature_columns]
-                y_test = test[target_col]
-                pred_dep = model.predict(X_test)
-                metrics = evaluate_predictions(
-                    y_true_dep=y_test,
-                    pred_dep=pred_dep,
-                    current_price=test["median_price"],
-                    future_price=test[future_price_col],
-                )
-                supervised_rows = supervised_backtest_rows(
-                    test=test,
-                    pred_dep=pred_dep,
-                    horizon=horizon,
-                    target_col=target_col,
-                    future_price_col=future_price_col,
-                    model_key=target_col,
-                    model_family="global_ml",
-                    forecast_method="recursive_global_ml_model",
-                )
-                if not supervised_rows.empty:
-                    backtest_frames.append(supervised_rows)
+            rolling_rows = rolling_origin_global_backtest(
+                model_df=model_df,
+                feature_columns=feature_columns,
+                target_col=target_col,
+                future_price_col=future_price_col,
+                horizon=horizon,
+                tuned_params=tuned_params,
+                min_history_months=min_rolling_history_months,
+            )
+            metrics = metrics_from_backtest_rows(rolling_rows)
+            if not rolling_rows.empty:
+                backtest_frames.append(rolling_rows)
 
             final_model, final_model_name = build_regression_pipeline(
                 model_df[feature_columns],
@@ -1787,9 +1970,9 @@ def train_cohort_models(
                 "future_price_column": future_price_col,
                 "split_date": str(model_cutoff.date()) if not pd.isna(model_cutoff) else None,
                 "train_rows": int(train.shape[0]),
-                "test_rows": int(test.shape[0]),
+                "test_rows": int(rolling_rows.shape[0]),
                 "train_cohorts": int(train[COHORT_COLUMNS].drop_duplicates().shape[0]),
-                "test_cohorts": int(test[COHORT_COLUMNS].drop_duplicates().shape[0]) if not test.empty else 0,
+                "test_cohorts": int(rolling_rows[COHORT_COLUMNS].drop_duplicates().shape[0]) if not rolling_rows.empty else 0,
                 "complete_rows": int(model_df.shape[0]),
                 "artifact_training_rows": int(model_df.shape[0]),
                 "tuning": tuning_metadata,
@@ -2050,6 +2233,7 @@ def run_cohort_forecast(
     time_series_models: list[str] | None = None,
     max_local_model_cohorts: int = DEFAULT_MAX_LOCAL_MODEL_COHORTS,
     timesfm_model_id: str = DEFAULT_TIMESFM_MODEL_ID,
+    min_rolling_history_months: int = MIN_ROLLING_HISTORY_MONTHS,
 ) -> dict[str, Any]:
     if target_months is None:
         target_months = horizons or DEFAULT_TARGET_MONTHS
@@ -2069,6 +2253,7 @@ def run_cohort_forecast(
         time_series_models=time_series_models,
         max_local_model_cohorts=max_local_model_cohorts,
         timesfm_model_id=timesfm_model_id,
+        min_rolling_history_months=min_rolling_history_months,
     )
     report.update(
         {
@@ -2079,6 +2264,7 @@ def run_cohort_forecast(
             "forecast_months": int(forecast_months),
             "sample_strategy": "recent_vins_full_history" if sample_size else "full_price_history",
             "time_series_models": time_series_models,
+            "min_rolling_history_months": int(min_rolling_history_months),
             "research_sources": RESEARCH_REFERENCES,
         }
     )
@@ -2198,6 +2384,7 @@ def main() -> None:
         time_series_models=time_series_models,
         max_local_model_cohorts=args.max_local_model_cohorts,
         timesfm_model_id=args.timesfm_model_id,
+        min_rolling_history_months=args.min_rolling_history_months,
     )
     print(f"Saved report to {Path(args.output_dir) / 'cohort_depreciation_model_report.json'}")
     for target, model_report in report["models"].items():

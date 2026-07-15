@@ -67,6 +67,8 @@ DROP_FEATURE_COLUMNS = {
     "date",
     "loaddate",
     "Vehicle_Entity",
+    "title",
+    "canonical_title",
 }
 
 PRICE_LEAKAGE_FEATURE_COLUMNS = {
@@ -84,15 +86,10 @@ TARGET_ENCODE_TOKENS = (
     "location",
 )
 
-TRIM_FEATURE_CANDIDATES = [
-    "trim_combined",
-    "nhtsa_trim_combined",
-    "nhtsa_Trim",
-    "nhtsa_Trim2",
-    "title_trim",
-]
+TRIM_FEATURE_CANDIDATES = ["canonical_trim"]
 
 TRIM_METADATA_COLUMNS = [
+    "canonical_trim",
     "title_trim",
     "trim_combined",
     "trim_source",
@@ -101,6 +98,45 @@ TRIM_METADATA_COLUMNS = [
     "nhtsa_Trim_source",
     "nhtsa_trim_combined",
 ]
+
+IDENTITY_DIAGNOSTIC_COLUMNS = {
+    "title_trim",
+    "trim_combined",
+    "trim_source",
+    "nhtsa_Trim",
+    "nhtsa_Trim2",
+    "nhtsa_Trim_source",
+    "nhtsa_trim_combined",
+    "nhtsa_Make",
+    "nhtsa_Model",
+    "nhtsa_ModelYear",
+    "canonical_trim_raw",
+    "canonical_trim_source",
+    "canonical_match_confidence",
+    "canonical_match_status",
+    "epa_vehicle_id",
+    "epa_match_status",
+    "normalization_version",
+    "nhtsa_year_agrees",
+    "nhtsa_make_agrees",
+    "nhtsa_model_agrees",
+    "nhtsa_trim_agrees",
+}
+
+
+def assert_canonical_identity_contract(feature_df: pd.DataFrame) -> None:
+    """Fail fast if a legacy trim can enter the price-model feature matrix."""
+    forbidden = {
+        "nhtsa_Trim", "nhtsa_Trim2", "nhtsa_trim_combined", "trim_combined",
+        "title_trim", "trim_source", "canonical_trim_raw", "canonical_trim_source",
+        "canonical_match_confidence", "canonical_match_status", "epa_vehicle_id",
+        "epa_match_status", "nhtsa_trim_agrees",
+    }
+    leaked = sorted(forbidden.intersection(feature_df.columns))
+    if leaked:
+        raise AssertionError("Non-canonical trim metadata entered the feature matrix: " + ", ".join(leaked))
+    if "canonical_trim" not in feature_df.columns:
+        raise AssertionError("canonical_trim must be present in the price-model feature matrix")
 
 RESEARCH_REFERENCES = [
     {
@@ -126,6 +162,41 @@ def normalize_trim_feature(value: Any, fallback: str = "UNKNOWN_TRIM") -> str:
         return fallback
     text = str(value).strip().upper().replace(" ", "_")
     return text if text and text not in {"NA", "N_A", "NONE", "NULL", "UNKNOWN"} else fallback
+
+
+def identity_normalization_profile(df: pd.DataFrame) -> dict[str, Any]:
+    """Summarize the canonical identity contract recorded with model outputs."""
+    total = max(int(df.shape[0]), 1)
+
+    def distribution(column: str) -> dict[str, int]:
+        if column not in df.columns:
+            return {}
+        return {
+            str(key): int(value)
+            for key, value in df[column].fillna("NULL").astype("string").value_counts().items()
+        }
+
+    canonical_trim = df.get("canonical_trim", pd.Series(index=df.index, dtype="string")).astype("string")
+    unresolved = canonical_trim.fillna("UNKNOWN_TRIM").eq("UNKNOWN_TRIM")
+    epa_matched = df.get("epa_vehicle_id", pd.Series(index=df.index, dtype="object")).notna()
+    disagreements = {}
+    for column in ["nhtsa_year_agrees", "nhtsa_make_agrees", "nhtsa_model_agrees", "nhtsa_trim_agrees"]:
+        if column in df.columns:
+            observed = df[column].dropna()
+            disagreements[column] = {
+                "observed_rows": int(observed.shape[0]),
+                "disagreement_rate": float((observed == 0).mean()) if not observed.empty else None,
+            }
+    return {
+        "versions": distribution("normalization_version"),
+        "trim_coverage_rate": float(1 - unresolved.sum() / total),
+        "unresolved_rows": int(unresolved.sum()),
+        "source_distribution": distribution("canonical_trim_source"),
+        "confidence_distribution": distribution("canonical_match_confidence"),
+        "epa_match_rate": float(epa_matched.sum() / total),
+        "nhtsa_disagreement": disagreements,
+        "identity_precedence": "NHTSA make/model anchors; title-derived trim; EPA validation/standardization",
+    }
 
 
 def parse_args() -> argparse.Namespace:
@@ -307,8 +378,8 @@ def load_modeling_frame(
                 conn.execute("ATTACH DATABASE ? AS absa", (str(absa_db_path),))
                 if _table_exists(conn, "absa.Vehicle_Sentiment_Index"):
                     entity_expr = (
-                        "CAST(n.nhtsa_ModelYear AS TEXT) || ' ' || "
-                        "n.nhtsa_Make || ' ' || n.nhtsa_Model"
+                        "CAST(l.canonical_year AS TEXT) || ' ' || "
+                        "l.canonical_make || ' ' || l.canonical_model"
                     )
                     query_cols.extend(
                         [
@@ -350,6 +421,12 @@ def load_modeling_frame(
 def engineer_current_price_features(df: pd.DataFrame) -> pd.DataFrame:
     """Create derived features from cleaned listing and NHTSA columns."""
     df = df.copy()
+    required_identity = {"canonical_make", "canonical_model", "canonical_year", "canonical_trim"}
+    missing_identity = sorted(required_identity - set(df.columns))
+    if missing_identity:
+        raise ValueError(
+            "Cleaned database lacks canonical identity columns: " + ", ".join(missing_identity)
+        )
     df["price"] = pd.to_numeric(df["price"], errors="coerce")
     df["mileage"] = pd.to_numeric(df["mileage"], errors="coerce")
     df = df[df["price"].notna() & (df["price"] > 0)]
@@ -359,7 +436,7 @@ def engineer_current_price_features(df: pd.DataFrame) -> pd.DataFrame:
         if col in df.columns:
             df[col] = pd.to_datetime(df[col], errors="coerce")
 
-    model_year_col = "nhtsa_ModelYear"
+    model_year_col = "canonical_year"
     if model_year_col in df.columns:
         model_year = pd.to_numeric(df[model_year_col], errors="coerce")
         df["vehicle_age"] = (datetime.now().year - model_year).clip(lower=0)
@@ -456,9 +533,9 @@ def engineer_current_price_features(df: pd.DataFrame) -> pd.DataFrame:
             na=False,
         ).astype("int8")
 
-    make = df.get("nhtsa_Make", pd.Series("UNKNOWN", index=df.index)).astype("string").fillna("UNKNOWN")
-    model = df.get("nhtsa_Model", pd.Series("UNKNOWN", index=df.index)).astype("string").fillna("UNKNOWN")
-    year = df.get("nhtsa_ModelYear", pd.Series("UNKNOWN", index=df.index)).astype("string").fillna("UNKNOWN")
+    make = df["canonical_make"].astype("string").fillna("UNKNOWN")
+    model = df["canonical_model"].astype("string").fillna("UNKNOWN")
+    year = pd.to_numeric(df["canonical_year"], errors="coerce").astype("Int64").astype("string").fillna("UNKNOWN")
     body = df.get("nhtsa_BodyClass", pd.Series("UNKNOWN", index=df.index)).astype("string").fillna("UNKNOWN")
     fuel = df.get("nhtsa_FuelTypePrimary", pd.Series("UNKNOWN", index=df.index)).astype("string").fillna("UNKNOWN")
 
@@ -547,9 +624,10 @@ def split_train_test(
 
 def make_feature_matrix(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series, pd.DataFrame]:
     y = df["price"].astype("float64")
-    drop_columns = DROP_FEATURE_COLUMNS | PRICE_LEAKAGE_FEATURE_COLUMNS
+    drop_columns = DROP_FEATURE_COLUMNS | PRICE_LEAKAGE_FEATURE_COLUMNS | IDENTITY_DIAGNOSTIC_COLUMNS
     feature_df = df.drop(columns=[c for c in drop_columns if c in df.columns], errors="ignore")
-    return feature_df, y, df[["vin", "price", "price_band", "nhtsa_Make", "nhtsa_ModelYear"]].copy()
+    assert_canonical_identity_contract(feature_df)
+    return feature_df, y, df[["vin", "price", "price_band", "canonical_make", "canonical_year"]].copy()
 
 
 def to_float32(X: Any) -> Any:
@@ -856,7 +934,7 @@ def segment_metrics(
     scored["is_high_value"] = np.where(scored["actual"] >= HIGH_VALUE_THRESHOLD, "high_value", "everyday")
 
     output: dict[str, dict[str, dict[str, float]]] = {}
-    for column in ["price_band", "nhtsa_Make", "nhtsa_ModelYear", "is_high_value"]:
+    for column in ["price_band", "canonical_make", "canonical_year", "is_high_value"]:
         if column not in scored.columns:
             continue
         groups = {}
@@ -884,7 +962,7 @@ def stratified_tuning_sample_positions(
     if max_rows <= 0 or row_count <= max_rows:
         return np.arange(row_count)
 
-    available_cols = [c for c in ["price_band", "nhtsa_Make", "nhtsa_ModelYear"] if c in segment_frame.columns]
+    available_cols = [c for c in ["price_band", "canonical_make", "canonical_year"] if c in segment_frame.columns]
     if not available_cols:
         return np.sort(
             np.random.default_rng(RANDOM_STATE).choice(row_count, size=max_rows, replace=False)
@@ -1245,16 +1323,18 @@ def train_current_price_models(
         "split": split_metadata,
         "features": feature_metadata,
         "trim_features": {
-            "cleaned_trim_columns_available": [
-                col for col in TRIM_METADATA_COLUMNS if col in model_df.columns
+            "canonical_trim_input": "canonical_trim" if "canonical_trim" in model_df.columns else None,
+            "comparison_columns_available": [
+                col for col in TRIM_METADATA_COLUMNS if col != "canonical_trim" and col in model_df.columns
             ],
             "engineered_trim_columns": [
                 col for col in ["trim_proxy", "make_model_year_trim"] if col in model_df.columns
             ],
         },
+        "identity_normalization": identity_normalization_profile(raw_df),
         "tuning": {
             "max_tuning_rows": DEFAULT_TUNING_SAMPLE_SIZE,
-            "sampling_strategy": "deterministic stratified sample by diagnostic price band, NHTSA make, and model year",
+            "sampling_strategy": "deterministic stratified sample by diagnostic price band, canonical make, and canonical model year",
             "final_fit": "best hyperparameters are refit before evaluation; memory-heavy models can use a documented representative fit cap",
         },
         "model_fit_metadata": model_fit_metadata,
@@ -1277,6 +1357,7 @@ def train_current_price_models(
             "Training defaults to the latest listing row per VIN to avoid duplicate VIN overweighting.",
             "Price bands are created only after observing price and are kept out of the feature matrix to avoid target leakage.",
             "NHTSA base-price fields are excluded because the cleaned base price can be filled from observed price history.",
+            "NHTSA make/model anchor canonical identity; title-derived canonical trim is the only trim input.",
             "Hyperparameters are tuned on a representative bounded sample, then refit on the full training split.",
             "RandomForest is sample-bounded and leaf-bounded on large full-database runs because scikit-learn stores every fitted tree node in memory.",
             "All current-price candidates use the same high-value classifier router before model-specific regressors.",
@@ -1317,7 +1398,7 @@ def write_reports(output_dir: Path, report: dict[str, Any]) -> None:
         f"- Feature matrix profile: {report['feature_space_profile']['transformed_shape_on_profile'][1]:,} transformed columns on "
         f"{report['feature_space_profile']['profile_rows']:,} profiled rows; projected full training matrix "
         f"{report['feature_space_profile']['projected_full_training_matrix_memory_mb'] / 1024:,.2f} GB",
-        f"- Cleaned trim fields used: {', '.join(report.get('trim_features', {}).get('cleaned_trim_columns_available', [])) or 'none available'}",
+        f"- Canonical trim input: {report.get('trim_features', {}).get('canonical_trim_input') or 'missing'}",
         "",
         "## Best Model Metrics",
         f"- MAE: ${best_metrics['mae']:,.2f}",

@@ -1,3 +1,4 @@
+import argparse
 import logging
 import os
 import re
@@ -11,18 +12,26 @@ import polars as pl
 
 try:
     from database import CarDatabase
+    from VehicleNormalization import (
+        NORMALIZATION_VERSION,
+        VehicleNormalizer,
+        build_epa_metadata_frame,
+        build_vehicle_identity,
+        download_epa_catalog,
+        empty_epa_catalog,
+        load_epa_catalog,
+    )
 except ImportError:  # pragma: no cover - used when imported as a package in tests
     from DataPipeline.database import CarDatabase
-
-
-MAKE_WHITELIST_UPPER = {
-    "TOYOTA", "NISSAN", "FORD", "CHEVROLET", "CADILLAC",
-    "HONDA", "VOLVO", "MASERATI", "PORSCHE", "ACURA", "LEXUS", "TESLA",
-    "KIA", "BMW", "MERCEDES", "HYUNDAI", "INFINITI", "DODGE", "LOTUS",
-    "SUZUKI", "MAZDA", "FIAT", "LINCOLN", "SUBARU", "GMC",
-    "GENESIS", "JEEP", "VOLKSWAGEN", "LANDROVER", "AUDI", "RAM",
-    "CHRYSLER", "JAGUAR", "FERRARI", "LAMBORGHINI", "MCLAREN",
-}
+    from DataPipeline.VehicleNormalization import (
+        NORMALIZATION_VERSION,
+        VehicleNormalizer,
+        build_epa_metadata_frame,
+        build_vehicle_identity,
+        download_epa_catalog,
+        empty_epa_catalog,
+        load_epa_catalog,
+    )
 
 LISTINGS_KEEP_COLUMNS = [
     "vin", "date", "loaddate", "title", "location", "locationCode",
@@ -53,9 +62,9 @@ PRICE_REPEATED_HIGH_RATIO = 2.0
 PRICE_REPEATED_LOW_RATIO = 0.50
 PRICE_REPEATED_DIGIT_LENGTH = 5
 PRICE_CONTEXT_LEVELS = [
-    (["nhtsa_Make", "nhtsa_Model", "nhtsa_ModelYear", "trim_combined"], 6, "make_model_year_trim"),
-    (["nhtsa_Make", "nhtsa_Model", "nhtsa_ModelYear"], 10, "make_model_year"),
-    (["nhtsa_Make", "nhtsa_Model"], 20, "make_model"),
+    (["canonical_make", "canonical_model", "canonical_year", "canonical_trim"], 6, "make_model_year_trim"),
+    (["canonical_make", "canonical_model", "canonical_year"], 10, "make_model_year"),
+    (["canonical_make", "canonical_model"], 20, "make_model"),
 ]
 
 VIN_BLACKLIST = {
@@ -136,7 +145,7 @@ def extract_clean_trim(make: object, model: object, model_year: object, title: o
 
 
 def combine_trim_values(*values: object) -> str:
-    """Return a stable, de-duplicated trim label from official and title-derived values."""
+    """Return a stable, de-duplicated label for comparison-only trim values."""
     parts = []
     seen = set()
     for value in values:
@@ -183,11 +192,38 @@ def reduce_cardinality(df: pl.DataFrame, columns: list[str], threshold: float = 
 class DataCleaningPipeline:
     """Builds a filtered SQLite clone for cleaned analysis output."""
 
-    def __init__(self, source_db_path: Path, target_db_path: Path):
+    def __init__(
+        self,
+        source_db_path: Path,
+        target_db_path: Path,
+        *,
+        epa_cache_dir: Path | None = None,
+        refresh_epa: bool = False,
+        offline: bool = False,
+        require_epa: bool = False,
+    ):
         self.source_db_path = Path(source_db_path)
         self.target_db_path = Path(target_db_path)
         self.output_dir = self.target_db_path.parent
+        self.epa_cache_dir = Path(epa_cache_dir) if epa_cache_dir is not None else None
+        self.refresh_epa = refresh_epa
+        self.offline = offline
+        self.require_epa = require_epa
         self._setup_logging()
+
+    def _load_epa_reference(self) -> tuple[pl.DataFrame, pl.DataFrame]:
+        if self.epa_cache_dir is None:
+            if self.require_epa:
+                raise ValueError("EPA cache directory is required for this cleaning run")
+            catalog = empty_epa_catalog()
+            return catalog, build_epa_metadata_frame({"cache_status": "not_configured"}, catalog)
+        archive, metadata = download_epa_catalog(
+            self.epa_cache_dir,
+            refresh=self.refresh_epa,
+            offline=self.offline,
+        )
+        catalog = load_epa_catalog(archive)
+        return catalog, build_epa_metadata_frame(metadata, catalog)
 
     def _setup_logging(self) -> None:
         os.makedirs(self.output_dir, exist_ok=True)
@@ -292,45 +328,18 @@ class DataCleaningPipeline:
 
     @staticmethod
     def _add_listing_trim_features(df: pl.DataFrame) -> pl.DataFrame:
-        required = {"title", "nhtsa_Make", "nhtsa_Model", "nhtsa_ModelYear", "nhtsa_Trim", "nhtsa_Trim2"}
+        """Populate legacy compatibility fields from canonical trim only."""
+        required = {"canonical_title", "canonical_trim", "canonical_trim_source"}
         if not required.issubset(set(df.columns)):
             return df
-
-        df = df.with_columns(
+        return df.with_columns(
             [
-                pl.col("title").map_elements(normalize_title, return_dtype=pl.String).alias("title_normalized"),
-                pl.struct(["nhtsa_Make", "nhtsa_Model", "nhtsa_ModelYear", "title"])
-                .map_elements(
-                    lambda row: extract_clean_trim(
-                        row["nhtsa_Make"],
-                        row["nhtsa_Model"],
-                        row["nhtsa_ModelYear"],
-                        row["title"],
-                    ),
-                    return_dtype=pl.String,
-                )
-                .alias("title_trim"),
+                pl.col("canonical_title").alias("title_normalized"),
+                pl.col("canonical_trim").alias("title_trim"),
+                pl.col("canonical_trim").alias("trim_combined"),
+                pl.col("canonical_trim_source").alias("trim_source"),
             ]
         )
-        df = df.with_columns(
-            [
-                pl.struct(["nhtsa_Trim", "nhtsa_Trim2", "title_trim"])
-                .map_elements(
-                    lambda row: combine_trim_values(row["nhtsa_Trim"], row["nhtsa_Trim2"], row["title_trim"]),
-                    return_dtype=pl.String,
-                )
-                .alias("trim_combined"),
-                pl.when(pl.col("nhtsa_Trim").is_not_null() & (pl.col("nhtsa_Trim") != ""))
-                .then(pl.lit("nhtsa_Trim"))
-                .when(pl.col("nhtsa_Trim2").is_not_null() & (pl.col("nhtsa_Trim2") != ""))
-                .then(pl.lit("nhtsa_Trim2"))
-                .when(pl.col("title_trim").is_not_null() & (pl.col("title_trim") != ""))
-                .then(pl.lit("title"))
-                .otherwise(pl.lit("unknown"))
-                .alias("trim_source"),
-            ]
-        )
-        return df
 
     @staticmethod
     def _contextual_price_stats(
@@ -562,18 +571,21 @@ class DataCleaningPipeline:
 
     @staticmethod
     def _create_tables_from_polars(conn: sqlite3.Connection, table_configs: dict[str, tuple[pl.DataFrame, list[str]]]) -> None:
-        type_str_map = {
-            pl.Int64: "INTEGER",
-            pl.Float64: "REAL",
-            pl.String: "TEXT",
-            pl.Boolean: "BOOLEAN",
-            pl.Date: "DATE",
-            pl.Datetime: "TIMESTAMP"
-        }
         for table_name, (df, pks) in table_configs.items():
             cols = []
             for name, dtype in df.schema.items():
-                sql_type = type_str_map.get(type(dtype), "TEXT")
+                if dtype.is_integer():
+                    sql_type = "INTEGER"
+                elif dtype.is_float():
+                    sql_type = "REAL"
+                elif dtype == pl.Boolean:
+                    sql_type = "BOOLEAN"
+                elif dtype == pl.Date:
+                    sql_type = "DATE"
+                elif isinstance(dtype, pl.Datetime):
+                    sql_type = "TIMESTAMP"
+                else:
+                    sql_type = "TEXT"
                 cols.append(f'"{name}" {sql_type}')
 
             if pks:
@@ -591,7 +603,14 @@ class DataCleaningPipeline:
             "CREATE INDEX IF NOT EXISTS idx_listings_vin ON listings (vin)",
             "CREATE INDEX IF NOT EXISTS idx_listings_loaddate ON listings (loaddate)",
             "CREATE INDEX IF NOT EXISTS idx_listings_price ON listings (price)",
+            "CREATE INDEX IF NOT EXISTS idx_listings_canonical_identity ON listings (canonical_make, canonical_model, canonical_year, canonical_trim)",
+            "CREATE INDEX IF NOT EXISTS idx_listings_normalization_audit ON listings (canonical_match_confidence, canonical_trim_source, canonical_match_status)",
+            "CREATE INDEX IF NOT EXISTS idx_listings_epa_vehicle_id ON listings (epa_vehicle_id)",
             "CREATE INDEX IF NOT EXISTS idx_nhtsa_make_model_year ON nhtsa_enrichment (nhtsa_Make, nhtsa_Model, nhtsa_ModelYear)",
+            "CREATE INDEX IF NOT EXISTS idx_vehicle_identity_canonical ON vehicle_identity (canonical_make, canonical_model, canonical_year, canonical_trim)",
+            "CREATE INDEX IF NOT EXISTS idx_vehicle_identity_confidence ON vehicle_identity (canonical_match_confidence, conflict_count)",
+            "CREATE INDEX IF NOT EXISTS idx_epa_catalog_normalized_identity ON epa_vehicle_catalog (year, normalized_make, normalized_model)",
+            "CREATE INDEX IF NOT EXISTS idx_epa_catalog_normalized_base ON epa_vehicle_catalog (year, normalized_make, normalized_base_model)",
             "CREATE INDEX IF NOT EXISTS idx_listing_history_date ON listing_history (history_date)",
             "CREATE INDEX IF NOT EXISTS idx_listing_history_vin_date ON listing_history (vin, history_date)",
             "CREATE INDEX IF NOT EXISTS idx_price_history_date ON price_history (history_date)",
@@ -607,6 +626,9 @@ class DataCleaningPipeline:
         logging.info("Starting cleaned database build")
         logging.info("Source DB: %s", self.source_db_path)
         logging.info("Target DB: %s", self.target_db_path)
+
+        epa_catalog, epa_metadata = self._load_epa_reference()
+        logging.info("EPA catalog rows: %d", epa_catalog.height)
 
         source_conn = sqlite3.connect(str(self.source_db_path))
         try:
@@ -637,8 +659,6 @@ class DataCleaningPipeline:
                 pl.col("nhtsa_ModelYear").cast(pl.String).str.strip_chars().cast(pl.Float64, strict=False).cast(pl.Int64, strict=False).alias("nhtsa_ModelYear"),
             ]
         )
-        nhtsa = nhtsa.filter(pl.col("nhtsa_Make").is_in(MAKE_WHITELIST_UPPER))
-
         nhtsa = self._cast_to_int(nhtsa, [
             "nhtsa_Axles", "nhtsa_BedLengthIN", "nhtsa_BasePrice", "nhtsa_ChargerPowerKW", 
             "nhtsa_CurbWeightLB", "nhtsa_Doors", "nhtsa_EngineCycles", "nhtsa_EngineCylinders", 
@@ -658,62 +678,32 @@ class DataCleaningPipeline:
             "vin", "nhtsa_Make", "nhtsa_Model", "nhtsa_ModelYear", "nhtsa_Trim", "nhtsa_Trim2"
         ]
         scoped_listings = listings.join(nhtsa.select(listing_context_columns), on="vin", how="inner")
+        scoped_listings = VehicleNormalizer(epa_catalog).normalize_listings(scoped_listings)
         scoped_listings = self._add_listing_trim_features(scoped_listings)
         scoped_listings = self._filter_contextual_price_outliers(scoped_listings, "price", "listings")
         scoped_vins = scoped_listings.select("vin").unique()
+        vehicle_identity = build_vehicle_identity(scoped_listings)
 
-        vin_title_trim = (
-            scoped_listings
-            .sort([c for c in ["vin", "loaddate", "date"] if c in scoped_listings.columns])
-            .group_by("vin")
-            .agg(
-                pl.col("title_trim")
-                .filter(pl.col("title_trim").is_not_null() & (pl.col("title_trim") != ""))
-                .last()
-                .alias("title_trim_for_fill")
-            )
-        )
-        nhtsa = nhtsa.join(vin_title_trim, on="vin", how="left")
         nhtsa = nhtsa.with_columns(
             [
-                pl.when(pl.col("nhtsa_Trim").is_not_null() & (pl.col("nhtsa_Trim") != ""))
-                .then(pl.col("nhtsa_Trim"))
-                .otherwise(pl.col("title_trim_for_fill"))
-                .alias("_nhtsa_Trim_filled"),
-                pl.when(pl.col("nhtsa_Trim2").is_not_null() & (pl.col("nhtsa_Trim2") != ""))
-                .then(pl.col("nhtsa_Trim2"))
-                .when(
-                    pl.col("nhtsa_Trim").is_not_null()
-                    & (pl.col("nhtsa_Trim") != "")
-                    & pl.col("title_trim_for_fill").is_not_null()
-                    & (pl.col("title_trim_for_fill") != "")
-                    & (pl.col("title_trim_for_fill") != pl.col("nhtsa_Trim"))
+                pl.when(
+                    (pl.col("nhtsa_Trim").is_not_null() & (pl.col("nhtsa_Trim") != ""))
+                    | (pl.col("nhtsa_Trim2").is_not_null() & (pl.col("nhtsa_Trim2") != ""))
                 )
-                .then(pl.col("title_trim_for_fill"))
-                .otherwise(pl.col("nhtsa_Trim2"))
-                .alias("_nhtsa_Trim2_filled"),
-                pl.when(pl.col("nhtsa_Trim").is_not_null() & (pl.col("nhtsa_Trim") != ""))
                 .then(pl.lit("nhtsa"))
-                .when(pl.col("title_trim_for_fill").is_not_null() & (pl.col("title_trim_for_fill") != ""))
-                .then(pl.lit("title"))
                 .otherwise(pl.lit("unknown"))
                 .alias("nhtsa_Trim_source"),
-            ]
-        ).with_columns(
-            [
-                pl.col("_nhtsa_Trim_filled").alias("nhtsa_Trim"),
-                pl.col("_nhtsa_Trim2_filled").alias("nhtsa_Trim2"),
-                pl.struct(["_nhtsa_Trim_filled", "_nhtsa_Trim2_filled"])
+                pl.struct(["nhtsa_Trim", "nhtsa_Trim2"])
                 .map_elements(
-                    lambda row: combine_trim_values(row["_nhtsa_Trim_filled"], row["_nhtsa_Trim2_filled"]),
+                    lambda row: combine_trim_values(row["nhtsa_Trim"], row["nhtsa_Trim2"]),
                     return_dtype=pl.String,
                 )
                 .alias("nhtsa_trim_combined"),
             ]
-        ).drop(["_nhtsa_Trim_filled", "_nhtsa_Trim2_filled", "title_trim_for_fill"])
+        )
 
         vin_price_context = scoped_listings.select(
-            ["vin", "nhtsa_Make", "nhtsa_Model", "nhtsa_ModelYear", "trim_combined"]
+            ["vin", "canonical_make", "canonical_model", "canonical_year", "canonical_trim"]
         ).unique(subset=["vin"], keep="last")
 
         listing_helper_cols = ["nhtsa_Make", "nhtsa_Model", "nhtsa_ModelYear", "nhtsa_Trim", "nhtsa_Trim2"]
@@ -733,7 +723,11 @@ class DataCleaningPipeline:
         listing_history = listing_history.join(vin_price_context, on="vin", how="inner")
         listing_history = self._filter_contextual_price_outliers(listing_history, "price", "listing_history")
         listing_history = listing_history.drop(
-            [c for c in ["nhtsa_Make", "nhtsa_Model", "nhtsa_ModelYear", "trim_combined"] if c in listing_history.columns]
+            [
+                c
+                for c in ["canonical_make", "canonical_model", "canonical_year", "canonical_trim"]
+                if c in listing_history.columns
+            ]
         )
 
         price_history = self._normalize_date_columns(price_history, ["history_date"])
@@ -743,7 +737,11 @@ class DataCleaningPipeline:
         price_history = price_history.join(vin_price_context, on="vin", how="inner")
         price_history = self._filter_contextual_price_outliers(price_history, "price", "price_history")
         price_history = price_history.drop(
-            [c for c in ["nhtsa_Make", "nhtsa_Model", "nhtsa_ModelYear", "trim_combined"] if c in price_history.columns]
+            [
+                c
+                for c in ["canonical_make", "canonical_model", "canonical_year", "canonical_trim"]
+                if c in price_history.columns
+            ]
         )
 
         # Keep all history rows, but restrict them to VINs in the make-filtered scope.
@@ -761,12 +759,22 @@ class DataCleaningPipeline:
                 "nhtsa_enrichment": (scoped_nhtsa, ["vin"]),
                 "listing_history": (listing_history, ["vin", "history_date", "price", "mileage"]),
                 "price_history": (price_history, ["vin", "history_date", "price"]),
+                "vehicle_identity": (vehicle_identity, ["vin"]),
+                "epa_vehicle_catalog": (epa_catalog, ["id"]),
+                "epa_catalog_metadata": (epa_metadata, []),
             })
 
             inserted_listings = self._insert_dataframe(target_conn, "listings", scoped_listings, conflict_mode="REPLACE")
             inserted_nhtsa = self._insert_dataframe(target_conn, "nhtsa_enrichment", scoped_nhtsa, conflict_mode="REPLACE")
             inserted_listing_hist = self._insert_dataframe(target_conn, "listing_history", listing_history, conflict_mode="IGNORE")
             inserted_price_hist = self._insert_dataframe(target_conn, "price_history", price_history, conflict_mode="IGNORE")
+            inserted_vehicle_identity = self._insert_dataframe(
+                target_conn, "vehicle_identity", vehicle_identity, conflict_mode="REPLACE"
+            )
+            inserted_epa = self._insert_dataframe(
+                target_conn, "epa_vehicle_catalog", epa_catalog, conflict_mode="REPLACE"
+            )
+            self._insert_dataframe(target_conn, "epa_catalog_metadata", epa_metadata)
             self._create_indexes(target_conn)
             target_conn.commit()
         finally:
@@ -777,6 +785,8 @@ class DataCleaningPipeline:
         logging.info("Inserted nhtsa_enrichment: %d", inserted_nhtsa)
         logging.info("Inserted listing_history: %d", inserted_listing_hist)
         logging.info("Inserted price_history: %d", inserted_price_hist)
+        logging.info("Inserted vehicle_identity: %d", inserted_vehicle_identity)
+        logging.info("Inserted EPA vehicles: %d", inserted_epa)
 
         print("Cleaned database build complete")
         print(f"Target DB: {self.target_db_path}")
@@ -784,15 +794,34 @@ class DataCleaningPipeline:
         print(f"nhtsa_enrichment rows: {inserted_nhtsa}")
         print(f"listing_history rows: {inserted_listing_hist}")
         print(f"price_history rows: {inserted_price_hist}")
+        print(f"vehicle_identity rows: {inserted_vehicle_identity}")
+        print(f"EPA catalog rows: {inserted_epa}")
 
 
 def main() -> None:
-    print("Running data cleaning pipeline...")
+    parser = argparse.ArgumentParser(description="Build the canonical cleaned vehicle database")
     repo_root = Path(__file__).resolve().parent.parent
-    source_db = repo_root / "CAR_DATA_OUTPUT" / "CAR_DATA.db"
-    target_db = repo_root / "CAR_DATA_OUTPUT" / "CAR_DATA_CLEANED.db"
+    parser.add_argument("--source-db", type=Path, default=repo_root / "CAR_DATA_OUTPUT" / "CAR_DATA.db")
+    parser.add_argument("--target-db", type=Path, default=repo_root / "CAR_DATA_OUTPUT" / "CAR_DATA_CLEANED.db")
+    parser.add_argument(
+        "--epa-cache-dir",
+        type=Path,
+        default=repo_root / "CAR_DATA_OUTPUT" / "reference" / "epa_fuel_economy",
+    )
+    parser.add_argument("--offline", action="store_true", help="Require the validated local EPA cache")
+    parser.add_argument("--no-epa-refresh", action="store_true", help="Use the validated EPA cache without checking upstream")
+    args = parser.parse_args()
 
-    cleaner = DataCleaningPipeline(source_db_path=source_db, target_db_path=target_db)
+    print("Running data cleaning pipeline...")
+
+    cleaner = DataCleaningPipeline(
+        source_db_path=args.source_db,
+        target_db_path=args.target_db,
+        epa_cache_dir=args.epa_cache_dir,
+        refresh_epa=not args.no_epa_refresh,
+        offline=args.offline,
+        require_epa=True,
+    )
     cleaner.run()
 
 

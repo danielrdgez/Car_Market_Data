@@ -109,12 +109,15 @@ Current cleaning choices:
 
 - Uses Polars for table reads, type normalization, filtering, and output.
 - Keeps predictive listing fields such as title, location, source, seller type, listing type, vehicle title, and price-change flags.
-- Applies contextual price-outlier removal with robust medians and quantile fences by make, model, model year, and trim when enough support exists; repeated-digit prices such as `444444` are dropped only when they are extreme relative to the relevant cohort.
-- Preserves listing titles and adds normalized trim fields such as `title_trim`, `trim_combined`, and `trim_source`.
-- Keeps and consolidates `nhtsa_Trim` and `nhtsa_Trim2`, filling missing trim values from title-derived trim when available and recording `nhtsa_Trim_source`.
+- Applies contextual price-outlier removal with robust medians and quantile fences by canonical make, model, model year, and title-derived trim when enough support exists; repeated-digit prices such as `444444` are dropped only when they are extreme relative to the relevant cohort.
+- Treats `nhtsa_Make` and `nhtsa_Model` as canonical anchors when present and records whether the listing title corroborates year, make, and model.
+- Derives `canonical_trim` only from the listing title. The official FuelEconomy.gov catalog standardizes or validates that title-derived result; an unmatched remainder is retained and an empty remainder becomes the explicit `UNKNOWN_TRIM` failure state.
+- Preserves `nhtsa_Trim` and `nhtsa_Trim2` unchanged as diagnostic comparison fields. They cannot supply or override canonical trim text.
+- Retains legacy `title_trim`, `trim_combined`, and `trim_source` as canonical-backed compatibility fields while downstream ML uses `canonical_trim`.
+- Imports the complete cached EPA file into `epa_vehicle_catalog`, records provenance in `epa_catalog_metadata`, and creates a confidence/recency-ranked VIN consensus in `vehicle_identity`.
 - Fills missing or non-positive `nhtsa_BasePrice` from the earliest cleaned `price_history` price for the VIN, then the earliest cleaned `listing_history` price when price history is unavailable, while recording `nhtsa_BasePrice_source`.
 - Normalizes date and numeric columns.
-- Filters NHTSA rows to supported makes and valid make/model/model year values.
+- Retains every valid NHTSA-enriched make/model/model-year row; there is no hard-coded make whitelist.
 - Creates indexes for modeling and time-series reads.
 
 The cleaned database is the preferred input for EDA and modeling.
@@ -153,7 +156,8 @@ Important design choices:
 - Full-database runs are opt-in with `--sample-size 0`; hyperparameter search
   uses a representative 200k-row tuning sample, then refits the tuned model on
   the full training split.
-- Feature engineering for age, mileage, recency, ZIP region, listing text lengths, title keywords, cleaned trim labels, EV/hybrid status, body/fuel segments, and make/model/year combinations.
+- Canonical identity features come exclusively from `canonical_make`, `canonical_model`, `canonical_year`, and title-derived `canonical_trim`; raw/legacy trim candidates and identity diagnostics are excluded from the feature matrix.
+- Feature engineering for age, mileage, recency, ZIP region, listing text lengths, title keywords, EV/hybrid status, body/fuel segments, and canonical make/model/year/trim combinations.
 - Latest-row-per-VIN deduplication by default.
 - Time cutoff validation when possible, with VIN overlap removed from train rows.
 - Group shuffle fallback by VIN.
@@ -165,7 +169,7 @@ Important design choices:
 
 Important design choices:
 
-- Cohort grain is make, model, model year, and trim proxy.
+- Cohort grain is canonical make, model, model year, and trim; VIN assignment comes from `vehicle_identity` for stability across snapshots.
 - Monthly cohort frames are built from price history.
 - Features include market index, cohort lags, rolling prices, mileage, volume, NHTSA attributes, recall/complaint counts, and optional sentiment signals.
 - Models forecast one-month depreciation percentages and recursively emit a monthly median-price path up to five years ahead by default.
@@ -179,7 +183,7 @@ Important design choices:
 
 ### Streamlit Dashboard
 
-`streamlit_app.py` provides an interactive UI over the cleaned database and generated model artifacts. The dashboard uses make, model, year, and trim-proxy filters, then shows latest VIN-level actuals with price, mileage, title, NHTSA base price, transmission, recall counts, complaint counts, cohort price distribution, price-mileage position, and VIN price history from both `price_history` and `listing_history`. The model page reads `MODELS_OUTPUT/model_report.json`, current-price `.joblib` artifacts, `cohort_depreciation_model_report.json`, `cohort_future_forecasts.csv`, `cohort_backtesting_results.csv`, and `cohort_backtesting_kpis.csv` to show validation metrics, filter-scoped current-price scoring, selected-VIN price predictions across trained current-price models, future cohort median-price forecasts by model family, and backtesting KPIs for time-series model comparison.
+`streamlit_app.py` provides an interactive UI over the cleaned database and generated model artifacts. Filters and primary labels use canonical identity; raw titles and NHTSA trims remain visible for comparison. The app reports normalization coverage, EPA matching, unresolved titles, and NHTSA identity disagreement, warns on a missing canonical schema, and disables predictions when database and model normalization versions differ.
 
 ## Validation and Testing
 
@@ -189,7 +193,8 @@ Recommended validation commands:
 python Utilities\health_check.py
 python Utilities\verify_schema.py
 python -m unittest tests\test_ml_upgrade.py
-python -m py_compile DataPipeline\Playwright_test.py DataPipeline\DataAquisition.py DataPipeline\DataCleaning.py DataPipeline\NHTSA_enrichment.py DataPipeline\SentimentAnalysis.py DataPipeline\absa_pipeline.py ML\Price_ML_Models.py ML\Time_Series_Price.py Utilities\health_check.py
+python -m unittest tests\test_vehicle_normalization.py
+python -m py_compile DataPipeline\Playwright_test.py DataPipeline\DataAquisition.py DataPipeline\DataCleaning.py DataPipeline\VehicleNormalization.py DataPipeline\NHTSA_enrichment.py DataPipeline\SentimentAnalysis.py DataPipeline\absa_pipeline.py ML\Price_ML_Models.py ML\Time_Series_Price.py Utilities\health_check.py Utilities\verify_schema.py
 ```
 
 `tests/test_ml_upgrade.py` currently checks:
@@ -240,7 +245,9 @@ python DataPipeline\absa_pipeline.py --run-all --force-reprocess
 Current-price modeling:
 
 ```powershell
-python ML\Price_ML_Models.py
+python ML\Price_ML_Models.py --sample-size 5000
+# Intentional full-data run:
+python ML\Price_ML_Models.py --sample-size 0
 ```
 
 Current-price plus depreciation modeling:

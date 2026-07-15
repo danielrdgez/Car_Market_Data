@@ -2,6 +2,7 @@ import logging
 import sqlite3
 import tempfile
 import unittest
+import zipfile
 from datetime import date, timedelta
 from pathlib import Path
 
@@ -365,7 +366,38 @@ def create_cleaned_gap_fixture_db(path: Path) -> None:
                 vehicleTitleDesc TEXT,
                 title_trim TEXT,
                 trim_combined TEXT,
-                trim_source TEXT
+                trim_source TEXT,
+                canonical_make TEXT,
+                canonical_model TEXT,
+                canonical_year INTEGER,
+                canonical_trim TEXT,
+                canonical_trim_source TEXT,
+                canonical_match_confidence TEXT,
+                epa_vehicle_id INTEGER,
+                normalization_version TEXT,
+                nhtsa_year_agrees BOOLEAN,
+                nhtsa_make_agrees BOOLEAN,
+                nhtsa_model_agrees BOOLEAN,
+                nhtsa_trim_agrees BOOLEAN
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE vehicle_identity (
+                vin TEXT PRIMARY KEY,
+                canonical_make TEXT,
+                canonical_model TEXT,
+                canonical_year INTEGER,
+                canonical_trim TEXT,
+                canonical_trim_source TEXT,
+                canonical_match_confidence TEXT,
+                epa_vehicle_id INTEGER,
+                normalization_version TEXT,
+                nhtsa_year_agrees BOOLEAN,
+                nhtsa_make_agrees BOOLEAN,
+                nhtsa_model_agrees BOOLEAN,
+                nhtsa_trim_agrees BOOLEAN
             )
             """
         )
@@ -410,7 +442,17 @@ def create_cleaned_gap_fixture_db(path: Path) -> None:
             """
             INSERT INTO listings VALUES (
                 'VIN1', '2026-01-05', '2026-01-05', 20000, 40000, 'Clean',
-                '2020 Toyota Camry LE', 'Clean sedan', 'LE', 'LE', 'title'
+                '2020 Toyota Camry LE', 'Clean sedan', 'LE', 'LE', 'title',
+                'TOYOTA', 'CAMRY', 2020, 'LE', 'title_alias', 'medium', NULL,
+                'title_epa_v1', 1, 1, 1, NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO vehicle_identity VALUES (
+                'VIN1', 'TOYOTA', 'CAMRY', 2020, 'LE', 'title_alias', 'medium', NULL,
+                'title_epa_v1', 1, 1, 1, NULL
             )
             """
         )
@@ -430,6 +472,68 @@ def create_cleaned_gap_fixture_db(path: Path) -> None:
 
 
 class DataCleaningUpgradeTests(unittest.TestCase):
+    def test_cleaning_retains_valid_make_outside_legacy_whitelist(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            raw_db = Path(tmp) / "raw.db"
+            cleaned_db = Path(tmp) / "cleaned.db"
+            create_raw_fixture_db(raw_db)
+            conn = sqlite3.connect(raw_db)
+            try:
+                conn.execute(
+                    "UPDATE nhtsa_enrichment SET nhtsa_Make='RIVIAN', nhtsa_Model='R1T'"
+                )
+                conn.execute("UPDATE listings SET title='2021 Rivian R1T Adventure'")
+                conn.commit()
+            finally:
+                conn.close()
+            DataCleaningPipeline(raw_db, cleaned_db).run()
+            logging.shutdown()
+            conn = sqlite3.connect(cleaned_db)
+            try:
+                self.assertEqual(
+                    conn.execute("SELECT canonical_make, canonical_model FROM listings").fetchone(),
+                    ("RIVIAN", "R1T"),
+                )
+            finally:
+                conn.close()
+
+    def test_cleaning_imports_epa_catalog_and_query_indexes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            raw_db = Path(tmp) / "raw.db"
+            cleaned_db = Path(tmp) / "cleaned.db"
+            create_raw_fixture_db(raw_db)
+            with zipfile.ZipFile(Path(tmp) / "vehicles.csv.zip", "w", zipfile.ZIP_DEFLATED) as archive:
+                archive.writestr(
+                    "vehicles.csv",
+                    "id,year,make,model,baseModel\n1,2021,Toyota,Camry,Camry\n",
+                )
+
+            DataCleaningPipeline(
+                raw_db,
+                cleaned_db,
+                epa_cache_dir=Path(tmp),
+                refresh_epa=False,
+                require_epa=True,
+            ).run()
+            logging.shutdown()
+
+            conn = sqlite3.connect(cleaned_db)
+            try:
+                self.assertEqual(conn.execute("SELECT COUNT(*) FROM epa_vehicle_catalog").fetchone()[0], 1)
+                self.assertEqual(conn.execute("SELECT COUNT(*) FROM vehicle_identity").fetchone()[0], 1)
+                epa_indexes = {row[1] for row in conn.execute("PRAGMA index_list('epa_vehicle_catalog')")}
+                self.assertIn("idx_epa_catalog_normalized_identity", epa_indexes)
+                listing = conn.execute(
+                    "SELECT canonical_make, canonical_model, canonical_trim, epa_vehicle_id FROM listings"
+                ).fetchone()
+                self.assertEqual(listing, ("TOYOTA", "CAMRY", "LE", 1))
+                self.assertEqual(
+                    conn.execute("SELECT COUNT(*) FROM listings WHERE canonical_trim IS NULL").fetchone()[0],
+                    0,
+                )
+            finally:
+                conn.close()
+
     def test_cleaning_preserves_predictive_listing_fields_and_indexes(self):
         with tempfile.TemporaryDirectory() as tmp:
             raw_db = Path(tmp) / "raw.db"
@@ -483,7 +587,7 @@ class DataCleaningUpgradeTests(unittest.TestCase):
             finally:
                 conn.close()
 
-    def test_cleaning_adds_title_trim_and_fills_missing_nhtsa_trim(self):
+    def test_cleaning_adds_canonical_trim_without_mutating_nhtsa_trim(self):
         with tempfile.TemporaryDirectory() as tmp:
             raw_db = Path(tmp) / "raw.db"
             cleaned_db = Path(tmp) / "cleaned.db"
@@ -501,7 +605,7 @@ class DataCleaningUpgradeTests(unittest.TestCase):
                     WHERE vin = 'VINTITLEGT350001'
                     """
                 ).fetchone()
-                self.assertEqual(listing_row, ("GT350", "GT350", "title"))
+                self.assertEqual(listing_row, ("GT350", "GT350", "title_alias"))
 
                 nhtsa_row = conn.execute(
                     """
@@ -510,7 +614,7 @@ class DataCleaningUpgradeTests(unittest.TestCase):
                     WHERE vin = 'VINTITLEGT350001'
                     """
                 ).fetchone()
-                self.assertEqual(nhtsa_row, ("GT350", "title", "GT350"))
+                self.assertEqual(nhtsa_row, (None, "unknown", "UNKNOWN_TRIM"))
             finally:
                 conn.close()
 
@@ -561,6 +665,10 @@ class ModelingUpgradeTests(unittest.TestCase):
                     "nhtsa_Make": "TOYOTA",
                     "nhtsa_Model": "CAMRY",
                     "nhtsa_ModelYear": 2020 + (idx % 3),
+                    "canonical_make": "TOYOTA",
+                    "canonical_model": "CAMRY",
+                    "canonical_year": 2020 + (idx % 3),
+                    "canonical_trim": "LE",
                     "nhtsa_BodyClass": "Sedan",
                     "nhtsa_FuelTypePrimary": "Gasoline",
                 }
@@ -588,13 +696,17 @@ class ModelingUpgradeTests(unittest.TestCase):
                         "nhtsa_Make": "FORD",
                         "nhtsa_Model": "MUSTANG",
                         "nhtsa_ModelYear": 2020,
+                        "canonical_make": "FORD",
+                        "canonical_model": "MUSTANG",
+                        "canonical_year": 2020,
+                        "canonical_trim": "GT350",
                         "nhtsa_BodyClass": "Coupe",
                         "nhtsa_FuelTypePrimary": "Gasoline",
                         "title_trim": "GT350",
                         "trim_combined": "GT350",
                         "trim_source": "title",
-                        "nhtsa_Trim": None,
-                        "nhtsa_trim_combined": "GT350",
+                        "nhtsa_Trim": "SHELBY",
+                        "nhtsa_trim_combined": "SHELBY_COUPE",
                     }
                 ]
             )
@@ -603,6 +715,9 @@ class ModelingUpgradeTests(unittest.TestCase):
         self.assertEqual(df.loc[0, "trim_proxy"], "GT350")
         self.assertEqual(df.loc[0, "make_model_year_trim"], "FORD_MUSTANG_2020_GT350")
         self.assertEqual(df.loc[0, "title_mentions_luxury_trim"], 1)
+        X, _, _ = make_feature_matrix(df)
+        self.assertNotIn("nhtsa_Trim", X.columns)
+        self.assertNotIn("nhtsa_trim_combined", X.columns)
 
     def test_current_price_feature_matrix_excludes_nhtsa_base_price(self):
         df = engineer_current_price_features(
@@ -617,6 +732,10 @@ class ModelingUpgradeTests(unittest.TestCase):
                         "nhtsa_Make": "TOYOTA",
                         "nhtsa_Model": "CAMRY",
                         "nhtsa_ModelYear": 2022,
+                        "canonical_make": "TOYOTA",
+                        "canonical_model": "CAMRY",
+                        "canonical_year": 2022,
+                        "canonical_trim": "LE",
                         "nhtsa_BodyClass": "Sedan",
                         "nhtsa_FuelTypePrimary": "Gasoline",
                         "nhtsa_BasePrice": 41000,
@@ -687,8 +806,8 @@ class ModelingUpgradeTests(unittest.TestCase):
         segments = pd.DataFrame(
             {
                 "price_band": ["under_25k"] * 500 + ["25k_50k"] * 300 + ["150k_plus"] * 200,
-                "nhtsa_Make": ["TOYOTA"] * 500 + ["FORD"] * 300 + ["PORSCHE"] * 200,
-                "nhtsa_ModelYear": [2020] * 500 + [2022] * 300 + [2024] * 200,
+                "canonical_make": ["TOYOTA"] * 500 + ["FORD"] * 300 + ["PORSCHE"] * 200,
+                "canonical_year": [2020] * 500 + [2022] * 300 + [2024] * 200,
             }
         )
 
@@ -697,7 +816,7 @@ class ModelingUpgradeTests(unittest.TestCase):
 
         self.assertEqual(len(positions), 100)
         self.assertEqual(set(sampled["price_band"]), {"under_25k", "25k_50k", "150k_plus"})
-        self.assertEqual(set(sampled["nhtsa_Make"]), {"TOYOTA", "FORD", "PORSCHE"})
+        self.assertEqual(set(sampled["canonical_make"]), {"TOYOTA", "FORD", "PORSCHE"})
 
     def test_gap_loader_labels_duplicate_like_history(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -820,6 +939,10 @@ class ModelingUpgradeTests(unittest.TestCase):
                     "nhtsa_Make": "TOYOTA",
                     "nhtsa_Model": "CAMRY",
                     "nhtsa_ModelYear": 2022,
+                    "canonical_make": "TOYOTA",
+                    "canonical_model": "CAMRY",
+                    "canonical_year": 2022,
+                    "canonical_trim": "XSE",
                     "nhtsa_BodyClass": "Sedan",
                     "nhtsa_DriveType": "4x2",
                     "nhtsa_FuelTypePrimary": "Gasoline",
@@ -872,6 +995,10 @@ class ModelingUpgradeTests(unittest.TestCase):
                     "nhtsa_Make": "FERRARI",
                     "nhtsa_Model": "458",
                     "nhtsa_ModelYear": 2020,
+                    "canonical_make": "FERRARI",
+                    "canonical_model": "458",
+                    "canonical_year": 2020,
+                    "canonical_trim": "SPIDER",
                     "nhtsa_BodyClass": "Convertible/Cabriolet",
                     "nhtsa_DriveType": "RWD",
                     "nhtsa_FuelTypePrimary": "Gasoline",

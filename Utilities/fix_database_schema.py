@@ -18,13 +18,15 @@ import logging
 from datetime import datetime
 import shutil
 import os
+from pathlib import Path
 
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 
-DB_PATH = r"C:\Users\danie\Code\Car-Price-Data-Visualization-Learning\CAR_DATA_OUTPUT\CAR_DATA.db"
+BASE_DIR = Path(__file__).resolve().parent.parent
+DB_PATH = BASE_DIR / "CAR_DATA_OUTPUT" / "CAR_DATA.db"
 
 
 def backup_database():
@@ -33,7 +35,9 @@ def backup_database():
         logging.error(f"Database not found: {DB_PATH}")
         return False
 
-    backup_path = DB_PATH.replace('.db', f'_backup_{datetime.now().strftime("%Y%m%d_%H%M%S")}.db')
+    backup_path = DB_PATH.with_name(
+        f"{DB_PATH.stem}_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.db"
+    )
     try:
         shutil.copy2(DB_PATH, backup_path)
         logging.info(f"Backup created: {backup_path}")
@@ -162,6 +166,10 @@ def get_stats():
 def main():
     """Main migration process"""
     print("Running schema migration...")
+    print(
+        "Note: canonical identity columns and EPA tables are derived fields; create them by "
+        "rerunning DataPipeline/DataCleaning.py, not by ALTER TABLE."
+    )
     logging.info("="*60)
     logging.info("Database Schema Migration Tool")
     logging.info("="*60)
