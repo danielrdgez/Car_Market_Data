@@ -50,6 +50,8 @@ If touching this file:
    - `listing_history`: normalized listing history rows.
    - `nhtsa_enrichment`: VIN-level official metadata and safety/recall/complaint fields.
 5. Prefer additive schema changes and update tests/docs with any schema change.
+6. Canonical make/model use NHTSA anchors when present; title parsing verifies them and exclusively supplies canonical trim.
+7. Keep EPA refresh/cache behavior conditional, atomic, offline-capable, and versioned.
 
 ## 5. Modeling and Research Standards
 
@@ -60,6 +62,7 @@ If touching this file:
 5. Set random seeds for ML, sampling, and search procedures.
 6. Report row counts, split strategy, metrics, caveats, and research rationale in model reports.
 7. Verify new research claims against current primary sources, official documentation, or peer-reviewed papers.
+8. Routine verification must not train production models; cap any explicitly needed smoke run at 5,000 rows.
 
 ## 6. Style and Hygiene Rules
 

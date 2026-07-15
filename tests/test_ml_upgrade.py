@@ -2,6 +2,7 @@ import logging
 import sqlite3
 import tempfile
 import unittest
+import zipfile
 from datetime import date, timedelta
 from pathlib import Path
 
@@ -10,17 +11,28 @@ import pandas as pd
 
 from DataPipeline.DataCleaning import DataCleaningPipeline
 from ML.Price_ML_Models import (
+    HighValueRoutedRegressor,
     MAX_PARALLEL_TUNING_ROWS,
+    PRICE_LEAKAGE_FEATURE_COLUMNS as CURRENT_PRICE_LEAKAGE_FEATURE_COLUMNS,
+    build_preprocessors,
     engineer_current_price_features,
+    get_preprocessor_feature_names,
+    make_feature_matrix,
+    model_candidates,
     split_train_test,
     stratified_tuning_sample_positions,
     tuning_search_n_jobs,
 )
+from ML.Time_Series_Price import CATEGORICAL_FEATURES as DEPRECIATION_CATEGORICAL_FEATURES
+from ML.Time_Series_Price import DEFAULT_MAX_PRICE
+from ML.Time_Series_Price import NUMERIC_FEATURES as DEPRECIATION_NUMERIC_FEATURES
+from ML.Time_Series_Price import PRICE_LEAKAGE_FEATURE_COLUMNS as DEPRECIATION_PRICE_LEAKAGE_FEATURE_COLUMNS
+from ML.Time_Series_Price import backtesting_kpi_frame
 from ML.Time_Series_Price import build_cohort_monthly_frame
 from ML.Time_Series_Price import clean_history_frame
 from ML.Time_Series_Price import load_gap_frame
-from ML.Time_Series_Price import clean_history_frame
 from ML.Time_Series_Price import load_history_frame
+from ML.Time_Series_Price import parse_model_families
 from ML.Time_Series_Price import stratified_depreciation_tuning_sample_positions
 
 
@@ -354,7 +366,38 @@ def create_cleaned_gap_fixture_db(path: Path) -> None:
                 vehicleTitleDesc TEXT,
                 title_trim TEXT,
                 trim_combined TEXT,
-                trim_source TEXT
+                trim_source TEXT,
+                canonical_make TEXT,
+                canonical_model TEXT,
+                canonical_year INTEGER,
+                canonical_trim TEXT,
+                canonical_trim_source TEXT,
+                canonical_match_confidence TEXT,
+                epa_vehicle_id INTEGER,
+                normalization_version TEXT,
+                nhtsa_year_agrees BOOLEAN,
+                nhtsa_make_agrees BOOLEAN,
+                nhtsa_model_agrees BOOLEAN,
+                nhtsa_trim_agrees BOOLEAN
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE vehicle_identity (
+                vin TEXT PRIMARY KEY,
+                canonical_make TEXT,
+                canonical_model TEXT,
+                canonical_year INTEGER,
+                canonical_trim TEXT,
+                canonical_trim_source TEXT,
+                canonical_match_confidence TEXT,
+                epa_vehicle_id INTEGER,
+                normalization_version TEXT,
+                nhtsa_year_agrees BOOLEAN,
+                nhtsa_make_agrees BOOLEAN,
+                nhtsa_model_agrees BOOLEAN,
+                nhtsa_trim_agrees BOOLEAN
             )
             """
         )
@@ -399,7 +442,17 @@ def create_cleaned_gap_fixture_db(path: Path) -> None:
             """
             INSERT INTO listings VALUES (
                 'VIN1', '2026-01-05', '2026-01-05', 20000, 40000, 'Clean',
-                '2020 Toyota Camry LE', 'Clean sedan', 'LE', 'LE', 'title'
+                '2020 Toyota Camry LE', 'Clean sedan', 'LE', 'LE', 'title',
+                'TOYOTA', 'CAMRY', 2020, 'LE', 'title_alias', 'medium', NULL,
+                'title_epa_v1', 1, 1, 1, NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO vehicle_identity VALUES (
+                'VIN1', 'TOYOTA', 'CAMRY', 2020, 'LE', 'title_alias', 'medium', NULL,
+                'title_epa_v1', 1, 1, 1, NULL
             )
             """
         )
@@ -419,6 +472,68 @@ def create_cleaned_gap_fixture_db(path: Path) -> None:
 
 
 class DataCleaningUpgradeTests(unittest.TestCase):
+    def test_cleaning_retains_valid_make_outside_legacy_whitelist(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            raw_db = Path(tmp) / "raw.db"
+            cleaned_db = Path(tmp) / "cleaned.db"
+            create_raw_fixture_db(raw_db)
+            conn = sqlite3.connect(raw_db)
+            try:
+                conn.execute(
+                    "UPDATE nhtsa_enrichment SET nhtsa_Make='RIVIAN', nhtsa_Model='R1T'"
+                )
+                conn.execute("UPDATE listings SET title='2021 Rivian R1T Adventure'")
+                conn.commit()
+            finally:
+                conn.close()
+            DataCleaningPipeline(raw_db, cleaned_db).run()
+            logging.shutdown()
+            conn = sqlite3.connect(cleaned_db)
+            try:
+                self.assertEqual(
+                    conn.execute("SELECT canonical_make, canonical_model FROM listings").fetchone(),
+                    ("RIVIAN", "R1T"),
+                )
+            finally:
+                conn.close()
+
+    def test_cleaning_imports_epa_catalog_and_query_indexes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            raw_db = Path(tmp) / "raw.db"
+            cleaned_db = Path(tmp) / "cleaned.db"
+            create_raw_fixture_db(raw_db)
+            with zipfile.ZipFile(Path(tmp) / "vehicles.csv.zip", "w", zipfile.ZIP_DEFLATED) as archive:
+                archive.writestr(
+                    "vehicles.csv",
+                    "id,year,make,model,baseModel\n1,2021,Toyota,Camry,Camry\n",
+                )
+
+            DataCleaningPipeline(
+                raw_db,
+                cleaned_db,
+                epa_cache_dir=Path(tmp),
+                refresh_epa=False,
+                require_epa=True,
+            ).run()
+            logging.shutdown()
+
+            conn = sqlite3.connect(cleaned_db)
+            try:
+                self.assertEqual(conn.execute("SELECT COUNT(*) FROM epa_vehicle_catalog").fetchone()[0], 1)
+                self.assertEqual(conn.execute("SELECT COUNT(*) FROM vehicle_identity").fetchone()[0], 1)
+                epa_indexes = {row[1] for row in conn.execute("PRAGMA index_list('epa_vehicle_catalog')")}
+                self.assertIn("idx_epa_catalog_normalized_identity", epa_indexes)
+                listing = conn.execute(
+                    "SELECT canonical_make, canonical_model, canonical_trim, epa_vehicle_id FROM listings"
+                ).fetchone()
+                self.assertEqual(listing, ("TOYOTA", "CAMRY", "LE", 1))
+                self.assertEqual(
+                    conn.execute("SELECT COUNT(*) FROM listings WHERE canonical_trim IS NULL").fetchone()[0],
+                    0,
+                )
+            finally:
+                conn.close()
+
     def test_cleaning_preserves_predictive_listing_fields_and_indexes(self):
         with tempfile.TemporaryDirectory() as tmp:
             raw_db = Path(tmp) / "raw.db"
@@ -472,7 +587,7 @@ class DataCleaningUpgradeTests(unittest.TestCase):
             finally:
                 conn.close()
 
-    def test_cleaning_adds_title_trim_and_fills_missing_nhtsa_trim(self):
+    def test_cleaning_adds_canonical_trim_without_mutating_nhtsa_trim(self):
         with tempfile.TemporaryDirectory() as tmp:
             raw_db = Path(tmp) / "raw.db"
             cleaned_db = Path(tmp) / "cleaned.db"
@@ -490,7 +605,7 @@ class DataCleaningUpgradeTests(unittest.TestCase):
                     WHERE vin = 'VINTITLEGT350001'
                     """
                 ).fetchone()
-                self.assertEqual(listing_row, ("GT350", "GT350", "title"))
+                self.assertEqual(listing_row, ("GT350", "GT350", "title_alias"))
 
                 nhtsa_row = conn.execute(
                     """
@@ -499,7 +614,7 @@ class DataCleaningUpgradeTests(unittest.TestCase):
                     WHERE vin = 'VINTITLEGT350001'
                     """
                 ).fetchone()
-                self.assertEqual(nhtsa_row, ("GT350", "title", "GT350"))
+                self.assertEqual(nhtsa_row, (None, "unknown", "UNKNOWN_TRIM"))
             finally:
                 conn.close()
 
@@ -550,6 +665,10 @@ class ModelingUpgradeTests(unittest.TestCase):
                     "nhtsa_Make": "TOYOTA",
                     "nhtsa_Model": "CAMRY",
                     "nhtsa_ModelYear": 2020 + (idx % 3),
+                    "canonical_make": "TOYOTA",
+                    "canonical_model": "CAMRY",
+                    "canonical_year": 2020 + (idx % 3),
+                    "canonical_trim": "LE",
                     "nhtsa_BodyClass": "Sedan",
                     "nhtsa_FuelTypePrimary": "Gasoline",
                 }
@@ -577,13 +696,17 @@ class ModelingUpgradeTests(unittest.TestCase):
                         "nhtsa_Make": "FORD",
                         "nhtsa_Model": "MUSTANG",
                         "nhtsa_ModelYear": 2020,
+                        "canonical_make": "FORD",
+                        "canonical_model": "MUSTANG",
+                        "canonical_year": 2020,
+                        "canonical_trim": "GT350",
                         "nhtsa_BodyClass": "Coupe",
                         "nhtsa_FuelTypePrimary": "Gasoline",
                         "title_trim": "GT350",
                         "trim_combined": "GT350",
                         "trim_source": "title",
-                        "nhtsa_Trim": None,
-                        "nhtsa_trim_combined": "GT350",
+                        "nhtsa_Trim": "SHELBY",
+                        "nhtsa_trim_combined": "SHELBY_COUPE",
                     }
                 ]
             )
@@ -592,6 +715,88 @@ class ModelingUpgradeTests(unittest.TestCase):
         self.assertEqual(df.loc[0, "trim_proxy"], "GT350")
         self.assertEqual(df.loc[0, "make_model_year_trim"], "FORD_MUSTANG_2020_GT350")
         self.assertEqual(df.loc[0, "title_mentions_luxury_trim"], 1)
+        X, _, _ = make_feature_matrix(df)
+        self.assertNotIn("nhtsa_Trim", X.columns)
+        self.assertNotIn("nhtsa_trim_combined", X.columns)
+
+    def test_current_price_feature_matrix_excludes_nhtsa_base_price(self):
+        df = engineer_current_price_features(
+            pd.DataFrame(
+                [
+                    {
+                        "vin": "VINBASEPRICE0001",
+                        "loaddate": date(2026, 1, 5),
+                        "date": date(2026, 1, 4),
+                        "price": 42000,
+                        "mileage": 18000,
+                        "nhtsa_Make": "TOYOTA",
+                        "nhtsa_Model": "CAMRY",
+                        "nhtsa_ModelYear": 2022,
+                        "canonical_make": "TOYOTA",
+                        "canonical_model": "CAMRY",
+                        "canonical_year": 2022,
+                        "canonical_trim": "LE",
+                        "nhtsa_BodyClass": "Sedan",
+                        "nhtsa_FuelTypePrimary": "Gasoline",
+                        "nhtsa_BasePrice": 41000,
+                        "nhtsa_BasePrice_source": "price_history",
+                    }
+                ]
+            )
+        )
+
+        X, _, _ = make_feature_matrix(df)
+
+        self.assertTrue(CURRENT_PRICE_LEAKAGE_FEATURE_COLUMNS.isdisjoint(X.columns))
+
+    def test_depreciation_feature_allowlists_exclude_nhtsa_base_price(self):
+        depreciation_features = set(DEPRECIATION_CATEGORICAL_FEATURES + DEPRECIATION_NUMERIC_FEATURES)
+
+        self.assertTrue(DEPRECIATION_PRICE_LEAKAGE_FEATURE_COLUMNS.isdisjoint(depreciation_features))
+
+    def test_target_encoded_feature_names_map_to_source_columns(self):
+        X = pd.DataFrame(
+            {
+                "mileage": [10_000, 20_000, 30_000, 40_000],
+                "nhtsa_Make": ["TOYOTA", "FORD", "HONDA", "BMW"],
+                "nhtsa_Model": ["CAMRY", "F-150", "ACCORD", "X5"],
+                "trim_proxy": ["LE", "XLT", "EX", "M SPORT"],
+                "body_class": ["Sedan", "Truck", "Sedan", "SUV"],
+            }
+        )
+        y = pd.Series([25_000, 42_000, 28_000, 65_000])
+        tree_preprocessor, _, _ = build_preprocessors(X)
+        tree_preprocessor.fit(X, y)
+
+        feature_names = get_preprocessor_feature_names(
+            tree_preprocessor,
+            tree_preprocessor.transform(X).shape[1],
+        )
+
+        self.assertIn("target_encoded__nhtsa_Make", feature_names)
+        self.assertIn("target_encoded__nhtsa_Model", feature_names)
+        self.assertIn("target_encoded__trim_proxy", feature_names)
+        self.assertFalse(any(name.startswith("cat_high__") and name.split("__", 1)[1].isdigit() for name in feature_names))
+
+    def test_current_price_candidates_are_all_high_value_routed_without_prefixes(self):
+        X = pd.DataFrame(
+            {
+                "mileage": [10_000, 20_000, 30_000, 40_000],
+                "nhtsa_Make": ["TOYOTA", "FORD", "BMW", "PORSCHE"],
+                "nhtsa_Model": ["CAMRY", "F-150", "X5", "911"],
+                "trim_proxy": ["LE", "XLT", "M SPORT", "TURBO"],
+                "body_class": ["Sedan", "Truck", "SUV", "Coupe"],
+            }
+        )
+        tree_preprocessor, linear_preprocessor, _ = build_preprocessors(X)
+
+        candidates = model_candidates(tree_preprocessor, linear_preprocessor)
+
+        self.assertEqual(set(candidates), {"Ridge", "ElasticNet", "LightGBM", "RandomForest"})
+        for name, (pipeline, param_grid) in candidates.items():
+            self.assertIsInstance(pipeline.named_steps["model"], HighValueRoutedRegressor)
+            self.assertFalse(name.startswith(("Readable_", "Tree_", "Advanced_", "Segmented_")))
+            self.assertIn("model__probability_cutoff", param_grid)
 
     def test_large_cv_search_uses_single_process_to_avoid_pickling_pressure(self):
         self.assertEqual(tuning_search_n_jobs(MAX_PARALLEL_TUNING_ROWS), -1)
@@ -601,8 +806,8 @@ class ModelingUpgradeTests(unittest.TestCase):
         segments = pd.DataFrame(
             {
                 "price_band": ["under_25k"] * 500 + ["25k_50k"] * 300 + ["150k_plus"] * 200,
-                "nhtsa_Make": ["TOYOTA"] * 500 + ["FORD"] * 300 + ["PORSCHE"] * 200,
-                "nhtsa_ModelYear": [2020] * 500 + [2022] * 300 + [2024] * 200,
+                "canonical_make": ["TOYOTA"] * 500 + ["FORD"] * 300 + ["PORSCHE"] * 200,
+                "canonical_year": [2020] * 500 + [2022] * 300 + [2024] * 200,
             }
         )
 
@@ -611,7 +816,7 @@ class ModelingUpgradeTests(unittest.TestCase):
 
         self.assertEqual(len(positions), 100)
         self.assertEqual(set(sampled["price_band"]), {"under_25k", "25k_50k", "150k_plus"})
-        self.assertEqual(set(sampled["nhtsa_Make"]), {"TOYOTA", "FORD", "PORSCHE"})
+        self.assertEqual(set(sampled["canonical_make"]), {"TOYOTA", "FORD", "PORSCHE"})
 
     def test_gap_loader_labels_duplicate_like_history(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -656,6 +861,63 @@ class ModelingUpgradeTests(unittest.TestCase):
         self.assertEqual(set(sampled["make"]), {"TOYOTA", "FORD", "PORSCHE"})
         self.assertEqual(set(sampled["trim_proxy"]), {"LE", "XLT", "BASE"})
 
+    def test_depreciation_model_family_parser_rejects_unknown_models(self):
+        self.assertEqual(parse_model_families("global_ml,sarimax,prophet,timesfm"), [
+            "global_ml",
+            "sarimax",
+            "prophet",
+            "timesfm",
+        ])
+        with self.assertRaises(ValueError):
+            parse_model_families("global_ml,not_a_model")
+
+    def test_backtesting_kpi_frame_reports_model_and_cohort_scopes(self):
+        rows = pd.DataFrame(
+            [
+                {
+                    "model_key": "target_depreciation_pct_1m",
+                    "model_family": "global_ml",
+                    "forecast_method": "recursive_global_ml_model",
+                    "forecast_month": 1,
+                    "make": "TOYOTA",
+                    "model": "CAMRY",
+                    "model_year": 2022,
+                    "trim_proxy": "LE",
+                    "cohort_id": "TOYOTA|CAMRY|2022|LE",
+                    "observed_median_price": 30000,
+                    "actual_median_price": 29000,
+                    "predicted_median_price": 29200,
+                    "actual_depreciation_pct": -1000 / 30000,
+                    "predicted_depreciation_pct": -800 / 30000,
+                },
+                {
+                    "model_key": "target_depreciation_pct_1m",
+                    "model_family": "global_ml",
+                    "forecast_method": "recursive_global_ml_model",
+                    "forecast_month": 1,
+                    "make": "HONDA",
+                    "model": "ACCORD",
+                    "model_year": 2021,
+                    "trim_proxy": "EX",
+                    "cohort_id": "HONDA|ACCORD|2021|EX",
+                    "observed_median_price": 28000,
+                    "actual_median_price": 27400,
+                    "predicted_median_price": 27600,
+                    "actual_depreciation_pct": -600 / 28000,
+                    "predicted_depreciation_pct": -400 / 28000,
+                },
+            ]
+        )
+
+        kpis = backtesting_kpi_frame(rows)
+        scopes = set(kpis["kpi_scope"])
+        summary = kpis[kpis["kpi_scope"].eq("model_horizon")].iloc[0]
+
+        self.assertEqual(scopes, {"model_horizon", "cohort_horizon"})
+        self.assertEqual(summary["backtest_rows"], 2)
+        self.assertEqual(summary["backtest_cohorts"], 2)
+        self.assertIn("future_price_mae_skill_vs_naive", kpis.columns)
+
     def test_depreciation_frame_uses_cleaned_trim_and_monthly_target(self):
         rows = []
         for idx, month in enumerate(pd.date_range("2025-01-10", periods=4, freq="MS")):
@@ -677,6 +939,10 @@ class ModelingUpgradeTests(unittest.TestCase):
                     "nhtsa_Make": "TOYOTA",
                     "nhtsa_Model": "CAMRY",
                     "nhtsa_ModelYear": 2022,
+                    "canonical_make": "TOYOTA",
+                    "canonical_model": "CAMRY",
+                    "canonical_year": 2022,
+                    "canonical_trim": "XSE",
                     "nhtsa_BodyClass": "Sedan",
                     "nhtsa_DriveType": "4x2",
                     "nhtsa_FuelTypePrimary": "Gasoline",
@@ -706,6 +972,63 @@ class ModelingUpgradeTests(unittest.TestCase):
         self.assertIn("target_depreciation_pct_1m", monthly.columns)
         self.assertNotIn("target_depreciation_pct_30d", monthly.columns)
         self.assertEqual(monthly["month_start"].dt.day.unique().tolist(), [1])
+
+    def test_depreciation_default_preserves_high_value_future_origin_months(self):
+        rows = []
+        prices = [235000, 265000, 325000, 410000]
+        for idx, (month, price) in enumerate(zip(pd.date_range("2026-01-01", periods=4, freq="MS"), prices)):
+            rows.append(
+                {
+                    "vin": "VINHIGHVALUE001",
+                    "history_date": month,
+                    "mileage": 8000 + idx * 250,
+                    "price": price,
+                    "trend": "none",
+                    "title": "2020 Ferrari 458 Spider",
+                    "vehicleTitle": "Clean",
+                    "vehicleTitleDesc": "Clean title",
+                    "trim_combined": "SPIDER",
+                    "nhtsa_trim_combined": "SPIDER",
+                    "title_trim": "SPIDER",
+                    "nhtsa_Trim": "SPIDER",
+                    "nhtsa_Trim2": None,
+                    "nhtsa_Make": "FERRARI",
+                    "nhtsa_Model": "458",
+                    "nhtsa_ModelYear": 2020,
+                    "canonical_make": "FERRARI",
+                    "canonical_model": "458",
+                    "canonical_year": 2020,
+                    "canonical_trim": "SPIDER",
+                    "nhtsa_BodyClass": "Convertible/Cabriolet",
+                    "nhtsa_DriveType": "RWD",
+                    "nhtsa_FuelTypePrimary": "Gasoline",
+                    "nhtsa_ElectrificationLevel": None,
+                    "sellerType": "Dealer",
+                    "sourceName": "autotempest",
+                    "nhtsa_EngineHP": 570,
+                    "nhtsa_EngineCylinders": 8,
+                    "nhtsa_total_recalls": 0,
+                    "nhtsa_total_complaints": 0,
+                    "sentiment_score": None,
+                    "sentiment_comment_count": 0,
+                    "sentiment_video_count": 0,
+                }
+            )
+
+        default_history = clean_history_frame(pd.DataFrame(rows), max_price=DEFAULT_MAX_PRICE)
+        default_monthly = build_cohort_monthly_frame(
+            default_history,
+            target_months=[1],
+            min_monthly_vins=1,
+            min_cohort_months=3,
+        )
+
+        capped_history = clean_history_frame(pd.DataFrame(rows), max_price=250000)
+
+        self.assertEqual(DEFAULT_MAX_PRICE, 0)
+        self.assertEqual(default_monthly["month_start"].max(), pd.Timestamp("2026-04-01"))
+        self.assertEqual(default_monthly.shape[0], 4)
+        self.assertEqual(capped_history["history_date"].max(), pd.Timestamp("2026-01-01"))
 
 
 if __name__ == "__main__":

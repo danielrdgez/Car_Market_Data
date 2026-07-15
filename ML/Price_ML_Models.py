@@ -58,6 +58,7 @@ RANDOM_FOREST_FULL_FIT_MAX_ROWS = 300_000
 RANDOM_FOREST_MAX_CATEGORIES_PER_FEATURE = 25
 RANDOM_FOREST_MAX_LEAF_NODES = 32_768
 MAX_MODEL_WEIGHT_ROWS = 40
+READABLE_MODEL_WEIGHT_REPORT_ROWS = 30
 
 DROP_FEATURE_COLUMNS = {
     "price",
@@ -66,6 +67,13 @@ DROP_FEATURE_COLUMNS = {
     "date",
     "loaddate",
     "Vehicle_Entity",
+    "title",
+    "canonical_title",
+}
+
+PRICE_LEAKAGE_FEATURE_COLUMNS = {
+    "nhtsa_BasePrice",
+    "nhtsa_BasePrice_source",
 }
 
 TARGET_ENCODE_TOKENS = (
@@ -78,15 +86,10 @@ TARGET_ENCODE_TOKENS = (
     "location",
 )
 
-TRIM_FEATURE_CANDIDATES = [
-    "trim_combined",
-    "nhtsa_trim_combined",
-    "nhtsa_Trim",
-    "nhtsa_Trim2",
-    "title_trim",
-]
+TRIM_FEATURE_CANDIDATES = ["canonical_trim"]
 
 TRIM_METADATA_COLUMNS = [
+    "canonical_trim",
     "title_trim",
     "trim_combined",
     "trim_source",
@@ -95,6 +98,45 @@ TRIM_METADATA_COLUMNS = [
     "nhtsa_Trim_source",
     "nhtsa_trim_combined",
 ]
+
+IDENTITY_DIAGNOSTIC_COLUMNS = {
+    "title_trim",
+    "trim_combined",
+    "trim_source",
+    "nhtsa_Trim",
+    "nhtsa_Trim2",
+    "nhtsa_Trim_source",
+    "nhtsa_trim_combined",
+    "nhtsa_Make",
+    "nhtsa_Model",
+    "nhtsa_ModelYear",
+    "canonical_trim_raw",
+    "canonical_trim_source",
+    "canonical_match_confidence",
+    "canonical_match_status",
+    "epa_vehicle_id",
+    "epa_match_status",
+    "normalization_version",
+    "nhtsa_year_agrees",
+    "nhtsa_make_agrees",
+    "nhtsa_model_agrees",
+    "nhtsa_trim_agrees",
+}
+
+
+def assert_canonical_identity_contract(feature_df: pd.DataFrame) -> None:
+    """Fail fast if a legacy trim can enter the price-model feature matrix."""
+    forbidden = {
+        "nhtsa_Trim", "nhtsa_Trim2", "nhtsa_trim_combined", "trim_combined",
+        "title_trim", "trim_source", "canonical_trim_raw", "canonical_trim_source",
+        "canonical_match_confidence", "canonical_match_status", "epa_vehicle_id",
+        "epa_match_status", "nhtsa_trim_agrees",
+    }
+    leaked = sorted(forbidden.intersection(feature_df.columns))
+    if leaked:
+        raise AssertionError("Non-canonical trim metadata entered the feature matrix: " + ", ".join(leaked))
+    if "canonical_trim" not in feature_df.columns:
+        raise AssertionError("canonical_trim must be present in the price-model feature matrix")
 
 RESEARCH_REFERENCES = [
     {
@@ -120,6 +162,41 @@ def normalize_trim_feature(value: Any, fallback: str = "UNKNOWN_TRIM") -> str:
         return fallback
     text = str(value).strip().upper().replace(" ", "_")
     return text if text and text not in {"NA", "N_A", "NONE", "NULL", "UNKNOWN"} else fallback
+
+
+def identity_normalization_profile(df: pd.DataFrame) -> dict[str, Any]:
+    """Summarize the canonical identity contract recorded with model outputs."""
+    total = max(int(df.shape[0]), 1)
+
+    def distribution(column: str) -> dict[str, int]:
+        if column not in df.columns:
+            return {}
+        return {
+            str(key): int(value)
+            for key, value in df[column].fillna("NULL").astype("string").value_counts().items()
+        }
+
+    canonical_trim = df.get("canonical_trim", pd.Series(index=df.index, dtype="string")).astype("string")
+    unresolved = canonical_trim.fillna("UNKNOWN_TRIM").eq("UNKNOWN_TRIM")
+    epa_matched = df.get("epa_vehicle_id", pd.Series(index=df.index, dtype="object")).notna()
+    disagreements = {}
+    for column in ["nhtsa_year_agrees", "nhtsa_make_agrees", "nhtsa_model_agrees", "nhtsa_trim_agrees"]:
+        if column in df.columns:
+            observed = df[column].dropna()
+            disagreements[column] = {
+                "observed_rows": int(observed.shape[0]),
+                "disagreement_rate": float((observed == 0).mean()) if not observed.empty else None,
+            }
+    return {
+        "versions": distribution("normalization_version"),
+        "trim_coverage_rate": float(1 - unresolved.sum() / total),
+        "unresolved_rows": int(unresolved.sum()),
+        "source_distribution": distribution("canonical_trim_source"),
+        "confidence_distribution": distribution("canonical_match_confidence"),
+        "epa_match_rate": float(epa_matched.sum() / total),
+        "nhtsa_disagreement": disagreements,
+        "identity_precedence": "NHTSA make/model anchors; title-derived trim; EPA validation/standardization",
+    }
 
 
 def parse_args() -> argparse.Namespace:
@@ -285,7 +362,11 @@ def load_modeling_frame(
     try:
         profile = build_data_profile(conn, sample_size, sample_strategy)
         listings_cols = _table_columns(conn, "listings")
-        nhtsa_cols = [c for c in _table_columns(conn, "nhtsa_enrichment") if c != "vin"]
+        nhtsa_cols = [
+            c
+            for c in _table_columns(conn, "nhtsa_enrichment")
+            if c != "vin" and c not in PRICE_LEAKAGE_FEATURE_COLUMNS
+        ]
 
         listing_select = [f"l.{c}" for c in listings_cols]
         nhtsa_select = [f"n.{c}" for c in nhtsa_cols]
@@ -297,8 +378,8 @@ def load_modeling_frame(
                 conn.execute("ATTACH DATABASE ? AS absa", (str(absa_db_path),))
                 if _table_exists(conn, "absa.Vehicle_Sentiment_Index"):
                     entity_expr = (
-                        "CAST(n.nhtsa_ModelYear AS TEXT) || ' ' || "
-                        "n.nhtsa_Make || ' ' || n.nhtsa_Model"
+                        "CAST(l.canonical_year AS TEXT) || ' ' || "
+                        "l.canonical_make || ' ' || l.canonical_model"
                     )
                     query_cols.extend(
                         [
@@ -340,6 +421,12 @@ def load_modeling_frame(
 def engineer_current_price_features(df: pd.DataFrame) -> pd.DataFrame:
     """Create derived features from cleaned listing and NHTSA columns."""
     df = df.copy()
+    required_identity = {"canonical_make", "canonical_model", "canonical_year", "canonical_trim"}
+    missing_identity = sorted(required_identity - set(df.columns))
+    if missing_identity:
+        raise ValueError(
+            "Cleaned database lacks canonical identity columns: " + ", ".join(missing_identity)
+        )
     df["price"] = pd.to_numeric(df["price"], errors="coerce")
     df["mileage"] = pd.to_numeric(df["mileage"], errors="coerce")
     df = df[df["price"].notna() & (df["price"] > 0)]
@@ -349,7 +436,7 @@ def engineer_current_price_features(df: pd.DataFrame) -> pd.DataFrame:
         if col in df.columns:
             df[col] = pd.to_datetime(df[col], errors="coerce")
 
-    model_year_col = "nhtsa_ModelYear"
+    model_year_col = "canonical_year"
     if model_year_col in df.columns:
         model_year = pd.to_numeric(df[model_year_col], errors="coerce")
         df["vehicle_age"] = (datetime.now().year - model_year).clip(lower=0)
@@ -446,9 +533,9 @@ def engineer_current_price_features(df: pd.DataFrame) -> pd.DataFrame:
             na=False,
         ).astype("int8")
 
-    make = df.get("nhtsa_Make", pd.Series("UNKNOWN", index=df.index)).astype("string").fillna("UNKNOWN")
-    model = df.get("nhtsa_Model", pd.Series("UNKNOWN", index=df.index)).astype("string").fillna("UNKNOWN")
-    year = df.get("nhtsa_ModelYear", pd.Series("UNKNOWN", index=df.index)).astype("string").fillna("UNKNOWN")
+    make = df["canonical_make"].astype("string").fillna("UNKNOWN")
+    model = df["canonical_model"].astype("string").fillna("UNKNOWN")
+    year = pd.to_numeric(df["canonical_year"], errors="coerce").astype("Int64").astype("string").fillna("UNKNOWN")
     body = df.get("nhtsa_BodyClass", pd.Series("UNKNOWN", index=df.index)).astype("string").fillna("UNKNOWN")
     fuel = df.get("nhtsa_FuelTypePrimary", pd.Series("UNKNOWN", index=df.index)).astype("string").fillna("UNKNOWN")
 
@@ -537,8 +624,10 @@ def split_train_test(
 
 def make_feature_matrix(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series, pd.DataFrame]:
     y = df["price"].astype("float64")
-    feature_df = df.drop(columns=[c for c in DROP_FEATURE_COLUMNS if c in df.columns], errors="ignore")
-    return feature_df, y, df[["vin", "price", "price_band", "nhtsa_Make", "nhtsa_ModelYear"]].copy()
+    drop_columns = DROP_FEATURE_COLUMNS | PRICE_LEAKAGE_FEATURE_COLUMNS | IDENTITY_DIAGNOSTIC_COLUMNS
+    feature_df = df.drop(columns=[c for c in drop_columns if c in df.columns], errors="ignore")
+    assert_canonical_identity_contract(feature_df)
+    return feature_df, y, df[["vin", "price", "price_band", "canonical_make", "canonical_year"]].copy()
 
 
 def to_float32(X: Any) -> Any:
@@ -628,20 +717,49 @@ class HighValueRoutedRegressor(BaseEstimator, RegressorMixin):
 
     def __init__(
         self,
+        regressor: BaseEstimator | None = None,
         threshold: int = HIGH_VALUE_THRESHOLD,
         probability_cutoff: float = 0.35,
         min_high_value_rows: int = 50,
         random_state: int = RANDOM_STATE,
     ):
+        self.regressor = regressor
         self.threshold = threshold
         self.probability_cutoff = probability_cutoff
         self.min_high_value_rows = min_high_value_rows
         self.random_state = random_state
 
-    def fit(self, X: pd.DataFrame, y: pd.Series) -> "HighValueRoutedRegressor":
+    def _default_regressor(self) -> TransformedTargetRegressor:
+        return TransformedTargetRegressor(
+            regressor=LGBMRegressor(
+                objective="regression",
+                n_estimators=700,
+                learning_rate=0.05,
+                num_leaves=63,
+                min_child_samples=50,
+                subsample=0.85,
+                colsample_bytree=0.85,
+                reg_lambda=1.0,
+                random_state=self.random_state,
+                n_jobs=-1,
+                verbose=-1,
+            ),
+            func=np.log1p,
+            inverse_func=np.expm1,
+        )
+
+    @staticmethod
+    def _row_subset(X: Any, mask: np.ndarray) -> Any:
+        if hasattr(X, "iloc"):
+            return X.iloc[mask]
+        return X[mask]
+
+    def fit(self, X: Any, y: pd.Series) -> "HighValueRoutedRegressor":
         y_array = np.asarray(y, dtype="float64")
         high_mask = y_array > self.threshold
         high_count = int(high_mask.sum())
+        low_count = int((~high_mask).sum())
+        base_regressor = self.regressor if self.regressor is not None else self._default_regressor()
 
         self.classifier_ = LGBMClassifier(
             objective="binary",
@@ -654,41 +772,35 @@ class HighValueRoutedRegressor(BaseEstimator, RegressorMixin):
             n_jobs=-1,
             verbose=-1,
         )
-        self.low_regressor_ = LGBMRegressor(
-            objective="regression",
-            n_estimators=700,
-            learning_rate=0.05,
-            num_leaves=63,
-            min_child_samples=50,
-            subsample=0.85,
-            colsample_bytree=0.85,
-            reg_lambda=1.0,
-            random_state=self.random_state,
-            n_jobs=-1,
-            verbose=-1,
-        )
+        self.low_regressor_ = clone(base_regressor)
         self.high_regressor_ = clone(self.low_regressor_)
         self.global_regressor_ = clone(self.low_regressor_)
 
-        self.global_regressor_.fit(X, np.log1p(y_array))
-        self.low_regressor_.fit(X[~high_mask], np.log1p(y_array[~high_mask]))
-        self.has_high_value_expert_ = high_count >= self.min_high_value_rows
+        self.global_regressor_.fit(X, y_array)
+        self.has_low_value_expert_ = low_count > 0
+        self.has_high_value_expert_ = (
+            high_count >= self.min_high_value_rows
+            and low_count > 0
+        )
+
+        if self.has_low_value_expert_:
+            self.low_regressor_.fit(self._row_subset(X, ~high_mask), y_array[~high_mask])
 
         if self.has_high_value_expert_:
             self.classifier_.fit(X, high_mask.astype("int8"))
-            self.high_regressor_.fit(X[high_mask], np.log1p(y_array[high_mask]))
+            self.high_regressor_.fit(self._row_subset(X, high_mask), y_array[high_mask])
 
         return self
 
-    def predict(self, X: pd.DataFrame) -> np.ndarray:
-        global_preds = np.expm1(self.global_regressor_.predict(X))
-        low_preds = np.expm1(self.low_regressor_.predict(X))
+    def predict(self, X: Any) -> np.ndarray:
+        global_preds = self.global_regressor_.predict(X)
 
-        if not self.has_high_value_expert_:
+        if not self.has_low_value_expert_ or not self.has_high_value_expert_:
             return np.clip(global_preds, a_min=0, a_max=None)
 
+        low_preds = self.low_regressor_.predict(X)
         high_probability = self.classifier_.predict_proba(X)[:, 1]
-        high_preds = np.expm1(self.high_regressor_.predict(X))
+        high_preds = self.high_regressor_.predict(X)
         routed_preds = np.where(
             high_probability >= self.probability_cutoff,
             high_preds,
@@ -701,118 +813,94 @@ class HighValueRoutedRegressor(BaseEstimator, RegressorMixin):
 
 
 def model_candidates(tree_preprocessor: ColumnTransformer, linear_preprocessor: Pipeline) -> dict[str, tuple[Pipeline, dict[str, list[Any]]]]:
-    ridge = Pipeline(
-        [
-            ("preprocessor", clone(linear_preprocessor)),
-            (
-                "model",
-                TransformedTargetRegressor(
-                    regressor=Ridge(random_state=RANDOM_STATE),
-                    func=np.log1p,
-                    inverse_func=np.expm1,
-                ),
-            ),
-        ]
+    def routed_pipeline(preprocessor: Any, regressor: BaseEstimator) -> Pipeline:
+        return Pipeline(
+            [
+                ("preprocessor", clone(preprocessor)),
+                ("model", HighValueRoutedRegressor(regressor=regressor)),
+            ]
+        )
+
+    router_params = {
+        "model__probability_cutoff": [0.25, 0.35, 0.5],
+        "model__min_high_value_rows": [25, 50, 100],
+    }
+    ridge = TransformedTargetRegressor(
+        regressor=Ridge(random_state=RANDOM_STATE),
+        func=np.log1p,
+        inverse_func=np.expm1,
     )
-    elastic = Pipeline(
-        [
-            ("preprocessor", clone(linear_preprocessor)),
-            (
-                "model",
-                TransformedTargetRegressor(
-                    regressor=ElasticNet(max_iter=5_000, random_state=RANDOM_STATE),
-                    func=np.log1p,
-                    inverse_func=np.expm1,
-                ),
-            ),
-        ]
+    elastic = TransformedTargetRegressor(
+        regressor=ElasticNet(max_iter=5_000, random_state=RANDOM_STATE),
+        func=np.log1p,
+        inverse_func=np.expm1,
     )
-    lightgbm = Pipeline(
-        [
-            ("preprocessor", clone(tree_preprocessor)),
-            (
-                "model",
-                TransformedTargetRegressor(
-                    regressor=LGBMRegressor(
-                        objective="regression",
-                        n_estimators=700,
-                        learning_rate=0.05,
-                        num_leaves=63,
-                        min_child_samples=50,
-                        subsample=0.85,
-                        colsample_bytree=0.85,
-                        reg_lambda=1.0,
-                        random_state=RANDOM_STATE,
-                        n_jobs=-1,
-                        verbose=-1,
-                    ),
-                    func=np.log1p,
-                    inverse_func=np.expm1,
-                ),
-            ),
-        ]
+    lightgbm = TransformedTargetRegressor(
+        regressor=LGBMRegressor(
+            objective="regression",
+            n_estimators=700,
+            learning_rate=0.05,
+            num_leaves=63,
+            min_child_samples=50,
+            subsample=0.85,
+            colsample_bytree=0.85,
+            reg_lambda=1.0,
+            random_state=RANDOM_STATE,
+            n_jobs=-1,
+            verbose=-1,
+        ),
+        func=np.log1p,
+        inverse_func=np.expm1,
     )
-    random_forest = Pipeline(
-        [
-            ("preprocessor", clone(tree_preprocessor)),
-            (
-                "model",
-                TransformedTargetRegressor(
-                    regressor=RandomForestRegressor(
-                        n_estimators=250,
-                        min_samples_leaf=5,
-                        max_depth=24,
-                        max_leaf_nodes=RANDOM_FOREST_MAX_LEAF_NODES,
-                        max_samples=0.5,
-                        max_features="sqrt",
-                        n_jobs=2,
-                        random_state=RANDOM_STATE,
-                    ),
-                    func=np.log1p,
-                    inverse_func=np.expm1,
-                ),
-            ),
-        ]
-    )
-    high_value_router = Pipeline(
-        [
-            ("preprocessor", clone(tree_preprocessor)),
-            ("model", HighValueRoutedRegressor()),
-        ]
+    random_forest = TransformedTargetRegressor(
+        regressor=RandomForestRegressor(
+            n_estimators=250,
+            min_samples_leaf=5,
+            max_depth=24,
+            max_leaf_nodes=RANDOM_FOREST_MAX_LEAF_NODES,
+            max_samples=0.5,
+            max_features="sqrt",
+            n_jobs=2,
+            random_state=RANDOM_STATE,
+        ),
+        func=np.log1p,
+        inverse_func=np.expm1,
     )
 
     return {
-        "Readable_Ridge": (ridge, {"model__regressor__alpha": [0.3, 1.0, 3.0, 10.0, 30.0]}),
-        "Readable_ElasticNet": (
-            elastic,
+        "Ridge": (
+            routed_pipeline(linear_preprocessor, ridge),
             {
-                "model__regressor__alpha": [0.0005, 0.001, 0.005, 0.01],
-                "model__regressor__l1_ratio": [0.1, 0.3, 0.5, 0.7],
+                **router_params,
+                "model__regressor__regressor__alpha": [0.3, 1.0, 3.0, 10.0, 30.0],
             },
         ),
-        "Advanced_LightGBM": (
-            lightgbm,
+        "ElasticNet": (
+            routed_pipeline(linear_preprocessor, elastic),
             {
-                "model__regressor__num_leaves": [31, 63, 127],
-                "model__regressor__learning_rate": [0.03, 0.05, 0.08],
-                "model__regressor__min_child_samples": [25, 50, 100],
-                "model__regressor__reg_lambda": [0.5, 1.0, 2.0],
+                **router_params,
+                "model__regressor__regressor__alpha": [0.0005, 0.001, 0.005, 0.01],
+                "model__regressor__regressor__l1_ratio": [0.1, 0.3, 0.5, 0.7],
             },
         ),
-        "Tree_RandomForest": (
-            random_forest,
+        "LightGBM": (
+            routed_pipeline(tree_preprocessor, lightgbm),
             {
-                "model__regressor__n_estimators": [150, 250],
-                "model__regressor__min_samples_leaf": [10, 25, 50],
-                "model__regressor__max_leaf_nodes": [16_384, RANDOM_FOREST_MAX_LEAF_NODES],
-                "model__regressor__max_features": ["sqrt", 0.5],
+                **router_params,
+                "model__regressor__regressor__num_leaves": [31, 63, 127],
+                "model__regressor__regressor__learning_rate": [0.03, 0.05, 0.08],
+                "model__regressor__regressor__min_child_samples": [25, 50, 100],
+                "model__regressor__regressor__reg_lambda": [0.5, 1.0, 2.0],
             },
         ),
-        "Segmented_HighValue_LightGBM": (
-            high_value_router,
+        "RandomForest": (
+            routed_pipeline(tree_preprocessor, random_forest),
             {
-                "model__probability_cutoff": [0.25, 0.35, 0.5],
-                "model__min_high_value_rows": [25, 50, 100],
+                **router_params,
+                "model__regressor__regressor__n_estimators": [150, 250],
+                "model__regressor__regressor__min_samples_leaf": [10, 25, 50],
+                "model__regressor__regressor__max_leaf_nodes": [16_384, RANDOM_FOREST_MAX_LEAF_NODES],
+                "model__regressor__regressor__max_features": ["sqrt", 0.5],
             },
         ),
     }
@@ -846,7 +934,7 @@ def segment_metrics(
     scored["is_high_value"] = np.where(scored["actual"] >= HIGH_VALUE_THRESHOLD, "high_value", "everyday")
 
     output: dict[str, dict[str, dict[str, float]]] = {}
-    for column in ["price_band", "nhtsa_Make", "nhtsa_ModelYear", "is_high_value"]:
+    for column in ["price_band", "canonical_make", "canonical_year", "is_high_value"]:
         if column not in scored.columns:
             continue
         groups = {}
@@ -874,7 +962,7 @@ def stratified_tuning_sample_positions(
     if max_rows <= 0 or row_count <= max_rows:
         return np.arange(row_count)
 
-    available_cols = [c for c in ["price_band", "nhtsa_Make", "nhtsa_ModelYear"] if c in segment_frame.columns]
+    available_cols = [c for c in ["price_band", "canonical_make", "canonical_year"] if c in segment_frame.columns]
     if not available_cols:
         return np.sort(
             np.random.default_rng(RANDOM_STATE).choice(row_count, size=max_rows, replace=False)
@@ -956,12 +1044,16 @@ def final_fit_positions_for_model(
     train_segments: pd.DataFrame,
     row_count: int,
 ) -> np.ndarray:
-    if name != "Tree_RandomForest" or row_count <= RANDOM_FOREST_FULL_FIT_MAX_ROWS:
+    if name != "RandomForest" or row_count <= RANDOM_FOREST_FULL_FIT_MAX_ROWS:
         return np.arange(row_count)
     return stratified_tuning_sample_positions(train_segments, RANDOM_FOREST_FULL_FIT_MAX_ROWS)
 
 
 def get_preprocessor_feature_names(preprocessor: Any, expected_count: int | None = None) -> list[str]:
+    readable_names = get_column_transformer_feature_names(preprocessor)
+    if readable_names and (expected_count is None or len(readable_names) == expected_count):
+        return readable_names
+
     try:
         names = list(preprocessor.get_feature_names_out())
     except Exception:
@@ -971,6 +1063,56 @@ def get_preprocessor_feature_names(preprocessor: Any, expected_count: int | None
     return [str(name) for name in names]
 
 
+def get_column_transformer_feature_names(preprocessor: Any) -> list[str]:
+    """Return report-friendly feature names, including target-encoded source fields."""
+    if isinstance(preprocessor, Pipeline):
+        if "features" in preprocessor.named_steps:
+            return get_column_transformer_feature_names(preprocessor.named_steps["features"])
+        if "preprocessor" in preprocessor.named_steps:
+            return get_column_transformer_feature_names(preprocessor.named_steps["preprocessor"])
+
+    if not hasattr(preprocessor, "transformers_"):
+        return []
+
+    feature_names: list[str] = []
+    for block_name, transformer, columns in preprocessor.transformers_:
+        if block_name == "remainder" and transformer == "drop":
+            continue
+        if columns is None:
+            continue
+        if isinstance(columns, slice):
+            continue
+        if isinstance(columns, (str, bytes)):
+            source_columns = [str(columns)]
+        else:
+            source_columns = [str(column) for column in list(columns)]
+        if not source_columns:
+            continue
+
+        if block_name == "cat_high":
+            feature_names.extend([f"target_encoded__{column}" for column in source_columns])
+            continue
+
+        try:
+            names = list(transformer.get_feature_names_out(source_columns))
+        except Exception:
+            names = [f"{block_name}__{column}" for column in source_columns]
+        feature_names.extend([str(name) for name in names])
+
+    return feature_names
+
+
+def fitted_regressor_weights(estimator: Any) -> tuple[np.ndarray | None, str]:
+    """Return weights from a fitted regressor, unwrapping target transformers."""
+    if hasattr(estimator, "regressor_"):
+        estimator = estimator.regressor_
+    if hasattr(estimator, "coef_"):
+        return np.ravel(estimator.coef_).astype("float64"), "coefficient"
+    if hasattr(estimator, "feature_importances_"):
+        return np.ravel(estimator.feature_importances_).astype("float64"), "feature_importance"
+    return None, "feature_importance"
+
+
 def extract_model_feature_weights(model: Pipeline, top_n: int = MAX_MODEL_WEIGHT_ROWS) -> list[dict[str, Any]]:
     """Return coefficient or feature-importance rows for fitted sklearn pipelines."""
     if "preprocessor" not in model.named_steps or "model" not in model.named_steps:
@@ -978,17 +1120,13 @@ def extract_model_feature_weights(model: Pipeline, top_n: int = MAX_MODEL_WEIGHT
 
     model_step = model.named_steps["model"]
     estimator = getattr(model_step, "regressor_", model_step)
-    weight_type = "feature_importance"
+    weights, weight_type = fitted_regressor_weights(estimator)
 
-    if hasattr(estimator, "coef_"):
-        weights = np.ravel(estimator.coef_).astype("float64")
-        weight_type = "coefficient"
-    elif hasattr(estimator, "feature_importances_"):
-        weights = np.ravel(estimator.feature_importances_).astype("float64")
-    elif hasattr(estimator, "global_regressor_") and hasattr(estimator.global_regressor_, "feature_importances_"):
-        weights = np.ravel(estimator.global_regressor_.feature_importances_).astype("float64")
-        weight_type = "global_feature_importance"
-    else:
+    if weights is None and hasattr(estimator, "global_regressor_"):
+        weights, nested_weight_type = fitted_regressor_weights(estimator.global_regressor_)
+        weight_type = f"global_{nested_weight_type}"
+
+    if weights is None:
         return []
 
     feature_names = get_preprocessor_feature_names(model.named_steps["preprocessor"], len(weights))
@@ -1185,16 +1323,18 @@ def train_current_price_models(
         "split": split_metadata,
         "features": feature_metadata,
         "trim_features": {
-            "cleaned_trim_columns_available": [
-                col for col in TRIM_METADATA_COLUMNS if col in model_df.columns
+            "canonical_trim_input": "canonical_trim" if "canonical_trim" in model_df.columns else None,
+            "comparison_columns_available": [
+                col for col in TRIM_METADATA_COLUMNS if col != "canonical_trim" and col in model_df.columns
             ],
             "engineered_trim_columns": [
                 col for col in ["trim_proxy", "make_model_year_trim"] if col in model_df.columns
             ],
         },
+        "identity_normalization": identity_normalization_profile(raw_df),
         "tuning": {
             "max_tuning_rows": DEFAULT_TUNING_SAMPLE_SIZE,
-            "sampling_strategy": "deterministic stratified sample by diagnostic price band, NHTSA make, and model year",
+            "sampling_strategy": "deterministic stratified sample by diagnostic price band, canonical make, and canonical model year",
             "final_fit": "best hyperparameters are refit before evaluation; memory-heavy models can use a documented representative fit cap",
         },
         "model_fit_metadata": model_fit_metadata,
@@ -1202,7 +1342,13 @@ def train_current_price_models(
         "model_feature_weights": model_feature_weights,
         "leakage_controls": {
             "dropped_answer_derived_columns": ["price", "price_band"],
-            "price_band_usage": "diagnostic segmentation only; never included in model inputs",
+            "dropped_price_leakage_columns": sorted(PRICE_LEAKAGE_FEATURE_COLUMNS),
+            "price_band_usage": "diagnostic segmentation and high-value classifier labels only; never included in model inputs",
+            "high_value_routing": (
+                "Every candidate model first trains a leakage-safe classifier on training labels "
+                f"for price > ${HIGH_VALUE_THRESHOLD:,}, then routes predictions to separately "
+                "fit everyday or high-value regressors."
+            ),
             "vin_overlap": split_metadata["vin_overlap"],
         },
         "models": metrics,
@@ -1210,9 +1356,11 @@ def train_current_price_models(
         "notes": [
             "Training defaults to the latest listing row per VIN to avoid duplicate VIN overweighting.",
             "Price bands are created only after observing price and are kept out of the feature matrix to avoid target leakage.",
+            "NHTSA base-price fields are excluded because the cleaned base price can be filled from observed price history.",
+            "NHTSA make/model anchor canonical identity; title-derived canonical trim is the only trim input.",
             "Hyperparameters are tuned on a representative bounded sample, then refit on the full training split.",
             "RandomForest is sample-bounded and leaf-bounded on large full-database runs because scikit-learn stores every fitted tree node in memory.",
-            "The high-value router is useful only if it improves the >$150k segment without hurting global MAE/RMSLE.",
+            "All current-price candidates use the same high-value classifier router before model-specific regressors.",
             "CatBoost remains a strong future candidate for categorical-heavy modeling but is not required for this dependency set.",
         ],
         "research_sources": RESEARCH_REFERENCES,
@@ -1226,6 +1374,13 @@ def train_current_price_models(
 def write_reports(output_dir: Path, report: dict[str, Any]) -> None:
     json_path = output_dir / "model_report.json"
     json_path.write_text(json.dumps(report, indent=2, default=str), encoding="utf-8")
+    weight_rows = [
+        {"model": model_name, "rank": rank, **row}
+        for model_name, rows in report.get("model_feature_weights", {}).items()
+        for rank, row in enumerate(rows, start=1)
+    ]
+    if weight_rows:
+        pd.DataFrame(weight_rows).to_csv(output_dir / "current_price_model_feature_weights.csv", index=False)
 
     best_name = report["recommended_model"]
     best_metrics = report["models"][best_name]
@@ -1243,7 +1398,7 @@ def write_reports(output_dir: Path, report: dict[str, Any]) -> None:
         f"- Feature matrix profile: {report['feature_space_profile']['transformed_shape_on_profile'][1]:,} transformed columns on "
         f"{report['feature_space_profile']['profile_rows']:,} profiled rows; projected full training matrix "
         f"{report['feature_space_profile']['projected_full_training_matrix_memory_mb'] / 1024:,.2f} GB",
-        f"- Cleaned trim fields used: {', '.join(report.get('trim_features', {}).get('cleaned_trim_columns_available', [])) or 'none available'}",
+        f"- Canonical trim input: {report.get('trim_features', {}).get('canonical_trim_input') or 'missing'}",
         "",
         "## Best Model Metrics",
         f"- MAE: ${best_metrics['mae']:,.2f}",
@@ -1267,16 +1422,31 @@ def write_reports(output_dir: Path, report: dict[str, Any]) -> None:
     weights = report.get("model_feature_weights", {}).get(best_name, [])
     if weights:
         md.extend(["", "## Top Feature Weights For Best Model"])
-        for row in weights[:12]:
+        for row in weights[:READABLE_MODEL_WEIGHT_REPORT_ROWS]:
             md.append(
                 f"- {row['feature']}: {row['weight']:.4g} ({row['weight_type']})"
             )
+    readable_weights = {
+        name: rows
+        for name, rows in report.get("model_feature_weights", {}).items()
+        if name in {"Ridge", "ElasticNet"} and rows
+    }
+    if readable_weights:
+        md.extend(["", "## Top 30 Linear Model Weights"])
+        for name, rows in readable_weights.items():
+            md.extend(["", f"### {name}"])
+            for row in rows[:READABLE_MODEL_WEIGHT_REPORT_ROWS]:
+                md.append(
+                    f"- {row['feature']}: {row['weight']:.4g} ({row['weight_type']})"
+                )
     md.extend(
         [
             "",
             "## Notes",
             "- The current-price benchmark now uses leakage-safe VIN handling.",
-            "- Answer-derived `price_band` is excluded from model features and used only for segment diagnostics.",
+            "- Answer-derived `price_band` is excluded from model features and used only for diagnostics and high-value router labels during training.",
+            "- Every candidate model uses a leakage-safe classifier router before separately fit everyday/high-value regressors.",
+            "- `nhtsa_BasePrice` and `nhtsa_BasePrice_source` are excluded because base price can be filled from observed price history.",
             "- Hyperparameters are tuned on a representative bounded sample, then refit on the full training split.",
             "- Full-database runs are opt-in with `--sample-size 0`.",
             "",

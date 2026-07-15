@@ -39,7 +39,10 @@ __pycache__/
 !/tests/*.py
 
 # Explicitly unignore specific files
+!/AGENTS.md
+!/streamlit_app.py
 !/DataPipeline/SentimentAnalysis.py
+!/DataPipeline/VehicleNormalization.py
 !/EDA/Depreciation_Analysis.py
 !/EDA/EDA_notebook.ipynb
 !/ML/Price_ML_Models.py

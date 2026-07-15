@@ -52,6 +52,8 @@ Preferred joins:
 - Treat outliers as evidence to inspect before removal; visualize before filtering.
 - Distinguish true zero mileage from missing mileage.
 - Check NHTSA coverage rates by make, model, model year, and VIN.
+- Audit canonical trim population, source/confidence, EPA coverage, suspicious cardinality, title remainders, and NHTSA agreement without treating NHTSA trim disagreement as a canonical error.
+- Include explicit GT350 and GT350R checks and keep exact database-wide rates behind `RUN_FULL_SCAN`.
 - Validate whether sentiment joins have enough sample support before using them in conclusions.
 
 ### Phase 2: Feature Engineering
