@@ -58,11 +58,14 @@ If touching this file:
 1. Avoid target leakage. Do not include `price`, `price_band`, future prices, or answer-derived fields in model features.
 2. Preserve VIN-safe validation for current-price modeling.
 3. Prefer temporal validation when sufficient dates exist.
-4. Use bounded SQLite reads by default; full scans should be intentional.
+4. Preserve bounded-memory SQLite access. Current-price modeling may default to
+   all eligible VINs only because latest-per-VIN selection happens in SQL and
+   the result is read in downcast Arrow-backed chunks.
 5. Set random seeds for ML, sampling, and search procedures.
 6. Report row counts, split strategy, metrics, caveats, and research rationale in model reports.
 7. Verify new research claims against current primary sources, official documentation, or peer-reviewed papers.
 8. Routine verification must not train production models; cap any explicitly needed smoke run at 5,000 rows.
+9. When a direct-script joblib artifact adds a custom estimator or transformer, keep the Streamlit `__main__` compatibility registration and its regression tests synchronized.
 
 ## 6. Style and Hygiene Rules
 

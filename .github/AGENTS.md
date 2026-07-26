@@ -53,6 +53,7 @@ run_pipeline_scheduler.bat --dry-run
 - NHTSA make/model are canonical anchors and must not be overwritten from titles. Titles must be checked for agreement and are the only source of canonical trim text.
 - EPA validates or standardizes title-derived identity. Raw NHTSA trims remain untouched diagnostic fields and must not enter the predictive trim feature.
 - Do not run model training for routine verification; if a smoke run is necessary, cap it at 5,000 rows. Document full runs with `--sample-size 0`.
+- When a custom current-price estimator or transformer is persisted in a joblib artifact from direct script execution, update the Streamlit `__main__` compatibility registration and dashboard regression tests in the same change.
 - Preserve `nhtsa_BasePrice` provenance; missing cleaned base prices can be filled from earliest cleaned price history, then earliest cleaned listing history.
 - Keep depreciation forecasts cohort-level and monthly out to five years by default, not VIN-level or fixed 30/60/90-day buckets.
 - Preserve direct script execution with `if __name__ == "__main__": main()`.
@@ -65,7 +66,10 @@ run_pipeline_scheduler.bat --dry-run
 - Avoid target leakage. Do not train on `price`, `price_band`, future prices, or answer-derived features.
 - Preserve VIN-safe train/test validation for current-price modeling.
 - Prefer temporal validation when enough dates exist.
-- Keep full-database runs opt-in; default to bounded samples for development.
+- Current-price modeling defaults to all eligible VINs, but bounded development
+  and verification runs must pass a positive `--sample-size`.
+- Preserve SQL-side latest-per-VIN selection, chunked Arrow-backed reads, and
+  early numeric downcasting for full current-price loads.
 - When adding research claims or new techniques, verify against current primary sources, official documentation, or peer-reviewed papers.
 
 ## Documentation and Dependency Hygiene
@@ -82,4 +86,5 @@ run_pipeline_scheduler.bat --dry-run
 - `DataAquisition.py` is misspelled historically and remains the Selenium reference/fallback path.
 - Some utility and EDA scripts still contain absolute Windows paths; improve portability when touching those files.
 - YouTube ingestion requires `YOUTUBE_API_KEY` or `GOOGLE_API_KEY`.
-- Large database scans can be expensive. Use sample-size defaults unless a full capstone run is intentional.
+- Full current-price runs can take hours. Pass a positive `--sample-size` for
+  development and verification.

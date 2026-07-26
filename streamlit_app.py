@@ -37,6 +37,7 @@ from ML.Price_ML_Models import (  # noqa: E402
     HighValueRoutedRegressor,
     engineer_current_price_features,
     make_feature_matrix,
+    normalize_categorical_missing_values,
     to_float32,
 )
 from ML.Time_Series_Price import normalize_label  # noqa: E402
@@ -47,6 +48,11 @@ import __main__  # noqa: E402
 
 setattr(__main__, "HighValueRoutedRegressor", HighValueRoutedRegressor)
 setattr(__main__, "to_float32", to_float32)
+setattr(
+    __main__,
+    "normalize_categorical_missing_values",
+    normalize_categorical_missing_values,
+)
 
 
 st.set_page_config(
@@ -734,7 +740,15 @@ def current_model_predictions(vin: str, model_names: list[str]) -> tuple[pd.Data
         except Exception as exc:  # pragma: no cover - defensive dashboard path
             errors.append(f"{model_name}: {exc}")
 
-    return pd.DataFrame(rows), errors
+    columns = [
+        "model",
+        "predicted_price",
+        "actual_price",
+        "difference_vs_actual",
+        "absolute_difference",
+        "pct_difference",
+    ]
+    return pd.DataFrame(rows, columns=columns), errors
 
 
 def filtered_current_model_metrics(
@@ -784,7 +798,20 @@ def filtered_current_model_metrics(
         except Exception as exc:  # pragma: no cover - defensive dashboard path
             errors.append(f"{model_name}: {exc}")
 
-    return pd.DataFrame(rows).sort_values("mae", na_position="last"), errors
+    columns = [
+        "model",
+        "scored_rows",
+        "mae",
+        "rmse",
+        "mape",
+        "mean_prediction",
+        "mean_actual",
+        "bias",
+    ]
+    metrics = pd.DataFrame(rows, columns=columns)
+    if metrics.empty:
+        return metrics, errors
+    return metrics.sort_values("mae", na_position="last").reset_index(drop=True), errors
 
 
 def current_metrics_table(report: dict[str, Any]) -> pd.DataFrame:
@@ -812,7 +839,25 @@ def current_metrics_table(report: dict[str, Any]) -> pd.DataFrame:
                 "fit_strategy": fit_metadata.get(model_name, {}).get("final_fit_strategy"),
             }
         )
-    return pd.DataFrame(rows).sort_values("mae", na_position="last")
+    columns = [
+        "model",
+        "recommended",
+        "mae",
+        "rmse",
+        "rmsle",
+        "mape",
+        "r2",
+        "everyday_rows",
+        "everyday_mae",
+        "high_value_rows",
+        "high_value_mae",
+        "final_fit_rows",
+        "fit_strategy",
+    ]
+    metrics = pd.DataFrame(rows, columns=columns)
+    if metrics.empty:
+        return metrics
+    return metrics.sort_values("mae", na_position="last").reset_index(drop=True)
 
 
 def cohort_metrics_table(report: dict[str, Any]) -> pd.DataFrame:
@@ -1410,6 +1455,46 @@ def render_models_page(selected_row: pd.Series | None, filtered_df: pd.DataFrame
     render_forecast_for_selected_vehicle(selected_row)
 
 
+def select_forecast_cohort_rows(
+    matched: pd.DataFrame,
+    selected_trim: str | None,
+) -> tuple[pd.DataFrame, str]:
+    """Choose one trim cohort that exposes the broadest comparable model set."""
+    if matched.empty:
+        return matched.copy(), "Unavailable"
+
+    ranked = matched.copy()
+    ranked["_trim_key"] = ranked["trim_proxy"].map(normalize_trim_proxy)
+    ranked["_unique_vins"] = pd.to_numeric(ranked["unique_vins"], errors="coerce").fillna(0)
+    ranked["_volume"] = pd.to_numeric(ranked["volume"], errors="coerce").fillna(0)
+    selected_trim_key = normalize_trim_proxy(selected_trim) if selected_trim else None
+
+    trim_support = (
+        ranked.groupby("_trim_key", as_index=False)
+        .agg(
+            forecast_methods=("forecast_method", "nunique"),
+            unique_vins=("_unique_vins", "max"),
+            volume=("_volume", "max"),
+        )
+    )
+    trim_support["is_exact_trim"] = (
+        trim_support["_trim_key"].eq(selected_trim_key) if selected_trim_key else False
+    )
+    chosen_trim = trim_support.sort_values(
+        ["forecast_methods", "is_exact_trim", "unique_vins", "volume", "_trim_key"],
+        ascending=[False, False, False, False, True],
+    ).iloc[0]["_trim_key"]
+
+    forecast_df = (
+        ranked[ranked["_trim_key"].eq(chosen_trim)]
+        .drop(columns=["_trim_key", "_unique_vins", "_volume"])
+        .sort_values(["forecast_method", "forecast_month"])
+        .copy()
+    )
+    match_label = "Exact" if selected_trim_key == chosen_trim else "Coverage fallback"
+    return forecast_df, match_label
+
+
 def render_forecast_for_selected_vehicle(selected_row: pd.Series) -> None:
     make, model, year, trim = selected_vehicle_context(selected_row)
     if not make or not model or year is None:
@@ -1428,21 +1513,7 @@ def render_forecast_for_selected_vehicle(selected_row: pd.Series) -> None:
         st.info("No cohort future forecasts match the selected VIN make, model, and year.")
         return
 
-    exact = matched[matched["trim_proxy"].astype(str) == str(trim)].copy() if trim else pd.DataFrame()
-    if exact.empty:
-        forecast_df = (
-            matched.sort_values(
-                ["forecast_method", "forecast_month", "unique_vins", "volume"],
-                ascending=[True, True, False, False],
-            )
-            .groupby(["forecast_method", "forecast_month"], as_index=False)
-            .head(1)
-            .copy()
-        )
-        match_label = "Fallback"
-    else:
-        forecast_df = exact.sort_values(["forecast_method", "forecast_month"]).copy()
-        match_label = "Exact"
+    forecast_df, match_label = select_forecast_cohort_rows(matched, trim)
 
     line_df = forecast_df.sort_values("forecast_date")
     forecast_trim = str(line_df["trim_proxy"].dropna().iloc[0]) if "trim_proxy" in line_df and line_df["trim_proxy"].notna().any() else "UNKNOWN_TRIM"
@@ -1454,6 +1525,12 @@ def render_forecast_for_selected_vehicle(selected_row: pd.Series) -> None:
     forecast_cols[1].metric("Trim Match", match_label)
     forecast_cols[2].metric("Observed Median", fmt_currency(forecast_df["observed_median_price"].iloc[0]))
     forecast_cols[3].metric("Forecast Methods", fmt_number(forecast_df["forecast_method"].nunique()))
+    if match_label != "Exact":
+        st.caption(
+            f"The selected trim ({trim or 'unknown'}) does not have the broadest model coverage. "
+            f"The chart uses {forecast_trim} so the available model forecasts remain comparable "
+            "within one cohort."
+        )
     historical_df = load_cohort_historical_prices(make, model, year, forecast_trim)
 
     forecast_fig = go.Figure()
@@ -1545,8 +1622,10 @@ def render_forecast_for_selected_vehicle(selected_row: pd.Series) -> None:
         & (backtests["model"].astype(str) == model)
         & (pd.to_numeric(backtests["model_year"], errors="coerce") == year)
     ].copy()
-    if trim:
-        exact_backtest = backtest_match[backtest_match["trim_proxy"].astype(str) == str(trim)].copy()
+    if forecast_trim:
+        exact_backtest = backtest_match[
+            backtest_match["trim_proxy"].map(normalize_trim_proxy).eq(forecast_trim)
+        ].copy()
         if not exact_backtest.empty:
             backtest_match = exact_backtest
     if backtest_match.empty:

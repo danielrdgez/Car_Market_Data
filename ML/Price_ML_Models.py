@@ -1,9 +1,9 @@
 """
 Train current vehicle price models with leakage-safe validation.
 
-The script is intentionally conservative with large SQLite inputs. By default
-it trains on a bounded, recent sample instead of scanning the full 5 GB cleaned
-database. Use ``--sample-size 0`` only when you intentionally want a full pass.
+By default the current-price task uses every eligible VIN, while SQLite selects
+the latest listing snapshot before Python materializes the joined model frame.
+Pass a positive ``--sample-size`` for bounded development and smoke runs.
 """
 
 from __future__ import annotations
@@ -49,8 +49,9 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 HIGH_VALUE_THRESHOLD = 150_000
 RANDOM_STATE = 42
-DEFAULT_SAMPLE_SIZE = 200_000
+DEFAULT_SAMPLE_SIZE = 0
 DEFAULT_SAMPLE_STRATEGY = "recent"
+DEFAULT_SQL_CHUNK_SIZE = 100_000
 DEFAULT_TUNING_SAMPLE_SIZE = 200_000
 MAX_PARALLEL_TUNING_ROWS = 500_000
 DEFAULT_FEATURE_PROFILE_ROWS = 200_000
@@ -164,6 +165,23 @@ def normalize_trim_feature(value: Any, fallback: str = "UNKNOWN_TRIM") -> str:
     return text if text and text not in {"NA", "N_A", "NONE", "NULL", "UNKNOWN"} else fallback
 
 
+def normalize_trim_series(
+    series: pd.Series,
+    fallback: str = "UNKNOWN_TRIM",
+) -> pd.Series:
+    """Normalize canonical trim with vectorized Arrow string operations."""
+    text = (
+        series.astype("string[pyarrow]")
+        .str.strip()
+        .str.upper()
+        .str.replace(" ", "_", regex=False)
+    )
+    invalid = text.isna() | text.eq("") | text.isin(
+        ["NA", "N_A", "NONE", "NULL", "UNKNOWN"]
+    )
+    return text.mask(invalid, fallback).astype("string[pyarrow]")
+
+
 def identity_normalization_profile(df: pd.DataFrame) -> dict[str, Any]:
     """Summarize the canonical identity contract recorded with model outputs."""
     total = max(int(df.shape[0]), 1)
@@ -173,10 +191,13 @@ def identity_normalization_profile(df: pd.DataFrame) -> dict[str, Any]:
             return {}
         return {
             str(key): int(value)
-            for key, value in df[column].fillna("NULL").astype("string").value_counts().items()
+            for key, value in df[column].fillna("NULL").astype("string[pyarrow]").value_counts().items()
         }
 
-    canonical_trim = df.get("canonical_trim", pd.Series(index=df.index, dtype="string")).astype("string")
+    canonical_trim = df.get(
+        "canonical_trim",
+        pd.Series(index=df.index, dtype="string[pyarrow]"),
+    ).astype("string[pyarrow]")
     unresolved = canonical_trim.fillna("UNKNOWN_TRIM").eq("UNKNOWN_TRIM")
     epa_matched = df.get("epa_vehicle_id", pd.Series(index=df.index, dtype="object")).notna()
     disagreements = {}
@@ -219,7 +240,10 @@ def parse_args() -> argparse.Namespace:
         "--sample-size",
         type=int,
         default=DEFAULT_SAMPLE_SIZE,
-        help="Bounded listing rows to load. Use 0 for the full cleaned listings table.",
+        help=(
+            "Listing snapshots to scope before latest-per-VIN selection. "
+            "The default 0 uses every eligible VIN; pass a positive value for a bounded run."
+        ),
     )
     parser.add_argument(
         "--sample-strategy",
@@ -252,6 +276,13 @@ def parse_args() -> argparse.Namespace:
 
 def _table_columns(conn: sqlite3.Connection, table: str) -> list[str]:
     return [row[1] for row in conn.execute(f"PRAGMA table_info('{table}')").fetchall()]
+
+
+def _table_schema(conn: sqlite3.Connection, table: str) -> dict[str, str]:
+    return {
+        str(row[1]): str(row[2]).upper()
+        for row in conn.execute(f"PRAGMA table_info('{table}')").fetchall()
+    }
 
 
 def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
@@ -306,6 +337,122 @@ def _scoped_listings_sql(sample_size: int | None, sample_strategy: str) -> str:
     return f"SELECT * FROM listings LIMIT {sample_size}"
 
 
+def _eligible_listings_sql(sample_size: int | None, sample_strategy: str) -> str:
+    """Apply the same target-row validity checks before materialization."""
+    scoped = _scoped_listings_sql(sample_size, sample_strategy)
+    return f"""
+        SELECT *
+        FROM (
+            {scoped}
+        )
+        WHERE price IS NOT NULL
+          AND CAST(price AS REAL) > 0
+          AND mileage IS NOT NULL
+          AND CAST(mileage AS REAL) >= 0
+    """
+
+
+def _modeling_listings_sql(
+    sample_size: int | None,
+    sample_strategy: str,
+    deduplicate_vins: bool,
+) -> str:
+    """Return eligible listing rows, reducing to the latest snapshot in SQLite."""
+    eligible = _eligible_listings_sql(sample_size, sample_strategy)
+    if not deduplicate_vins:
+        return eligible
+
+    # Full runs avoid materializing the entire listings table as a CTE. The
+    # cleaned table's (vin, loaddate) primary key makes this group-and-join
+    # deterministic and index-friendly.
+    if not sample_size or sample_size <= 0:
+        return """
+            SELECT l.*
+            FROM listings AS l
+            INNER JOIN (
+                SELECT vin, MAX(loaddate) AS latest_loaddate
+                FROM listings
+                WHERE price IS NOT NULL
+                  AND CAST(price AS REAL) > 0
+                  AND mileage IS NOT NULL
+                  AND CAST(mileage AS REAL) >= 0
+                GROUP BY vin
+            ) AS latest
+                ON l.vin = latest.vin
+               AND l.loaddate = latest.latest_loaddate
+        """
+
+    return f"""
+        WITH eligible_listings AS (
+            {eligible}
+        ),
+        latest AS (
+            SELECT vin, MAX(loaddate) AS latest_loaddate
+            FROM eligible_listings
+            GROUP BY vin
+        )
+        SELECT l.*
+        FROM eligible_listings AS l
+        INNER JOIN latest
+            ON l.vin = latest.vin
+           AND l.loaddate = latest.latest_loaddate
+    """
+
+
+def _downcast_sql_chunk(
+    chunk: pd.DataFrame,
+    declared_types: dict[str, str],
+) -> pd.DataFrame:
+    """Narrow SQLite's 64-bit numerics before chunks are combined."""
+    for column in chunk.columns:
+        declared_type = declared_types.get(column, "")
+        if declared_type == "BOOLEAN":
+            chunk[column] = chunk[column].astype("int8[pyarrow]")
+        elif "INT" in declared_type:
+            try:
+                chunk[column] = chunk[column].astype("int32[pyarrow]")
+            except (OverflowError, TypeError, ValueError):
+                chunk[column] = chunk[column].astype("int64[pyarrow]")
+        elif any(token in declared_type for token in ("REAL", "FLOA", "DOUB")):
+            chunk[column] = chunk[column].astype("float32[pyarrow]")
+    return chunk
+
+
+def _read_modeling_query_in_chunks(
+    query: str,
+    conn: sqlite3.Connection,
+    declared_types: dict[str, str],
+    chunk_size: int,
+) -> pd.DataFrame:
+    """Read SQLite incrementally using nullable Arrow-backed pandas columns."""
+    chunks: list[pd.DataFrame] = []
+    reader = pd.read_sql_query(
+        query,
+        conn,
+        chunksize=max(1, int(chunk_size)),
+        dtype_backend="pyarrow",
+    )
+    for chunk in reader:
+        chunks.append(_downcast_sql_chunk(chunk, declared_types))
+
+    if not chunks:
+        return pd.DataFrame()
+    if len(chunks) == 1:
+        return chunks[0].reset_index(drop=True)
+    return pd.concat(chunks, ignore_index=True, copy=False)
+
+
+def _scoped_listing_row_count(
+    conn: sqlite3.Connection,
+    sample_size: int | None,
+    sample_strategy: str,
+) -> int:
+    if not sample_size or sample_size <= 0:
+        return int(conn.execute("SELECT COUNT(*) FROM listings").fetchone()[0])
+    scoped = _scoped_listings_sql(sample_size, sample_strategy)
+    return int(conn.execute(f"SELECT COUNT(*) FROM ({scoped})").fetchone()[0])
+
+
 def build_data_profile(
     conn: sqlite3.Connection,
     sample_size: int | None,
@@ -352,8 +499,10 @@ def load_modeling_frame(
     absa_db_path: Path | str | None = ABSA_DB_PATH,
     sample_size: int | None = DEFAULT_SAMPLE_SIZE,
     sample_strategy: str = DEFAULT_SAMPLE_STRATEGY,
+    deduplicate_vins: bool = True,
+    chunk_size: int = DEFAULT_SQL_CHUNK_SIZE,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
-    """Load a bounded current-price training frame from listings and NHTSA data."""
+    """Load the current-price frame through a bounded-memory SQLite reader."""
     db_path = Path(db_path)
     if not db_path.exists():
         raise FileNotFoundError(f"SQLite database not found: {db_path}")
@@ -361,12 +510,23 @@ def load_modeling_frame(
     conn = sqlite3.connect(str(db_path))
     try:
         profile = build_data_profile(conn, sample_size, sample_strategy)
-        listings_cols = _table_columns(conn, "listings")
+        scoped_snapshot_rows = _scoped_listing_row_count(
+            conn,
+            sample_size,
+            sample_strategy,
+        )
+        listings_schema = _table_schema(conn, "listings")
+        nhtsa_schema = _table_schema(conn, "nhtsa_enrichment")
+        listings_cols = list(listings_schema)
         nhtsa_cols = [
             c
-            for c in _table_columns(conn, "nhtsa_enrichment")
+            for c in nhtsa_schema
             if c != "vin" and c not in PRICE_LEAKAGE_FEATURE_COLUMNS
         ]
+        declared_types = {
+            **listings_schema,
+            **{column: nhtsa_schema[column] for column in nhtsa_cols},
+        }
 
         listing_select = [f"l.{c}" for c in listings_cols]
         nhtsa_select = [f"n.{c}" for c in nhtsa_cols]
@@ -391,6 +551,16 @@ def load_modeling_frame(
                             "vsi.Confidence_Level",
                         ]
                     )
+                    declared_types.update(
+                        {
+                            "Vehicle_Entity": "TEXT",
+                            "Reliability_Index": "REAL",
+                            "General_Enthusiast_Score": "REAL",
+                            "Sentiment_Volatility_StdDev": "REAL",
+                            "Sentiment_Trend_Slope": "REAL",
+                            "Confidence_Level": "REAL",
+                        }
+                    )
                     absa_join = f"""
                         LEFT JOIN absa.Vehicle_Sentiment_Index AS vsi
                             ON {entity_expr} = vsi.Vehicle_Entity
@@ -398,7 +568,11 @@ def load_modeling_frame(
             except sqlite3.Error:
                 absa_join = ""
 
-        scoped_listings = _scoped_listings_sql(sample_size, sample_strategy)
+        scoped_listings = _modeling_listings_sql(
+            sample_size,
+            sample_strategy,
+            deduplicate_vins,
+        )
 
         query = f"""
             WITH scoped_listings AS (
@@ -409,7 +583,20 @@ def load_modeling_frame(
             INNER JOIN nhtsa_enrichment AS n USING(vin)
             {absa_join}
         """
-        df = pd.read_sql_query(query, conn)
+        df = _read_modeling_query_in_chunks(
+            query,
+            conn,
+            declared_types,
+            chunk_size,
+        )
+        if deduplicate_vins:
+            df.attrs["deduplication"] = {
+                "deduplicated_vins": True,
+                "rows_before": scoped_snapshot_rows,
+                "rows_after": int(df.shape[0]),
+                "distinct_vins_before": int(df.shape[0]),
+                "rows_removed": int(max(0, scoped_snapshot_rows - df.shape[0])),
+            }
     finally:
         conn.close()
 
@@ -418,9 +605,13 @@ def load_modeling_frame(
     return df, profile
 
 
-def engineer_current_price_features(df: pd.DataFrame) -> pd.DataFrame:
+def engineer_current_price_features(
+    df: pd.DataFrame,
+    copy_frame: bool = True,
+) -> pd.DataFrame:
     """Create derived features from cleaned listing and NHTSA columns."""
-    df = df.copy()
+    if copy_frame:
+        df = df.copy()
     required_identity = {"canonical_make", "canonical_model", "canonical_year", "canonical_trim"}
     missing_identity = sorted(required_identity - set(df.columns))
     if missing_identity:
@@ -429,8 +620,14 @@ def engineer_current_price_features(df: pd.DataFrame) -> pd.DataFrame:
         )
     df["price"] = pd.to_numeric(df["price"], errors="coerce")
     df["mileage"] = pd.to_numeric(df["mileage"], errors="coerce")
-    df = df[df["price"].notna() & (df["price"] > 0)]
-    df = df[df["mileage"].notna() & (df["mileage"] >= 0)]
+    valid_rows = (
+        df["price"].notna()
+        & (df["price"] > 0)
+        & df["mileage"].notna()
+        & (df["mileage"] >= 0)
+    )
+    if not bool(valid_rows.all()):
+        df = df.loc[valid_rows].copy()
 
     for col in ["date", "loaddate"]:
         if col in df.columns:
@@ -442,7 +639,11 @@ def engineer_current_price_features(df: pd.DataFrame) -> pd.DataFrame:
         df["vehicle_age"] = (datetime.now().year - model_year).clip(lower=0)
         df["vehicle_age_squared"] = df["vehicle_age"] ** 2
         df["miles_per_year"] = df["mileage"] / df["vehicle_age"].clip(lower=1)
-        df["model_year_bucket"] = (model_year // 5 * 5).astype("Int64").astype("string")
+        df["model_year_bucket"] = (
+            (model_year // 5 * 5)
+            .astype("int32[pyarrow]")
+            .astype("string[pyarrow]")
+        )
     else:
         df["vehicle_age"] = np.nan
         df["vehicle_age_squared"] = np.nan
@@ -463,7 +664,7 @@ def engineer_current_price_features(df: pd.DataFrame) -> pd.DataFrame:
             "100k_150k",
             "150k_plus",
         ],
-    ).astype("string")
+    ).astype("string[pyarrow]")
     if "loaddate" in df.columns and df["loaddate"].notna().any():
         max_load_date = df["loaddate"].max()
         df["listing_recency_days"] = (max_load_date - df["loaddate"]).dt.days
@@ -475,69 +676,93 @@ def engineer_current_price_features(df: pd.DataFrame) -> pd.DataFrame:
         df["listing_week"] = np.nan
 
     if "locationCode" in df.columns:
-        location_text = df["locationCode"].astype("string").str.zfill(5)
+        location_text = df["locationCode"].astype("string[pyarrow]").str.zfill(5)
         df["location_region"] = location_text.str.slice(0, 2).fillna("UNKNOWN")
 
     for col in ["pendingSale", "priceRecentChange"]:
         if col in df.columns:
-            df[col] = df[col].astype("string").str.lower().isin(["1", "true", "yes"]).astype("int8")
+            df[col] = (
+                df[col]
+                .astype("string[pyarrow]")
+                .str.lower()
+                .isin(["1", "true", "yes"])
+                .astype("int8[pyarrow]")
+            )
 
     for col in ["vehicleTitle", "vehicleTitleDesc", "title"]:
         if col in df.columns:
-            text = df[col].astype("string").fillna("")
+            text = df[col].astype("string[pyarrow]").fillna("")
             df[f"{col}_length"] = text.str.len()
             df[f"{col}_word_count"] = text.str.split().str.len()
 
-    trim_candidates = [df[col] for col in TRIM_FEATURE_CANDIDATES if col in df.columns]
-    for col in TRIM_METADATA_COLUMNS:
+    trim_candidates = []
+    for col in TRIM_FEATURE_CANDIDATES:
         if col in df.columns:
-            df[col] = df[col].map(normalize_trim_feature).astype("string")
+            normalized = normalize_trim_series(df[col])
+            df[col] = normalized
+            trim_candidates.append(normalized)
 
     df["trim_proxy"] = "UNKNOWN_TRIM"
     for candidate in trim_candidates:
-        normalized = candidate.map(normalize_trim_feature)
-        usable = normalized.notna() & normalized.ne("UNKNOWN_TRIM") & normalized.ne("")
-        df.loc[df["trim_proxy"].eq("UNKNOWN_TRIM") & usable, "trim_proxy"] = normalized[usable]
-    df["trim_proxy"] = df["trim_proxy"].astype("string")
+        usable = candidate.notna() & candidate.ne("UNKNOWN_TRIM") & candidate.ne("")
+        df.loc[df["trim_proxy"].eq("UNKNOWN_TRIM") & usable, "trim_proxy"] = candidate[usable]
+    df["trim_proxy"] = df["trim_proxy"].astype("string[pyarrow]")
 
     if "vehicleTitle" in df.columns:
         title_parts = [
-            df[col].astype("string").fillna("")
+            df[col].astype("string[pyarrow]").fillna("")
             for col in ["vehicleTitle", "vehicleTitleDesc", "title", "trim_proxy"]
             if col in df.columns
         ]
-        title = title_parts[0] if title_parts else pd.Series("", index=df.index, dtype="string")
+        title = (
+            title_parts[0]
+            if title_parts
+            else pd.Series("", index=df.index, dtype="string[pyarrow]")
+        )
         for part in title_parts[1:]:
             title = title + " " + part
         df["title_mentions_certified"] = title.str.contains(
             "certified|cpo",
             case=False,
             na=False,
-        ).astype("int8")
+        ).astype("int8[pyarrow]")
         df["title_mentions_awd_4wd"] = title.str.contains(
             "awd|4wd|4x4|all wheel",
             case=False,
             na=False,
-        ).astype("int8")
+        ).astype("int8[pyarrow]")
         df["title_mentions_luxury_trim"] = title.str.contains(
             "premium|platinum|limited|reserve|s|amg|m sport|rs|performance|gt350|gt500",
             case=False,
             na=False,
-        ).astype("int8")
+        ).astype("int8[pyarrow]")
 
     if "sourceName" in df.columns:
-        source = df["sourceName"].astype("string").fillna("UNKNOWN")
+        source = df["sourceName"].astype("string[pyarrow]").fillna("UNKNOWN")
         df["source_is_marketplace"] = source.str.contains(
             "Cars.com|TrueCar|CarGurus|AutoTempest",
             case=False,
             na=False,
-        ).astype("int8")
+        ).astype("int8[pyarrow]")
 
-    make = df["canonical_make"].astype("string").fillna("UNKNOWN")
-    model = df["canonical_model"].astype("string").fillna("UNKNOWN")
-    year = pd.to_numeric(df["canonical_year"], errors="coerce").astype("Int64").astype("string").fillna("UNKNOWN")
-    body = df.get("nhtsa_BodyClass", pd.Series("UNKNOWN", index=df.index)).astype("string").fillna("UNKNOWN")
-    fuel = df.get("nhtsa_FuelTypePrimary", pd.Series("UNKNOWN", index=df.index)).astype("string").fillna("UNKNOWN")
+    make = df["canonical_make"].astype("string[pyarrow]").fillna("UNKNOWN")
+    model = df["canonical_model"].astype("string[pyarrow]").fillna("UNKNOWN")
+    year = (
+        pd.to_numeric(df["canonical_year"], errors="coerce")
+        .astype("int32[pyarrow]")
+        .astype("string[pyarrow]")
+        .fillna("UNKNOWN")
+    )
+    body = (
+        df.get("nhtsa_BodyClass", pd.Series("UNKNOWN", index=df.index))
+        .astype("string[pyarrow]")
+        .fillna("UNKNOWN")
+    )
+    fuel = (
+        df.get("nhtsa_FuelTypePrimary", pd.Series("UNKNOWN", index=df.index))
+        .astype("string[pyarrow]")
+        .fillna("UNKNOWN")
+    )
 
     df["make_model_year"] = make + "_" + model + "_" + year
     df["make_model_year_trim"] = df["make_model_year"] + "_" + df["trim_proxy"].fillna("UNKNOWN_TRIM")
@@ -545,15 +770,38 @@ def engineer_current_price_features(df: pd.DataFrame) -> pd.DataFrame:
     df["is_ev_or_hybrid"] = (
         fuel.str.contains("electric|hybrid", case=False, na=False)
         | df.get("nhtsa_ElectrificationLevel", pd.Series("", index=df.index))
-        .astype("string")
+        .astype("string[pyarrow]")
         .str.contains("electric|hybrid|bev|phev", case=False, na=False)
-    ).astype("int8")
+    ).astype("int8[pyarrow]")
 
     df["price_band"] = pd.cut(
         df["price"],
         bins=[0, 25_000, 50_000, 100_000, HIGH_VALUE_THRESHOLD, np.inf],
         labels=["under_25k", "25k_50k", "50k_100k", "100k_150k", "150k_plus"],
-    ).astype("string")
+    ).astype("string[pyarrow]")
+
+    for column in [
+        "vehicle_age",
+        "vehicle_age_squared",
+        "listing_recency_days",
+        "listing_month",
+        "listing_week",
+        "vehicleTitle_length",
+        "vehicleTitle_word_count",
+        "vehicleTitleDesc_length",
+        "vehicleTitleDesc_word_count",
+        "title_length",
+        "title_word_count",
+    ]:
+        if column in df.columns:
+            df[column] = df[column].astype("int32[pyarrow]")
+    for column in [
+        "miles_per_year",
+        "log_mileage",
+        "mileage_age_interaction",
+    ]:
+        if column in df.columns:
+            df[column] = df[column].astype("float32[pyarrow]")
 
     return df.reset_index(drop=True)
 
@@ -585,9 +833,11 @@ def split_train_test(
     df: pd.DataFrame,
     split_date: str | None = None,
     test_size: float = 0.2,
+    copy_frame: bool = True,
 ) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, Any]]:
     """Prefer a time cutoff, then remove overlapping VINs from the training set."""
-    df = df.copy()
+    if copy_frame:
+        df = df.copy()
     if "loaddate" in df.columns:
         df["loaddate"] = pd.to_datetime(df["loaddate"], errors="coerce")
 
@@ -623,7 +873,7 @@ def split_train_test(
 
 
 def make_feature_matrix(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series, pd.DataFrame]:
-    y = df["price"].astype("float64")
+    y = df["price"].astype("float32")
     drop_columns = DROP_FEATURE_COLUMNS | PRICE_LEAKAGE_FEATURE_COLUMNS | IDENTITY_DIAGNOSTIC_COLUMNS
     feature_df = df.drop(columns=[c for c in drop_columns if c in df.columns], errors="ignore")
     assert_canonical_identity_contract(feature_df)
@@ -633,6 +883,25 @@ def make_feature_matrix(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series, pd.D
 def to_float32(X: Any) -> Any:
     """Cast transformed numeric blocks to float32 to reduce full-fit memory."""
     return X.astype(np.float32)
+
+
+def normalize_categorical_missing_values(X: Any) -> Any:
+    """Replace pandas nullable sentinels before scikit-learn object conversion."""
+    if isinstance(X, pd.DataFrame):
+        normalized = X.copy(deep=False)
+        for column in normalized.columns:
+            values = normalized[column]
+            if isinstance(values.dtype, pd.CategoricalDtype) and values.isna().any():
+                values = values.astype("string[pyarrow]")
+            normalized[column] = values.fillna("UNKNOWN")
+        return normalized
+
+    values = np.asarray(X, dtype=object)
+    missing = pd.isna(values)
+    if missing.any():
+        values = values.copy()
+        values[missing] = "UNKNOWN"
+    return values
 
 
 def build_preprocessors(X_train: pd.DataFrame) -> tuple[ColumnTransformer, Pipeline, dict[str, Any]]:
@@ -655,6 +924,10 @@ def build_preprocessors(X_train: pd.DataFrame) -> tuple[ColumnTransformer, Pipel
     ]
 
     float32_cast = FunctionTransformer(to_float32, feature_names_out="one-to-one")
+    categorical_missing = FunctionTransformer(
+        normalize_categorical_missing_values,
+        feature_names_out="one-to-one",
+    )
     numeric_pipeline = Pipeline(
         [
             ("imputer", SimpleImputer(strategy="median")),
@@ -663,6 +936,7 @@ def build_preprocessors(X_train: pd.DataFrame) -> tuple[ColumnTransformer, Pipel
     )
     categorical_low = Pipeline(
         [
+            ("normalize_missing", categorical_missing),
             ("imputer", SimpleImputer(strategy="constant", fill_value="UNKNOWN")),
             (
                 "onehot",
@@ -678,6 +952,7 @@ def build_preprocessors(X_train: pd.DataFrame) -> tuple[ColumnTransformer, Pipel
     )
     categorical_high = Pipeline(
         [
+            ("normalize_missing", categorical_missing),
             ("imputer", SimpleImputer(strategy="constant", fill_value="UNKNOWN")),
             ("target", TargetEncoder(min_samples_leaf=20, smoothing=10)),
             ("float32", float32_cast),
@@ -970,7 +1245,7 @@ def stratified_tuning_sample_positions(
 
     strata = (
         segment_frame[available_cols]
-        .astype("string")
+        .astype("string[pyarrow]")
         .fillna("UNKNOWN")
         .agg("|".join, axis=1)
     )
@@ -1246,12 +1521,40 @@ def train_current_price_models(
         absa_db_path,
         sample_size,
         sample_strategy,
+        deduplicate_vins=deduplicate_vins,
     )
-    model_df = engineer_current_price_features(raw_df)
+    sql_dedup_metadata = raw_df.attrs.get("deduplication")
+    raw_rows = int(raw_df.shape[0])
+    identity_profile = identity_normalization_profile(raw_df)
+    model_df = engineer_current_price_features(raw_df, copy_frame=False)
+    del raw_df
+    gc.collect()
+
     dedup_metadata = {"deduplicated_vins": False}
     if deduplicate_vins:
-        model_df, dedup_metadata = keep_latest_listing_per_vin(model_df)
-    train_df, test_df, split_metadata = split_train_test(model_df, split_date)
+        if sql_dedup_metadata:
+            dedup_metadata = dict(sql_dedup_metadata)
+            dedup_metadata["rows_after"] = int(model_df.shape[0])
+            dedup_metadata["rows_removed"] = int(
+                max(0, dedup_metadata["rows_before"] - model_df.shape[0])
+            )
+        else:
+            model_df, dedup_metadata = keep_latest_listing_per_vin(model_df)
+    model_rows = int(model_df.shape[0])
+    canonical_trim_input = "canonical_trim" if "canonical_trim" in model_df.columns else None
+    comparison_columns_available = [
+        col for col in TRIM_METADATA_COLUMNS if col != "canonical_trim" and col in model_df.columns
+    ]
+    engineered_trim_columns = [
+        col for col in ["trim_proxy", "make_model_year_trim"] if col in model_df.columns
+    ]
+    train_df, test_df, split_metadata = split_train_test(
+        model_df,
+        split_date,
+        copy_frame=False,
+    )
+    del model_df
+    gc.collect()
 
     X_train, y_train, train_segments = make_feature_matrix(train_df)
     X_test, y_test, test_segments = make_feature_matrix(test_df)
@@ -1306,8 +1609,8 @@ def train_current_price_models(
         "sample_size": int(sample_size or 0),
         "sample_strategy": sample_strategy,
         "row_counts": {
-            "raw_rows": int(raw_df.shape[0]),
-            "model_rows": int(model_df.shape[0]),
+            "raw_rows": raw_rows,
+            "model_rows": model_rows,
             "train_rows": int(train_df.shape[0]),
             "test_rows": int(test_df.shape[0]),
             "train_vins": int(train_df["vin"].nunique()),
@@ -1323,15 +1626,11 @@ def train_current_price_models(
         "split": split_metadata,
         "features": feature_metadata,
         "trim_features": {
-            "canonical_trim_input": "canonical_trim" if "canonical_trim" in model_df.columns else None,
-            "comparison_columns_available": [
-                col for col in TRIM_METADATA_COLUMNS if col != "canonical_trim" and col in model_df.columns
-            ],
-            "engineered_trim_columns": [
-                col for col in ["trim_proxy", "make_model_year_trim"] if col in model_df.columns
-            ],
+            "canonical_trim_input": canonical_trim_input,
+            "comparison_columns_available": comparison_columns_available,
+            "engineered_trim_columns": engineered_trim_columns,
         },
-        "identity_normalization": identity_normalization_profile(raw_df),
+        "identity_normalization": identity_profile,
         "tuning": {
             "max_tuning_rows": DEFAULT_TUNING_SAMPLE_SIZE,
             "sampling_strategy": "deterministic stratified sample by diagnostic price band, canonical make, and canonical model year",
@@ -1354,7 +1653,8 @@ def train_current_price_models(
         "models": metrics,
         "recommended_model": best_name,
         "notes": [
-            "Training defaults to the latest listing row per VIN to avoid duplicate VIN overweighting.",
+            "Training defaults to all eligible VINs; SQLite selects the latest listing row before materialization to avoid duplicate VIN overweighting.",
+            "SQLite results are read in bounded chunks with Arrow-backed strings and nullable 32-bit numeric columns.",
             "Price bands are created only after observing price and are kept out of the feature matrix to avoid target leakage.",
             "NHTSA base-price fields are excluded because the cleaned base price can be filled from observed price history.",
             "NHTSA make/model anchor canonical identity; title-derived canonical trim is the only trim input.",
@@ -1448,7 +1748,7 @@ def write_reports(output_dir: Path, report: dict[str, Any]) -> None:
             "- Every candidate model uses a leakage-safe classifier router before separately fit everyday/high-value regressors.",
             "- `nhtsa_BasePrice` and `nhtsa_BasePrice_source` are excluded because base price can be filled from observed price history.",
             "- Hyperparameters are tuned on a representative bounded sample, then refit on the full training split.",
-            "- Full-database runs are opt-in with `--sample-size 0`.",
+            "- Full eligible-VIN training is the default; pass a positive `--sample-size` for bounded development runs.",
             "",
             "## Research Rationale",
             "- Used-car pricing literature supports supervised tabular/tree models when vehicle attributes, mileage, and market context are controlled.",
@@ -1460,9 +1760,13 @@ def write_reports(output_dir: Path, report: dict[str, Any]) -> None:
 
 def load_and_split_data():
     """Backward-compatible helper used by the existing notebook."""
-    raw_df, _ = load_modeling_frame(DB_PATH, ABSA_DB_PATH, DEFAULT_SAMPLE_SIZE)
+    raw_df, _ = load_modeling_frame(
+        DB_PATH,
+        ABSA_DB_PATH,
+        DEFAULT_SAMPLE_SIZE,
+        deduplicate_vins=True,
+    )
     model_df = engineer_current_price_features(raw_df)
-    model_df, _ = keep_latest_listing_per_vin(model_df)
     train_df, test_df, _ = split_train_test(model_df)
     X_train, y_train, _ = make_feature_matrix(train_df)
     X_test, y_test, _ = make_feature_matrix(test_df)

@@ -152,10 +152,15 @@ Sentiment features are intended to support the capstone question about whether c
 
 Important design choices:
 
-- Bounded SQLite reads by default to keep development runs feasible.
-- Full-database runs are opt-in with `--sample-size 0`; hyperparameter search
-  uses a representative 200k-row tuning sample, then refits the tuned model on
-  the full training split.
+- Full eligible-VIN training is the default. SQLite filters invalid target rows
+  and selects the latest listing snapshot per VIN before joining NHTSA data, so
+  repeated snapshots are not materialized only to be discarded later.
+- Query results are read in bounded chunks with Arrow-backed pandas columns;
+  SQLite integers and reals are narrowed to nullable 32-bit types before chunks
+  are combined.
+- Positive `--sample-size` values remain available for bounded development.
+  Hyperparameter search uses a representative 200k-row tuning sample, then
+  refits the tuned model on the full training split.
 - Canonical identity features come exclusively from `canonical_make`, `canonical_model`, `canonical_year`, and title-derived `canonical_trim`; raw/legacy trim candidates and identity diagnostics are excluded from the feature matrix.
 - Feature engineering for age, mileage, recency, ZIP region, listing text lengths, title keywords, EV/hybrid status, body/fuel segments, and canonical make/model/year/trim combinations.
 - Latest-row-per-VIN deduplication by default.
@@ -183,7 +188,7 @@ Important design choices:
 
 ### Streamlit Dashboard
 
-`streamlit_app.py` provides an interactive UI over the cleaned database and generated model artifacts. Filters and primary labels use canonical identity; raw titles and NHTSA trims remain visible for comparison. The app reports normalization coverage, EPA matching, unresolved titles, and NHTSA identity disagreement, warns on a missing canonical schema, and disables predictions when database and model normalization versions differ.
+`streamlit_app.py` provides an interactive UI over the cleaned database and generated model artifacts. Filters and primary labels use canonical identity; raw titles and NHTSA trims remain visible for comparison. The app reports normalization coverage, EPA matching, unresolved titles, and NHTSA identity disagreement, warns on a missing canonical schema, and disables predictions when database and model normalization versions differ. Current-price joblib artifacts retain compatibility with direct-script training through an explicit custom-object registration layer. Filter-scoped scoring also preserves its metric schema when individual models fail, allowing the dashboard to show model-specific diagnostics without masking them behind a secondary table error.
 
 ## Validation and Testing
 
@@ -246,9 +251,13 @@ Current-price modeling:
 
 ```powershell
 python ML\Price_ML_Models.py --sample-size 5000
-# Intentional full-data run:
+# Explicit full-data run (also the default when the flag is omitted):
 python ML\Price_ML_Models.py --sample-size 0
 ```
+
+`python ML\Price_ML_Models.py --task all` passes the current-price sample size
+through to depreciation. With the default `0`, both workflows use their full
+eligible data; pass a positive sample size for a bounded end-to-end run.
 
 Current-price plus depreciation modeling:
 
@@ -276,5 +285,6 @@ streamlit run streamlit_app.py
 - Some utility and EDA scripts still contain absolute Windows paths. Prefer repo-root-relative paths when touching them.
 - `Utilities/fix_database_schema.py` is additive and backs up the raw database before migration, but agents should avoid running it unless schema verification shows it is needed.
 - YouTube ingestion requires `YOUTUBE_API_KEY` or `GOOGLE_API_KEY`.
-- Large database scans can be expensive. Use sample-size defaults unless a full capstone run is intentional.
+- Full current-price runs can take hours even with bounded-memory loading. Use a
+  positive `--sample-size` for development and smoke tests.
 - When adding research claims or new techniques, verify against recent primary sources, official docs, or peer-reviewed work and record the rationale in model reports or project docs.

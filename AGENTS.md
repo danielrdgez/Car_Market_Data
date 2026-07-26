@@ -60,7 +60,7 @@ python -m unittest tests\test_sentiment_incremental.py
 python -m py_compile DataPipeline\Playwright_test.py DataPipeline\DataAquisition.py DataPipeline\DataCleaning.py DataPipeline\VehicleNormalization.py DataPipeline\NHTSA_enrichment.py DataPipeline\SentimentAnalysis.py DataPipeline\absa_pipeline.py ML\Price_ML_Models.py ML\Time_Series_Price.py Utilities\health_check.py
 ```
 
-Modeling defaults are intentionally bounded. Do not switch to full-database training unless the user explicitly wants a long run.
+Current-price modeling defaults to all eligible VINs with SQL-side latest-snapshot selection and chunked Arrow-backed reads. Use a positive sample size for bounded development and verification.
 
 ```powershell
 python ML\Price_ML_Models.py
@@ -122,11 +122,12 @@ run_pipeline_scheduler.bat --dry-run
 - Avoid target leakage. Do not train on `price`, `price_band`, future price fields, or any feature created from the target unless it is explicitly removed before fitting.
 - Preserve VIN-safe validation. Current-price splits should avoid VIN overlap between train and test.
 - Prefer time-based validation when enough dates exist; fall back to grouped validation by VIN or cohort.
-- Keep bounded data loads as the default for large SQLite inputs.
-- Do not run model training during implementation verification unless explicitly needed; any smoke run must use at most `--sample-size 5000`. Full runs remain explicit with `--sample-size 0`.
+- Keep current-price full-data loading bounded in memory through SQL-side latest-per-VIN selection, chunked reads, and early numeric downcasting.
+- Do not run full model training during implementation verification. Any smoke run must explicitly use at most `--sample-size 5000`, even though production current-price runs default to full eligible-VIN input.
 - Record model assumptions, row counts, split strategy, metrics, and caveats in generated reports.
 - Compare readable baselines against advanced models. Do not present a complex model as better unless metrics support it.
 - Segment diagnostics should include high-value vehicles, price bands, make, and model year when feasible.
+- When a custom current-price estimator or transformer is persisted in a joblib artifact from direct script execution, update the Streamlit `__main__` compatibility registration and dashboard regression tests in the same change.
 - When `ML/Price_ML_Models.py` or `ML/Time_Series_Price.py` changes output schemas, metrics, artifact names, feature-importance fields, or forecast columns, update `ML/Model_Output.ipynb` in the same change so the notebook can read and summarize the corresponding outputs.
 - For depreciation, preserve the cohort grain of make, model, model year, and trim proxy unless there is a research reason to change it. Keep the default output as monthly cohort-level forecasts out to five years, not VIN-level forecasts or fixed 30/60/90-day buckets. When adding or changing time-series models, preserve `cohort_future_forecasts.csv`, `cohort_backtesting_results.csv`, and `cohort_backtesting_kpis.csv` contracts so Streamlit and `ML/Model_Output.ipynb` can compare model families by cohort and horizon.
 

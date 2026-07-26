@@ -11,12 +11,14 @@ import pandas as pd
 
 from DataPipeline.DataCleaning import DataCleaningPipeline
 from ML.Price_ML_Models import (
+    DEFAULT_SAMPLE_SIZE as CURRENT_PRICE_DEFAULT_SAMPLE_SIZE,
     HighValueRoutedRegressor,
     MAX_PARALLEL_TUNING_ROWS,
     PRICE_LEAKAGE_FEATURE_COLUMNS as CURRENT_PRICE_LEAKAGE_FEATURE_COLUMNS,
     build_preprocessors,
     engineer_current_price_features,
     get_preprocessor_feature_names,
+    load_modeling_frame,
     make_feature_matrix,
     model_candidates,
     split_train_test,
@@ -471,6 +473,104 @@ def create_cleaned_gap_fixture_db(path: Path) -> None:
         conn.close()
 
 
+def create_current_price_loader_fixture_db(path: Path) -> None:
+    conn = sqlite3.connect(path)
+    try:
+        conn.execute(
+            """
+            CREATE TABLE listings (
+                vin TEXT,
+                loaddate DATE,
+                date DATE,
+                price INTEGER,
+                mileage INTEGER,
+                distance REAL,
+                canonical_make TEXT,
+                canonical_model TEXT,
+                canonical_year INTEGER,
+                canonical_trim TEXT,
+                PRIMARY KEY (vin, loaddate)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE nhtsa_enrichment (
+                vin TEXT PRIMARY KEY,
+                nhtsa_BodyClass TEXT,
+                nhtsa_EngineHP INTEGER,
+                nhtsa_DisplacementL REAL,
+                nhtsa_BasePrice INTEGER,
+                nhtsa_BasePrice_source TEXT
+            )
+            """
+        )
+        conn.executemany(
+            "INSERT INTO listings VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+                (
+                    "VIN1",
+                    "2026-01-01",
+                    "2026-01-01",
+                    20_000,
+                    40_000,
+                    10.5,
+                    "TOYOTA",
+                    "CAMRY",
+                    2020,
+                    "LE",
+                ),
+                (
+                    "VIN1",
+                    "2026-02-01",
+                    "2026-02-01",
+                    19_000,
+                    41_000,
+                    10.5,
+                    "TOYOTA",
+                    "CAMRY",
+                    2020,
+                    "LE",
+                ),
+                (
+                    "VIN2",
+                    "2026-03-01",
+                    "2026-03-01",
+                    30_000,
+                    20_000,
+                    5.25,
+                    "HONDA",
+                    "ACCORD",
+                    2022,
+                    "EX",
+                ),
+                (
+                    "VIN3",
+                    "2026-04-01",
+                    "2026-04-01",
+                    0,
+                    10_000,
+                    2.0,
+                    "FORD",
+                    "FUSION",
+                    2019,
+                    "SE",
+                ),
+            ],
+        )
+        conn.executemany(
+            "INSERT INTO nhtsa_enrichment VALUES (?, ?, ?, ?, ?, ?)",
+            [
+                ("VIN1", "Sedan", 203, 2.5, 25_000, "nhtsa"),
+                ("VIN2", "Sedan", 192, 1.5, 28_000, "nhtsa"),
+                ("VIN3", "Sedan", 175, 2.0, 22_000, "nhtsa"),
+            ],
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
 class DataCleaningUpgradeTests(unittest.TestCase):
     def test_cleaning_retains_valid_make_outside_legacy_whitelist(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -651,6 +751,51 @@ class DataCleaningUpgradeTests(unittest.TestCase):
 
 
 class ModelingUpgradeTests(unittest.TestCase):
+    def test_current_price_loader_defaults_to_all_latest_valid_vins(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "cleaned.db"
+            create_current_price_loader_fixture_db(db_path)
+
+            frame, _ = load_modeling_frame(
+                db_path,
+                absa_db_path=None,
+                chunk_size=1,
+            )
+
+            self.assertEqual(CURRENT_PRICE_DEFAULT_SAMPLE_SIZE, 0)
+            self.assertEqual(set(frame["vin"]), {"VIN1", "VIN2"})
+            self.assertEqual(frame.loc[frame["vin"].eq("VIN1"), "price"].item(), 19_000)
+            self.assertEqual(str(frame["price"].dtype), "int32[pyarrow]")
+            self.assertEqual(str(frame["distance"].dtype), "float[pyarrow]")
+            self.assertEqual(str(frame["nhtsa_EngineHP"].dtype), "int32[pyarrow]")
+            self.assertNotIn("nhtsa_BasePrice", frame.columns)
+            self.assertEqual(frame.attrs["deduplication"]["rows_before"], 4)
+            self.assertEqual(frame.attrs["deduplication"]["rows_after"], 2)
+
+    def test_current_price_loader_keeps_bounded_and_duplicate_options(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "cleaned.db"
+            create_current_price_loader_fixture_db(db_path)
+
+            sampled, _ = load_modeling_frame(
+                db_path,
+                absa_db_path=None,
+                sample_size=2,
+                sample_strategy="recent",
+                chunk_size=1,
+            )
+            snapshots, _ = load_modeling_frame(
+                db_path,
+                absa_db_path=None,
+                sample_size=0,
+                deduplicate_vins=False,
+                chunk_size=2,
+            )
+
+            self.assertEqual(set(sampled["vin"]), {"VIN2"})
+            self.assertEqual(snapshots.shape[0], 3)
+            self.assertEqual(snapshots["vin"].value_counts().loc["VIN1"], 2)
+
     def test_current_price_split_has_no_vin_overlap(self):
         start = date(2026, 1, 1)
         rows = []
@@ -777,6 +922,37 @@ class ModelingUpgradeTests(unittest.TestCase):
         self.assertIn("target_encoded__nhtsa_Model", feature_names)
         self.assertIn("target_encoded__trim_proxy", feature_names)
         self.assertFalse(any(name.startswith("cat_high__") and name.split("__", 1)[1].isdigit() for name in feature_names))
+
+    def test_preprocessors_accept_arrow_nullable_categorical_values(self):
+        X = pd.DataFrame(
+            {
+                "mileage": pd.Series([10_000, 20_000, 30_000, 40_000], dtype="int32[pyarrow]"),
+                "model_year_bucket": pd.Series(
+                    ["2020", pd.NA, "2025", "2020"],
+                    dtype="string[pyarrow]",
+                ),
+                "body_class": pd.Series(
+                    ["Sedan", "Truck", pd.NA, "SUV"],
+                    dtype="string[pyarrow]",
+                ),
+            }
+        )
+        y = pd.Series([25_000, 42_000, 28_000, 65_000], dtype="float32")
+        tree_preprocessor, _, metadata = build_preprocessors(X)
+
+        transformed = tree_preprocessor.fit_transform(X, y)
+
+        self.assertIn(
+            "model_year_bucket",
+            metadata["high_cardinality_categorical_features"],
+        )
+        self.assertIn(
+            "body_class",
+            metadata["low_cardinality_categorical_features"],
+        )
+        self.assertEqual(transformed.shape[0], X.shape[0])
+        dense = transformed.toarray() if hasattr(transformed, "toarray") else np.asarray(transformed)
+        self.assertTrue(np.isfinite(dense).all())
 
     def test_current_price_candidates_are_all_high_value_routed_without_prefixes(self):
         X = pd.DataFrame(

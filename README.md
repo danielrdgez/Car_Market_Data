@@ -90,19 +90,27 @@ Train current-price models:
 python ML\Price_ML_Models.py
 ```
 
-For a bounded smoke run, use `--sample-size 5000`. Full-data training remains
-explicit with `--sample-size 0` and can take several hours.
+The default run uses every eligible VIN. SQLite selects the latest valid
+listing snapshot per VIN before joining enrichment data, then pandas reads the
+result in bounded chunks with Arrow-backed strings and nullable 32-bit numeric
+columns. This avoids materializing every historical snapshot as one large
+`float64` block.
 
-The default run loads a bounded recent sample for iteration. Full-database
-training is opt-in with `--sample-size 0`; hyperparameter search uses a
-representative 200k-row tuning sample, then refits the tuned model on the full
-training split.
+For a bounded smoke run, use `--sample-size 5000`. A positive sample size scopes
+listing snapshots before latest-per-VIN selection; `--sample-size 0` explicitly
+requests the same full eligible-VIN behavior as the default. Hyperparameter
+search still uses a representative 200k-row tuning sample, then refits the tuned
+model on the full training split where the model family supports it.
 
 Train current-price and depreciation models together:
 
 ```powershell
 python ML\Price_ML_Models.py --task all
 ```
+
+Because the current-price default sample size is `0`, `--task all` also requests
+full price-history input from the depreciation workflow and can take several
+hours. Add `--sample-size 5000` for a bounded end-to-end smoke run.
 
 Launch the Streamlit dashboard:
 
@@ -128,6 +136,12 @@ python -m unittest tests\test_vehicle_normalization.py tests\test_streamlit_cano
 7. `ML/Price_ML_Models.py` trains leakage-aware current-price models and writes reports to `MODELS_OUTPUT/`.
 8. `ML/Time_Series_Price.py` trains cohort-level monthly depreciation forecasts from historical price trajectories with global ML, SARIMAX, Prophet, and TimesFM model families when their dependencies are installed.
 9. `streamlit_app.py` reads `CAR_DATA_CLEANED.db` and `MODELS_OUTPUT/` artifacts to present filterable VIN actuals, NHTSA KPIs, global and filter-scoped model metrics, current-price predictions, cohort future-price forecasts, and time-series backtesting KPIs.
+
+Current-price artifacts are trained by direct script execution, so the dashboard
+registers their custom estimator and transformer symbols before joblib loading.
+If an artifact cannot be loaded or scored, the Model Predictions tab preserves
+the metric-table schema and reports the model-specific error instead of failing
+the entire page.
 
 ## Modeling Approach
 
