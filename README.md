@@ -22,6 +22,7 @@ Car-Price-Data-Visualization-Learning/
 |-- requirements.txt                  # Python dependencies
 |-- streamlit_app.py                  # Interactive dashboard for actuals and models
 |-- run_pipeline_scheduler.bat        # Windows scheduler entry point
+|-- run_pipeline_scheduler.sh         # macOS/Linux scheduler entry point
 |-- DataPipeline/
 |   |-- Playwright_test.py            # Current Playwright global-queue scraper
 |   |-- DataAquisition.py             # Legacy/reference Selenium CDP scraper
@@ -60,7 +61,17 @@ python -m playwright install
 python Utilities\health_check.py
 ```
 
-The Windows scheduler script prefers the repo-local `.venv` when it exists, so keeping that environment populated is the safest way to run the pipeline end to end.
+Both scheduler scripts prefer the repo-local `.venv` when it exists. The
+macOS/Linux script also recognizes the repository's legacy `venv` directory
+before falling back to `python3` or `python` on `PATH`.
+
+On macOS, create the environment and install Playwright with:
+
+```bash
+python3 -m venv .venv
+./.venv/bin/python -m pip install -r requirements.txt
+./.venv/bin/python -m playwright install
+```
 
 Run the core data pipeline:
 
@@ -69,6 +80,16 @@ python DataPipeline\Playwright_test.py
 python DataPipeline\NHTSA_enrichment.py
 python DataPipeline\DataCleaning.py
 ```
+
+Run the complete macOS pipeline in sequence:
+
+```bash
+./run_pipeline_scheduler.sh --dry-run
+./run_pipeline_scheduler.sh
+```
+
+Each command waits for the previous Python process to finish. The pipeline stops
+immediately and returns that process's exit code if any stage fails.
 
 Cleaning refreshes the official FuelEconomy.gov `vehicles.csv.zip` catalog into
 `CAR_DATA_OUTPUT/reference/epa_fuel_economy/` and imports it into the cleaned
@@ -107,6 +128,18 @@ Train current-price and depreciation models together:
 ```powershell
 python ML\Price_ML_Models.py --task all
 ```
+
+TimesFM downloads its configured checkpoint from Hugging Face. To authenticate
+those requests, create a repository-root `.env` file and add your token without
+quotes:
+
+```dotenv
+HF_TOKEN=hf_replace_with_your_token
+```
+
+`ML/Time_Series_Price.py` loads this file before importing TimesFM. A token
+already set in the shell environment takes precedence, and `.env` is ignored by
+Git so credentials are not committed.
 
 Because the current-price default sample size is `0`, `--task all` also requests
 full price-history input from the depreciation workflow and can take several

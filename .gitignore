@@ -41,6 +41,7 @@ __pycache__/
 # Explicitly unignore specific files
 !/AGENTS.md
 !/streamlit_app.py
+!/run_pipeline_scheduler.sh
 !/DataPipeline/SentimentAnalysis.py
 !/DataPipeline/VehicleNormalization.py
 !/EDA/Depreciation_Analysis.py

@@ -24,6 +24,7 @@ from typing import Any
 import joblib
 import numpy as np
 import pandas as pd
+from dotenv import load_dotenv
 from sklearn.compose import ColumnTransformer
 from sklearn.dummy import DummyRegressor
 from sklearn.ensemble import HistGradientBoostingRegressor
@@ -38,6 +39,11 @@ warnings.filterwarnings(
     message="X does not have valid feature names, but LGBMRegressor was fitted with feature names",
     category=UserWarning,
 )
+
+# Load repository-local credentials before importing optional Hub-backed models.
+# Existing shell environment variables take precedence over values in .env.
+BASE_DIR = Path(__file__).resolve().parent.parent
+load_dotenv(BASE_DIR / ".env", override=False)
 
 try:
     from lightgbm import LGBMRegressor
@@ -60,7 +66,6 @@ except ImportError:  # pragma: no cover - optional foundation-model dependency
     timesfm = None
 
 
-BASE_DIR = Path(__file__).resolve().parent.parent
 DB_PATH = BASE_DIR / "CAR_DATA_OUTPUT" / "CAR_DATA_CLEANED.db"
 OUTPUT_DIR = BASE_DIR / "MODELS_OUTPUT"
 

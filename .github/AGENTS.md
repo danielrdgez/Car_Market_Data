@@ -40,6 +40,14 @@ Use this before scheduled ingestion:
 run_pipeline_scheduler.bat --dry-run
 ```
 
+```bash
+./run_pipeline_scheduler.sh --dry-run
+```
+
+Keep `run_pipeline_scheduler.bat` and `run_pipeline_scheduler.sh` aligned: both
+must run Playwright scraping, NHTSA enrichment, EPA refresh/validation, and
+cleaning with `--no-epa-refresh` as four blocking, fail-fast stages.
+
 ## Coding Rules Specific To This Repo
 
 - Preserve Playwright response interception for `queue-results`; do not scrape listing HTML when structured network data is available.

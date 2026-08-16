@@ -75,10 +75,14 @@ Use dry run before scheduled ingestion:
 run_pipeline_scheduler.bat --dry-run
 ```
 
+```bash
+./run_pipeline_scheduler.sh --dry-run
+```
+
 ## Scheduled Pipeline Synchronization
 
-- `run_pipeline_scheduler.bat` is the Windows Task Scheduler entry point. Its ordered workflow is Playwright scraping, NHTSA enrichment, EPA cache refresh/validation through `VehicleNormalization.py`, then `DataCleaning.py --no-epa-refresh` so the validated catalog is imported exactly once into the cleaned database.
-- When changing a DataPipeline script's scheduler-relevant behavior, inputs, outputs, dependencies, or required arguments, update both this `AGENTS.md` and `run_pipeline_scheduler.bat` in the same change. Keep the dry-run output and step counts aligned with the actual commands.
+- `run_pipeline_scheduler.bat` is the Windows Task Scheduler entry point, and `run_pipeline_scheduler.sh` is the macOS/Linux cron or launchd entry point. Their ordered workflow is Playwright scraping, NHTSA enrichment, EPA cache refresh/validation through `VehicleNormalization.py`, then `DataCleaning.py --no-epa-refresh` so the validated catalog is imported exactly once into the cleaned database.
+- When changing a DataPipeline script's scheduler-relevant behavior, inputs, outputs, dependencies, or required arguments, update this `AGENTS.md` and both scheduler scripts in the same change. Keep the dry-run output and step counts aligned with the actual commands.
 
 ## Acquisition Rules
 
@@ -129,6 +133,7 @@ run_pipeline_scheduler.bat --dry-run
 - Segment diagnostics should include high-value vehicles, price bands, make, and model year when feasible.
 - When a custom current-price estimator or transformer is persisted in a joblib artifact from direct script execution, update the Streamlit `__main__` compatibility registration and dashboard regression tests in the same change.
 - When `ML/Price_ML_Models.py` or `ML/Time_Series_Price.py` changes output schemas, metrics, artifact names, feature-importance fields, or forecast columns, update `ML/Model_Output.ipynb` in the same change so the notebook can read and summarize the corresponding outputs.
+- Keep the combined machine-learning Mermaid diagram and its feature/encoder reference tables in `PROJECT_SUMMARY.md` synchronized with `ML/Price_ML_Models.py` and `ML/Time_Series_Price.py`. Update them in the same change whenever either script changes its workflow, feature set, preprocessing or encoding, model families, validation strategy, artifacts, or output contracts.
 - For depreciation, preserve the cohort grain of make, model, model year, and trim proxy unless there is a research reason to change it. Keep the default output as monthly cohort-level forecasts out to five years, not VIN-level forecasts or fixed 30/60/90-day buckets. When adding or changing time-series models, preserve `cohort_future_forecasts.csv`, `cohort_backtesting_results.csv`, and `cohort_backtesting_kpis.csv` contracts so Streamlit and `ML/Model_Output.ipynb` can compare model families by cohort and horizon.
 
 ## EDA and Notebook Rules
