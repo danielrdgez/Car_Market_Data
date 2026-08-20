@@ -67,6 +67,7 @@ except ImportError:  # pragma: no cover - optional foundation-model dependency
 
 
 DB_PATH = BASE_DIR / "CAR_DATA_OUTPUT" / "CAR_DATA_CLEANED.db"
+ABSA_DB_PATH = BASE_DIR / "CAR_DATA_OUTPUT" / "CAR_YOUTUBE_COMMENTS.db"
 OUTPUT_DIR = BASE_DIR / "MODELS_OUTPUT"
 
 RANDOM_STATE = 42
@@ -219,9 +220,14 @@ NUMERIC_FEATURES = [
     "market_median_price",
     "market_price_index",
     "market_monthly_volume",
-    "sentiment_score",
+    "sentiment_overall_score",
+    "sentiment_reliability_score",
+    "sentiment_value_score",
+    "sentiment_performance_score",
+    "sentiment_comfort_score",
     "sentiment_comment_count",
     "sentiment_video_count",
+    "sentiment_aspect_coverage",
     "engine_hp",
     "engine_cylinders",
     "total_recalls",
@@ -292,6 +298,7 @@ def parse_args() -> argparse.Namespace:
         description="Train cohort-level vehicle depreciation forecasts."
     )
     parser.add_argument("--db-path", default=str(DB_PATH), help="Path to CAR_DATA_CLEANED.db.")
+    parser.add_argument("--absa-db-path", default=str(ABSA_DB_PATH), help="Path to make-level sentiment DB.")
     parser.add_argument("--output-dir", default=str(OUTPUT_DIR), help="Directory for model artifacts.")
     parser.add_argument(
         "--sample-size",
@@ -398,6 +405,13 @@ def _basic_limit_clause(sample_size: int | None) -> str:
 
 
 def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
+    if "." in table:
+        schema, name = table.split(".", 1)
+        row = conn.execute(
+            f"SELECT 1 FROM {schema}.sqlite_master WHERE type = 'table' AND name = ?",
+            (name,),
+        ).fetchone()
+        return row is not None
     row = conn.execute(
         "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
         (table,),
@@ -504,7 +518,11 @@ def mode_or_unknown(values: pd.Series) -> str:
     return normalize_label(cleaned.mode().iloc[0])
 
 
-def load_history_frame(db_path: Path, sample_size: int | None) -> pd.DataFrame:
+def load_history_frame(
+    db_path: Path,
+    sample_size: int | None,
+    absa_db_path: Path | None = None,
+) -> pd.DataFrame:
     """Load recent price history with static VIN attributes for cohorting."""
     if not db_path.exists():
         raise FileNotFoundError(f"SQLite database not found: {db_path}")
@@ -513,7 +531,13 @@ def load_history_frame(db_path: Path, sample_size: int | None) -> pd.DataFrame:
     try:
         listing_cols = _table_columns(conn, "listings")
         nhtsa_cols = _table_columns(conn, "nhtsa_enrichment")
-        has_sentiment = _table_exists(conn, "vehicle_sentiment")
+        has_sentiment = False
+        if absa_db_path and Path(absa_db_path).exists():
+            try:
+                conn.execute("ATTACH DATABASE ? AS absa", (str(absa_db_path),))
+                has_sentiment = _table_exists(conn, "absa.make_sentiment_monthly")
+            except sqlite3.Error:
+                has_sentiment = False
         has_vehicle_identity = _table_exists(conn, "vehicle_identity")
 
         latest_listing_columns = [
@@ -562,23 +586,51 @@ def load_history_frame(db_path: Path, sample_size: int | None) -> pd.DataFrame:
         ]
         sentiment_select_columns = (
             [
-                "vs.sentiment_score AS sentiment_score",
-                "vs.comment_count AS sentiment_comment_count",
-                "vs.video_count AS sentiment_video_count",
+                "msi.sentiment_overall_score AS sentiment_overall_score",
+                "msi.sentiment_reliability_score AS sentiment_reliability_score",
+                "msi.sentiment_value_score AS sentiment_value_score",
+                "msi.sentiment_performance_score AS sentiment_performance_score",
+                "msi.sentiment_comfort_score AS sentiment_comfort_score",
+                "msi.sentiment_comment_count AS sentiment_comment_count",
+                "msi.sentiment_video_count AS sentiment_video_count",
+                "msi.sentiment_aspect_coverage AS sentiment_aspect_coverage",
             ]
             if has_sentiment
             else [
-                "NULL AS sentiment_score",
+                "NULL AS sentiment_overall_score",
+                "NULL AS sentiment_reliability_score",
+                "NULL AS sentiment_value_score",
+                "NULL AS sentiment_performance_score",
+                "NULL AS sentiment_comfort_score",
                 "NULL AS sentiment_comment_count",
                 "NULL AS sentiment_video_count",
+                "NULL AS sentiment_aspect_coverage",
             ]
         )
+        sentiment_make_expr = (
+            "UPPER(COALESCE(NULLIF(vi.canonical_make, ''), NULLIF(ll.canonical_make, ''), n.nhtsa_Make))"
+            if has_vehicle_identity
+            else "UPPER(COALESCE(NULLIF(ll.canonical_make, ''), n.nhtsa_Make))"
+        )
+        history_date_expr = """
+            CASE
+                WHEN ph.history_date LIKE '____-__-__%' THEN SUBSTR(ph.history_date, 1, 10)
+                WHEN ph.history_date LIKE '__-__-____%' THEN
+                    SUBSTR(ph.history_date, 7, 4) || '-' || SUBSTR(ph.history_date, 1, 2) || '-' || SUBSTR(ph.history_date, 4, 2)
+                ELSE NULL
+            END
+        """
+        history_month_expr = f"SUBSTR(({history_date_expr}), 1, 7) || '-01'"
         sentiment_join = (
-            """
-        LEFT JOIN vehicle_sentiment AS vs
-            ON LOWER(vs.make) = LOWER(n.nhtsa_Make)
-           AND LOWER(vs.model) = LOWER(n.nhtsa_Model)
-           AND vs.year = n.nhtsa_ModelYear
+            f"""
+        LEFT JOIN absa.make_sentiment_monthly AS msi
+            ON msi.sentiment_make = {sentiment_make_expr}
+           AND msi.sentiment_month = (
+               SELECT MAX(msi2.sentiment_month)
+               FROM absa.make_sentiment_monthly AS msi2
+               WHERE msi2.sentiment_make = {sentiment_make_expr}
+                 AND msi2.sentiment_month <= {history_month_expr}
+           )
             """
             if has_sentiment
             else ""
@@ -720,7 +772,15 @@ def clean_history_frame(df: pd.DataFrame, max_price: int | None) -> pd.DataFrame
     history["engine_cylinders"] = pd.to_numeric(history["nhtsa_EngineCylinders"], errors="coerce")
     history["total_recalls"] = pd.to_numeric(history["nhtsa_total_recalls"], errors="coerce").fillna(0)
     history["total_complaints"] = pd.to_numeric(history["nhtsa_total_complaints"], errors="coerce").fillna(0)
-    history["sentiment_score"] = pd.to_numeric(history["sentiment_score"], errors="coerce")
+    for column in [
+        "sentiment_overall_score",
+        "sentiment_reliability_score",
+        "sentiment_value_score",
+        "sentiment_performance_score",
+        "sentiment_comfort_score",
+        "sentiment_aspect_coverage",
+    ]:
+        history[column] = pd.to_numeric(history[column], errors="coerce")
     history["sentiment_comment_count"] = pd.to_numeric(
         history["sentiment_comment_count"], errors="coerce"
     ).fillna(0)
@@ -768,9 +828,14 @@ def build_cohort_monthly_frame(
             electrification_level=("electrification_level", mode_or_unknown),
             dominant_seller_type=("seller_type", mode_or_unknown),
             dominant_source_name=("source_name", mode_or_unknown),
-            sentiment_score=("sentiment_score", "mean"),
+            sentiment_overall_score=("sentiment_overall_score", "mean"),
+            sentiment_reliability_score=("sentiment_reliability_score", "mean"),
+            sentiment_value_score=("sentiment_value_score", "mean"),
+            sentiment_performance_score=("sentiment_performance_score", "mean"),
+            sentiment_comfort_score=("sentiment_comfort_score", "mean"),
             sentiment_comment_count=("sentiment_comment_count", "mean"),
             sentiment_video_count=("sentiment_video_count", "mean"),
+            sentiment_aspect_coverage=("sentiment_aspect_coverage", "mean"),
             engine_hp=("engine_hp", "median"),
             engine_cylinders=("engine_cylinders", "median"),
             total_recalls=("total_recalls", "median"),
@@ -1777,6 +1842,7 @@ def run_local_forecaster(
 
 def train_cohort_models(
     db_path: Path,
+    absa_db_path: Path | None,
     output_dir: Path,
     sample_size: int | None,
     target_months: list[int],
@@ -1790,7 +1856,7 @@ def train_cohort_models(
     timesfm_model_id: str,
     min_rolling_history_months: int = MIN_ROLLING_HISTORY_MONTHS,
 ) -> dict[str, Any]:
-    raw = load_history_frame(db_path, sample_size)
+    raw = load_history_frame(db_path, sample_size, absa_db_path=absa_db_path)
     history = clean_history_frame(raw, max_price=max_price)
     monthly = build_cohort_monthly_frame(
         history,
@@ -2227,6 +2293,7 @@ def write_reports(output_dir: Path, report: dict[str, Any]) -> None:
 def run_cohort_forecast(
     db_path: Path,
     output_dir: Path,
+    absa_db_path: Path | None = ABSA_DB_PATH,
     sample_size: int | None = DEFAULT_SAMPLE_SIZE,
     target_months: list[int] | None = None,
     forecast_months: int = DEFAULT_FORECAST_MONTHS,
@@ -2247,6 +2314,7 @@ def run_cohort_forecast(
     output_dir.mkdir(parents=True, exist_ok=True)
     report = train_cohort_models(
         db_path=db_path,
+        absa_db_path=absa_db_path,
         output_dir=output_dir,
         sample_size=sample_size,
         target_months=target_months,
@@ -2264,6 +2332,7 @@ def run_cohort_forecast(
         {
             "generated_at": datetime.now().isoformat(timespec="seconds"),
             "database_path": str(db_path),
+            "sentiment_database_path": str(absa_db_path) if absa_db_path else None,
             "sample_size": int(sample_size or 0),
             "target_months": target_months,
             "forecast_months": int(forecast_months),
@@ -2378,6 +2447,7 @@ def main() -> None:
     time_series_models = parse_model_families(args.time_series_models)
     report = run_cohort_forecast(
         db_path=Path(args.db_path).expanduser().resolve(),
+        absa_db_path=Path(args.absa_db_path).expanduser().resolve() if args.absa_db_path else None,
         output_dir=Path(args.output_dir).expanduser().resolve(),
         sample_size=args.sample_size,
         target_months=target_months,

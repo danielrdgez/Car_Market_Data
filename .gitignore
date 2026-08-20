@@ -48,3 +48,4 @@ __pycache__/
 !/EDA/EDA_notebook.ipynb
 !/ML/Price_ML_Models.py
 !/ML/Time_Series_Price.py
+!/ML/Vehicle_Scenario.py

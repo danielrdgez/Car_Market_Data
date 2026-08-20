@@ -28,6 +28,8 @@ COHORT_REPORT_PATH = MODELS_DIR / "cohort_depreciation_model_report.json"
 FORECAST_PATH = MODELS_DIR / "cohort_future_forecasts.csv"
 BACKTEST_RESULTS_PATH = MODELS_DIR / "cohort_backtesting_results.csv"
 BACKTEST_KPI_PATH = MODELS_DIR / "cohort_backtesting_kpis.csv"
+COHORT_TRAINING_PATH = MODELS_DIR / "cohort_monthly_training_frame.csv"
+COHORT_FEATURES_PATH = MODELS_DIR / "cohort_model_features.json"
 TRIM_FEATURE_CANDIDATES = ["canonical_trim"]
 
 if str(BASE_DIR) not in sys.path:
@@ -37,10 +39,29 @@ from ML.Price_ML_Models import (  # noqa: E402
     HighValueRoutedRegressor,
     engineer_current_price_features,
     make_feature_matrix,
+    make_inference_feature_matrix,
     normalize_categorical_missing_values,
     to_float32,
 )
-from ML.Time_Series_Price import normalize_label  # noqa: E402
+from ML.Time_Series_Price import (  # noqa: E402
+    forecast_latest_cohorts_recursive,
+    normalize_label,
+)
+from ML.Vehicle_Scenario import (  # noqa: E402
+    DISPLAY_SCENARIO_FIELDS,
+    apply_monthly_scenario_overrides,
+    apply_price_anchor,
+    build_resolved_vehicle_row,
+    deterministic_mode,
+    engine_profile_options,
+    format_engine_profile,
+    format_transmission_profile,
+    normalize_scenario_key,
+    select_latest_cohort_feature_row,
+    select_scenario_pool,
+    select_stored_reference_rows,
+    transmission_profile_options,
+)
 
 # Models were trained by direct script execution, so some joblib artifacts may
 # look for custom objects on __main__ when Streamlit unpickles them.
@@ -123,50 +144,36 @@ def read_sql(query: str, params: tuple[Any, ...] = ()) -> pd.DataFrame:
         return pd.read_sql_query(query, conn, params=params)
 
 
-def canonical_sentiment_entity(make: str, model: str, year: int, trim: str | None = None) -> str:
-    parts = [str(int(year)), str(make).replace("_", " "), str(model).replace("_", " ")]
-    if trim and trim != "UNKNOWN_TRIM":
-        parts.append(str(trim).replace("_", " "))
-    return " ".join(parts)
-
-
 @st.cache_data(show_spinner=False)
 def load_cohort_sentiment(make: str, model: str, year: int, trim: str | None) -> tuple[pd.DataFrame, pd.DataFrame, str]:
-    """Load exact title-derived entity sentiment, then an explicitly labeled fallback."""
+    """Load make-wide sentiment and its highest-weight supporting comments."""
     if not SENTIMENT_DB_PATH.exists():
         return pd.DataFrame(), pd.DataFrame(), "unavailable"
-    exact_entity = canonical_sentiment_entity(make, model, year, trim)
-    model_entity = canonical_sentiment_entity(make, model, year)
+    sentiment_make = str(make).replace("_", " ").upper()
     try:
         with sqlite3.connect(SENTIMENT_DB_PATH) as conn:
-            entity_exists = conn.execute(
-                "SELECT 1 FROM youtube_comments_scored WHERE Vehicle_Entity = ? COLLATE NOCASE LIMIT 1",
-                (exact_entity,),
-            ).fetchone()
-            if entity_exists:
-                entity_clause, entity_params, match_label = "Vehicle_Entity = ? COLLATE NOCASE", (exact_entity,), "exact canonical cohort"
-            else:
-                entity_clause, entity_params, match_label = "Vehicle_Entity LIKE ? COLLATE NOCASE", (f"{model_entity}%",), "make/model/year fallback"
             comments = pd.read_sql_query(
-                f"""
-                SELECT Vehicle_Entity, text, video_title, published_at, like_count, comment_weight,
+                """
+                SELECT sentiment_make, text, video_title, published_at, like_count, comment_weight,
                        reliability_sentiment, value_sentiment, performance_sentiment, comfort_sentiment
                 FROM youtube_comments_scored
-                WHERE {entity_clause} AND text IS NOT NULL AND TRIM(text) <> ''
+                WHERE sentiment_make = ? COLLATE NOCASE
+                  AND sentiment_status = 'scored'
+                  AND text IS NOT NULL AND TRIM(text) <> ''
                 ORDER BY comment_weight DESC, datetime(published_at) DESC
                 LIMIT 5
                 """,
                 conn,
-                params=entity_params,
+                params=(sentiment_make,),
             )
             index = pd.read_sql_query(
-                f"SELECT * FROM vehicle_sentiment_index WHERE Vehicle_Entity {'=' if entity_exists else 'LIKE'} ? COLLATE NOCASE ORDER BY Sample_Size DESC LIMIT 1",
+                "SELECT * FROM make_sentiment_index WHERE sentiment_make = ? COLLATE NOCASE LIMIT 1",
                 conn,
-                params=(exact_entity if entity_exists else f"{model_entity}%",),
+                params=(sentiment_make,),
             )
     except sqlite3.Error:
         return pd.DataFrame(), pd.DataFrame(), "unavailable"
-    return index, comments, match_label if not comments.empty else "no matching sentiment"
+    return index, comments, "make-wide" if not comments.empty else "no matching sentiment"
 
 
 @st.cache_data(show_spinner=False)
@@ -480,6 +487,137 @@ def load_vehicle_model_rows(vins: tuple[str, ...]) -> pd.DataFrame:
 
 
 @st.cache_data(show_spinner=False)
+def load_vehicle_scenario_pool(make: str, model: str, year: int) -> pd.DataFrame:
+    """Load latest-per-VIN rows for a same-year scenario cohort."""
+    listing_cols = table_columns("listings")
+    nhtsa_cols = [column for column in table_columns("nhtsa_enrichment") if column != "vin"]
+    select_cols = [f"l.{column}" for column in listing_cols]
+    select_cols.extend(f"n.{column}" for column in nhtsa_cols)
+    query = f"""
+        WITH ranked AS (
+            SELECT
+                {', '.join(select_cols)},
+                ROW_NUMBER() OVER (
+                    PARTITION BY l.vin
+                    ORDER BY datetime(l.loaddate) DESC, datetime(l.date) DESC, l.rowid DESC
+                ) AS rn
+            FROM listings AS l
+            INNER JOIN nhtsa_enrichment AS n USING(vin)
+            WHERE l.canonical_make = ?
+              AND l.canonical_model = ?
+              AND CAST(l.canonical_year AS INTEGER) = ?
+              AND l.price IS NOT NULL
+              AND l.price > 0
+        )
+        SELECT *
+        FROM ranked
+        WHERE rn = 1
+    """
+    return read_sql(query, (make, model, int(year)))
+
+
+@st.cache_data(show_spinner=False)
+def load_cohort_training_frame(path_text: str) -> pd.DataFrame:
+    path = Path(path_text)
+    if not path.exists():
+        return pd.DataFrame()
+    df = pd.read_csv(path)
+    if df.empty:
+        return df
+    if "month_start" in df.columns:
+        df["month_start"] = pd.to_datetime(df["month_start"], errors="coerce")
+    if "model_year" in df.columns:
+        df["model_year"] = pd.to_numeric(df["model_year"], errors="coerce").astype("Int64")
+    if "trim_proxy" in df.columns:
+        df["trim_proxy"] = df["trim_proxy"].map(normalize_scenario_key)
+    return df
+
+
+@st.cache_data(show_spinner=False)
+def load_cohort_feature_metadata(path_text: str) -> dict[str, Any]:
+    path = Path(path_text)
+    if not path.exists():
+        return {}
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+@st.cache_resource(show_spinner=False)
+def load_depreciation_model(model_name: str, modified_ns: int) -> Any:
+    _ = modified_ns
+    return joblib.load(MODELS_DIR / model_name)
+
+
+@st.cache_data(show_spinner=False)
+def load_matching_forecast_references(
+    make: str,
+    model: str,
+    year: int,
+    path_text: str,
+) -> pd.DataFrame:
+    path = Path(path_text)
+    if not path.exists():
+        return pd.DataFrame()
+    try:
+        header = pd.read_csv(path, nrows=0)
+    except (OSError, pd.errors.ParserError):
+        return pd.DataFrame()
+    desired = [
+        "make",
+        "model",
+        "model_year",
+        "trim_proxy",
+        "forecast_method",
+        "model_family",
+        "forecast_month",
+        "forecast_date",
+        "observed_month_start",
+        "observed_week_start",
+        "observed_median_price",
+        "predicted_depreciation_pct",
+        "predicted_median_price",
+        "unique_vins",
+        "volume",
+    ]
+    usecols = [column for column in desired if column in header.columns]
+    if not usecols:
+        return pd.DataFrame()
+    frames: list[pd.DataFrame] = []
+    try:
+        for chunk in pd.read_csv(path, usecols=usecols, chunksize=100_000):
+            mask = (
+                chunk["make"].astype(str).eq(str(make))
+                & chunk["model"].astype(str).eq(str(model))
+                & pd.to_numeric(chunk["model_year"], errors="coerce").eq(int(year))
+            )
+            if mask.any():
+                frames.append(chunk.loc[mask].copy())
+    except (OSError, pd.errors.ParserError, ValueError):
+        return pd.DataFrame()
+    if not frames:
+        return pd.DataFrame()
+    df = pd.concat(frames, ignore_index=True)
+    for column in ["forecast_date", "observed_month_start", "observed_week_start"]:
+        if column in df.columns:
+            df[column] = pd.to_datetime(df[column], errors="coerce")
+    for column in [
+        "model_year",
+        "forecast_month",
+        "observed_median_price",
+        "predicted_depreciation_pct",
+        "predicted_median_price",
+        "unique_vins",
+        "volume",
+    ]:
+        if column in df.columns:
+            df[column] = pd.to_numeric(df[column], errors="coerce")
+    if "trim_proxy" in df.columns:
+        df["trim_proxy"] = df["trim_proxy"].map(normalize_scenario_key)
+    if "model_family" not in df.columns and "forecast_method" in df.columns:
+        df["model_family"] = df["forecast_method"].astype(str).str.replace("_model", "", regex=False)
+    return df
+
+
+@st.cache_data(show_spinner=False)
 def load_price_history(vin: str) -> pd.DataFrame:
     query = """
         WITH combined_history AS (
@@ -751,6 +889,39 @@ def current_model_predictions(vin: str, model_names: list[str]) -> tuple[pd.Data
     return pd.DataFrame(rows, columns=columns), errors
 
 
+def current_scenario_predictions(
+    resolved_raw_row: pd.DataFrame,
+    model_names: list[str],
+) -> tuple[pd.DataFrame, list[str]]:
+    """Score a target-free resolved vehicle row through current-price models."""
+    if resolved_raw_row.empty:
+        return pd.DataFrame(columns=["model", "predicted_price"]), ["Resolved scenario row is empty."]
+    try:
+        engineered = engineer_current_price_features(resolved_raw_row, require_target=False)
+        if engineered.empty:
+            return pd.DataFrame(columns=["model", "predicted_price"]), [
+                "The scenario row was removed because mileage is missing or invalid."
+            ]
+        X = make_inference_feature_matrix(engineered)
+    except Exception as exc:  # pragma: no cover - defensive dashboard path
+        return pd.DataFrame(columns=["model", "predicted_price"]), [f"Scenario feature preparation failed: {exc}"]
+
+    rows: list[dict[str, Any]] = []
+    errors: list[str] = []
+    for model_name in model_names:
+        artifact_path = MODELS_DIR / f"{model_name}.joblib"
+        if not artifact_path.exists():
+            errors.append(f"{model_name}: artifact not found.")
+            continue
+        try:
+            model = load_current_model(model_name, artifact_path.stat().st_mtime_ns)
+            prediction = float(np.ravel(model.predict(X))[0])
+            rows.append({"model": model_name, "predicted_price": prediction})
+        except Exception as exc:  # pragma: no cover - defensive dashboard path
+            errors.append(f"{model_name}: {exc}")
+    return pd.DataFrame(rows, columns=["model", "predicted_price"]), errors
+
+
 def filtered_current_model_metrics(
     filtered_df: pd.DataFrame,
     model_names: list[str],
@@ -928,29 +1099,31 @@ def selected_vin_label(row: pd.Series) -> str:
 
 
 def render_cohort_sentiment(make: str, model: str, year: int, trim: str | None) -> None:
-    st.markdown("#### Cohort sentiment")
+    st.markdown("#### Make-wide sentiment")
     index, comments, match_label = load_cohort_sentiment(make, model, year, trim)
     if comments.empty:
-        st.info("No scored YouTube comments match this canonical cohort.")
+        st.info("No scored YouTube comments match this make.")
         return
-    st.caption(f"Sentiment match: {match_label}. Comments are ranked by existing comment weight, then publication date.")
+    st.caption(
+        f"Sentiment match: {match_label}. These scores cover all attributable models and years for {make}. "
+        "Comments are ranked by existing comment weight, then publication date."
+    )
     if index.empty:
         st.info("Scored comments are available, but no aggregate sentiment index has been generated yet.")
     else:
         aggregate = index.iloc[0]
         metric_cols = st.columns(4)
-        metric_cols[0].metric("Enthusiasm", fmt_number(aggregate.get("General_Enthusiast_Score"), 1))
-        metric_cols[1].metric("Reliability", fmt_number(aggregate.get("Reliability_Index"), 1))
-        metric_cols[2].metric("Comments", fmt_number(aggregate.get("Sample_Size")))
-        metric_cols[3].metric("Confidence", aggregate.get("Confidence_Level") or "n/a")
+        metric_cols[0].metric("Overall", fmt_number(aggregate.get("sentiment_overall_score"), 2))
+        metric_cols[1].metric("Reliability", fmt_number(aggregate.get("sentiment_reliability_score"), 2))
+        metric_cols[2].metric("Comments", fmt_number(aggregate.get("sentiment_comment_count")))
+        metric_cols[3].metric("Coverage", fmt_number(aggregate.get("sentiment_aspect_coverage"), 2))
         aspect_cols = st.columns(3)
         for column, label, target in [
-            ("value_sentiment", "Value", aspect_cols[0]),
-            ("performance_sentiment", "Performance", aspect_cols[1]),
-            ("comfort_sentiment", "Comfort", aspect_cols[2]),
+            ("sentiment_value_score", "Value", aspect_cols[0]),
+            ("sentiment_performance_score", "Performance", aspect_cols[1]),
+            ("sentiment_comfort_score", "Comfort", aspect_cols[2]),
         ]:
-            values = pd.to_numeric(comments[column], errors="coerce").dropna()
-            target.metric(label, fmt_number((values.mean() + 1) * 50 if not values.empty else np.nan, 1))
+            target.metric(label, fmt_number(aggregate.get(column), 2))
     st.dataframe(
         comments,
         hide_index=True,
@@ -1179,6 +1352,383 @@ def render_actuals_page(
                 "mileage": st.column_config.NumberColumn("mileage", format="%d"),
             },
         )
+
+
+def _scenario_display_value(value: Any) -> str:
+    if value is None or pd.isna(value):
+        return "Unavailable"
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    return str(value)
+
+
+def _scenario_profile_labels(
+    profiles: list[dict[str, Any]],
+    infer_label: str,
+) -> tuple[list[str], dict[str, dict[str, Any] | None]]:
+    labels = [infer_label]
+    mapping: dict[str, dict[str, Any] | None] = {infer_label: None}
+    for profile in profiles:
+        label = f"{profile['label']} ({profile['support_count']} rows)"
+        labels.append(label)
+        mapping[label] = profile
+    return labels, mapping
+
+
+def _scenario_feature_columns(
+    cohort_report: dict[str, Any],
+    feature_metadata: dict[str, Any],
+) -> list[str]:
+    feature_columns = feature_metadata.get("feature_columns") or cohort_report.get("feature_columns") or []
+    return [str(column) for column in feature_columns]
+
+
+def render_vehicle_estimator_page() -> None:
+    st.subheader("Vehicle estimator")
+    st.caption(
+        "Select a vehicle, provide the mileage you know, and optionally choose observed technical profiles. "
+        "The remaining model fields are inferred from the most common values in the same-year cohort."
+    )
+
+    current_report = load_json(str(CURRENT_REPORT_PATH))
+    cohort_report = load_json(str(COHORT_REPORT_PATH))
+    if not normalization_versions_match(current_report, cohort_report):
+        st.error(
+            "Custom estimates are disabled because the model-report normalization version does not "
+            "match the cleaned database. Retrain both model workflows against this canonical schema."
+        )
+        return
+
+    make_options = get_makes()
+    if not make_options:
+        st.info("No canonical vehicles are available for custom estimation.")
+        return
+    make = st.selectbox("Make", make_options, key="scenario_make")
+    model_options = get_models(make)
+    if not model_options:
+        st.info("No models are available for the selected make.")
+        return
+    model = st.selectbox("Model", model_options, key="scenario_model")
+    year_options = get_years(make, model)
+    if not year_options:
+        st.info("No model years are available for the selected vehicle.")
+        return
+    year = int(st.selectbox("Year", year_options, key="scenario_year"))
+    trim_options = get_trim_options(make, model, year)
+    trim_choices = ["Infer from cohort"] + trim_options
+    trim_choice = st.selectbox("Trim", trim_choices, key="scenario_trim")
+    selected_trim = None if trim_choice == "Infer from cohort" else trim_choice
+
+    raw_pool = load_vehicle_scenario_pool(make, model, year)
+    pool, pool_metadata = select_scenario_pool(raw_pool, make, model, year, selected_trim)
+    if pool.empty:
+        st.warning(
+            "No enriched listing rows are available for this same-year cohort, so the estimator cannot infer "
+            "the remaining model fields."
+        )
+        return
+
+    transmission_profiles = transmission_profile_options(pool)
+    engine_profiles = engine_profile_options(pool)
+    transmission_labels, transmission_map = _scenario_profile_labels(
+        transmission_profiles,
+        "Infer from cohort (modal transmission)",
+    )
+    engine_labels, engine_map = _scenario_profile_labels(
+        engine_profiles,
+        "Infer from cohort (modal engine)",
+    )
+    default_mileage, _ = deterministic_mode(pool.get("mileage", pd.Series(dtype="float64")))
+    default_mileage = float(pd.to_numeric(default_mileage, errors="coerce")) if default_mileage is not None else 0.0
+
+    with st.form("vehicle_estimator_form", border=True):
+        form_cols = st.columns(2)
+        with form_cols[0]:
+            mileage = st.number_input(
+                "Mileage",
+                min_value=0.0,
+                max_value=1_000_000.0,
+                value=max(0.0, default_mileage),
+                step=500.0,
+                help="Defaults to the modal mileage in the selected cohort; replace it with the vehicle's known mileage.",
+            )
+            transmission_label = st.selectbox("Transmission", transmission_labels)
+        with form_cols[1]:
+            engine_label = st.selectbox("Engine", engine_labels)
+            horizon = st.slider("Depreciation horizon (months)", 12, 60, 60)
+        submitted = st.form_submit_button(
+            "Run vehicle estimate",
+            type="primary",
+            icon=":material/calculate:",
+        )
+
+    if not submitted:
+        st.info("Submit the form to run the current-price and depreciation models.")
+        return
+
+    resolved_raw, resolution, _ = build_resolved_vehicle_row(
+        pool,
+        make=make,
+        model=model,
+        model_year=year,
+        trim=selected_trim,
+        mileage=float(mileage),
+        transmission_profile=transmission_map[transmission_label],
+        engine_profile=engine_map[engine_label],
+    )
+    selected_source = pool_metadata.get("match_scope", "cohort")
+    st.caption(
+        f"Inference source: {selected_source}; {pool_metadata.get('support_rows', len(pool)):,} latest-per-VIN rows supported the resolved profile."
+    )
+
+    resolved = resolved_raw.iloc[0]
+    with st.container(border=True):
+        st.markdown("#### Vehicle used for prediction")
+        summary_cols = st.columns(6)
+        summary_cols[0].metric("Make", _scenario_display_value(resolved.get("canonical_make")))
+        summary_cols[1].metric("Model", _scenario_display_value(resolved.get("canonical_model")))
+        summary_cols[2].metric("Year", _scenario_display_value(resolved.get("canonical_year")))
+        summary_cols[3].metric("Trim", _scenario_display_value(resolved.get("canonical_trim")))
+        summary_cols[4].metric("Mileage", fmt_number(resolved.get("mileage")))
+        summary_cols[5].metric("Transmission", format_transmission_profile(resolved))
+        st.write(f"Engine: **{format_engine_profile(resolved)}**")
+
+    resolution_display = resolution[resolution["field"].isin(DISPLAY_SCENARIO_FIELDS)].copy()
+    st.markdown("#### Resolved model inputs")
+    st.dataframe(
+        resolution_display,
+        hide_index=True,
+        width="stretch",
+        column_config={
+            "field": st.column_config.TextColumn("Field"),
+            "value": st.column_config.TextColumn("Resolved value"),
+            "source": st.column_config.TextColumn("Source"),
+            "support_count": st.column_config.NumberColumn("Support rows", format="%d"),
+        },
+    )
+    with st.expander("Show all inferred model fields"):
+        st.dataframe(resolution, hide_index=True, width="stretch")
+
+    model_names = list(current_report.get("models", {}).keys())
+    with st.spinner("Scoring the custom vehicle through current-price models..."):
+        predictions, prediction_errors = current_scenario_predictions(resolved_raw, model_names)
+    if prediction_errors:
+        with st.expander("Current-price scoring messages"):
+            for error in prediction_errors:
+                st.write(error)
+
+    recommended_name = current_report.get("recommended_model")
+    recommended_price: float | None = None
+    if not predictions.empty:
+        predictions["recommended"] = predictions["model"].eq(recommended_name)
+        recommended_rows = predictions[predictions["recommended"]]
+        if recommended_rows.empty:
+            recommended_rows = predictions.head(1)
+        recommended_price = safe_float(recommended_rows["predicted_price"].iloc[0])
+        with st.container(border=True):
+            st.markdown("#### Current-price estimate")
+            price_cols = st.columns(3)
+            price_cols[0].metric("Recommended model", recommended_name or predictions["model"].iloc[0])
+            price_cols[1].metric("Estimated current price", fmt_currency(recommended_price))
+            price_cols[2].metric("Models scored", fmt_number(predictions["model"].nunique()))
+        price_fig = px.bar(
+            predictions.sort_values("predicted_price"),
+            x="model",
+            y="predicted_price",
+            color="recommended",
+            labels={"model": "Model", "predicted_price": "Estimated price"},
+            title="Custom Vehicle Current-Price Estimates",
+        )
+        price_fig.update_layout(margin=dict(l=10, r=10, t=55, b=10), xaxis_tickangle=-20)
+        st.plotly_chart(price_fig, width="stretch")
+        st.dataframe(
+            predictions.sort_values("predicted_price"),
+            hide_index=True,
+            width="stretch",
+            column_config={
+                "predicted_price": st.column_config.NumberColumn("Estimated price", format="$%d"),
+                "recommended": st.column_config.CheckboxColumn("Recommended"),
+            },
+        )
+    else:
+        st.warning("No current-price model returned a prediction, so only stored cohort references can be shown.")
+
+    monthly = load_cohort_training_frame(str(COHORT_TRAINING_PATH))
+    latest_features, monthly_match = select_latest_cohort_feature_row(
+        monthly,
+        make,
+        model,
+        year,
+        selected_trim or str(resolved.get("canonical_trim")),
+    )
+    feature_metadata = load_cohort_feature_metadata(str(COHORT_FEATURES_PATH))
+    feature_columns = _scenario_feature_columns(cohort_report, feature_metadata)
+    if latest_features.empty or not feature_columns:
+        st.info("No monthly cohort feature row is available for a custom depreciation scenario.")
+    else:
+        latest_features = apply_monthly_scenario_overrides(latest_features, resolved_raw, float(mileage))
+        for column in feature_columns:
+            if column not in latest_features.columns:
+                latest_features[column] = np.nan
+        global_model_report = cohort_report.get("models", {}).get("target_depreciation_pct_1m", {})
+        artifact_name = global_model_report.get("artifact") or "Cohort_Depreciation_1m.joblib"
+        artifact_path = MODELS_DIR / artifact_name
+        if not artifact_path.exists():
+            st.warning(f"The custom depreciation artifact is missing: {artifact_name}")
+        else:
+            try:
+                depreciation_model = load_depreciation_model(artifact_name, artifact_path.stat().st_mtime_ns)
+                observed_price = safe_float(latest_features["median_price"].iloc[0])
+                anchor_frames: list[pd.DataFrame] = []
+                if observed_price is not None and observed_price > 0:
+                    for anchor_name, anchor_price in [
+                        ("Observed cohort median", observed_price),
+                        ("Predicted current price", recommended_price),
+                    ]:
+                        if anchor_price is None or anchor_price <= 0:
+                            continue
+                        scenario_features = (
+                            apply_price_anchor(latest_features, anchor_price)
+                            if anchor_name == "Predicted current price"
+                            else latest_features.copy()
+                        )
+                        forecast = forecast_latest_cohorts_recursive(
+                            latest_features=scenario_features,
+                            model=depreciation_model,
+                            feature_columns=feature_columns,
+                            step_months=1,
+                            forecast_months=int(horizon),
+                        )
+                        forecast["anchor"] = anchor_name
+                        forecast["starting_price"] = float(anchor_price)
+                        forecast["predicted_depreciation_from_start"] = (
+                            forecast["predicted_median_price"] / float(anchor_price) - 1
+                        )
+                        anchor_frames.append(forecast)
+                if anchor_frames:
+                    scenario_forecasts = pd.concat(anchor_frames, ignore_index=True)
+                    st.markdown("#### Custom depreciation scenarios")
+                    st.caption(
+                        f"Monthly global-model path using {monthly_match}. The two paths differ only in their starting-price anchor."
+                    )
+                    final_forecasts = (
+                        scenario_forecasts.sort_values(["anchor", "forecast_month"])
+                        .groupby("anchor", as_index=False)
+                        .tail(1)
+                    )
+                    dep_cols = st.columns(4)
+                    dep_cols[0].metric("Forecast cohort", f"{make} {model} {year}")
+                    dep_cols[1].metric("Monthly horizon", f"{horizon} months")
+                    dep_cols[2].metric(
+                        "5-year predicted price",
+                        fmt_currency(
+                            final_forecasts.loc[
+                                final_forecasts["anchor"].eq("Predicted current price"),
+                                "predicted_median_price",
+                            ].iloc[0]
+                            if not final_forecasts.loc[
+                                final_forecasts["anchor"].eq("Predicted current price")
+                            ].empty
+                            else np.nan
+                        ),
+                    )
+                    dep_cols[3].metric("Cohort match", monthly_match)
+                    dep_fig = go.Figure()
+                    for anchor, anchor_df in scenario_forecasts.groupby("anchor", sort=False):
+                        dep_fig.add_trace(
+                            go.Scatter(
+                                x=anchor_df["forecast_date"],
+                                y=anchor_df["predicted_median_price"],
+                                mode="lines+markers",
+                                name=str(anchor),
+                                customdata=anchor_df[["forecast_month", "predicted_depreciation_from_start"]],
+                                hovertemplate=(
+                                    "%{x|%Y-%m-%d}<br>Predicted price: $%{y:,.0f}<br>"
+                                    "Month: %{customdata[0]}<br>Depreciation from start: %{customdata[1]:.1%}<extra></extra>"
+                                ),
+                            )
+                        )
+                    dep_fig.update_layout(
+                        title="Custom Vehicle Monthly Depreciation Path",
+                        xaxis_title="Forecast date",
+                        yaxis_title="Predicted price",
+                        margin=dict(l=10, r=10, t=55, b=10),
+                    )
+                    st.plotly_chart(dep_fig, width="stretch")
+                    st.dataframe(
+                        scenario_forecasts[
+                            [
+                                "anchor",
+                                "forecast_month",
+                                "forecast_date",
+                                "starting_price",
+                                "predicted_median_price",
+                                "predicted_depreciation_from_start",
+                            ]
+                        ],
+                        hide_index=True,
+                        width="stretch",
+                        column_config={
+                            "starting_price": st.column_config.NumberColumn("Starting price", format="$%d"),
+                            "predicted_median_price": st.column_config.NumberColumn("Predicted price", format="$%d"),
+                            "predicted_depreciation_from_start": st.column_config.NumberColumn(
+                                "Depreciation from start",
+                                format="percent",
+                            ),
+                        },
+                    )
+                else:
+                    st.info("The cohort median is unavailable, so no custom depreciation path could be generated.")
+            except Exception as exc:  # pragma: no cover - defensive dashboard path
+                st.warning(f"Custom depreciation scoring failed: {exc}")
+
+    stored_references = load_matching_forecast_references(
+        make,
+        model,
+        year,
+        str(FORECAST_PATH),
+    )
+    stored_references, stored_match = select_stored_reference_rows(
+        stored_references,
+        str(resolved.get("canonical_trim")) if pd.notna(resolved.get("canonical_trim")) else selected_trim,
+    )
+    if not stored_references.empty:
+        st.markdown("#### Stored cohort reference forecasts")
+        st.caption(
+            f"{stored_match}. These SARIMAX, Prophet, and TimesFM paths come from the saved cohort forecast and do not apply the custom mileage or technical overrides."
+        )
+        reference_fig = go.Figure()
+        for method, method_df in stored_references.groupby("forecast_method", sort=False):
+            reference_fig.add_trace(
+                go.Scatter(
+                    x=method_df["forecast_date"],
+                    y=method_df["predicted_median_price"],
+                    mode="lines",
+                    name=str(method),
+                )
+            )
+        reference_fig.update_layout(
+            title="Saved Cohort Forecast References",
+            xaxis_title="Forecast date",
+            yaxis_title="Predicted cohort median price",
+            margin=dict(l=10, r=10, t=55, b=10),
+        )
+        st.plotly_chart(reference_fig, width="stretch")
+        reference_columns = [
+            column
+            for column in [
+                "model_family",
+                "forecast_method",
+                "trim_proxy",
+                "forecast_month",
+                "forecast_date",
+                "observed_median_price",
+                "predicted_depreciation_pct",
+                "predicted_median_price",
+            ]
+            if column in stored_references.columns
+        ]
+        st.dataframe(stored_references[reference_columns], hide_index=True, width="stretch")
 
 
 def render_models_page(selected_row: pd.Series | None, filtered_df: pd.DataFrame) -> None:
@@ -1776,13 +2326,22 @@ def main() -> None:
         st.markdown(f"**Selected VIN:** `{selected_row.get('vin')}`")
         st.caption(selected_vin_label(selected_row))
 
-    actuals_tab, models_tab, research_tab = st.tabs(["Actuals", "Model Predictions", "Research Context"])
-    with actuals_tab:
-        render_actuals_page(filtered_df, selected_row, filter_state)
-    with models_tab:
-        render_models_page(selected_row, filtered_df)
-    with research_tab:
-        render_research_page()
+    actuals_tab, models_tab, estimator_tab, research_tab = st.tabs(
+        ["Actuals", "Model Predictions", "Vehicle estimator", "Research Context"],
+        on_change="rerun",
+    )
+    if actuals_tab.open:
+        with actuals_tab:
+            render_actuals_page(filtered_df, selected_row, filter_state)
+    if models_tab.open:
+        with models_tab:
+            render_models_page(selected_row, filtered_df)
+    if estimator_tab.open:
+        with estimator_tab:
+            render_vehicle_estimator_page()
+    if research_tab.open:
+        with research_tab:
+            render_research_page()
 
 
 if __name__ == "__main__":

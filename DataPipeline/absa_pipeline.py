@@ -2,20 +2,27 @@ import argparse
 import logging
 import os
 import re
+import sqlite3
 from datetime import datetime, timezone
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
+from dotenv import load_dotenv
 
 try:
     from database import CarDatabase, YouTubeCommentsDatabase
+    from VehicleNormalization import MAKE_ALIASES, normalize_vehicle_text
 except ImportError:  # pragma: no cover - used when imported as a package in tests
     from DataPipeline.database import CarDatabase, YouTubeCommentsDatabase
+    from DataPipeline.VehicleNormalization import MAKE_ALIASES, normalize_vehicle_text
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
+load_dotenv(Path(__file__).resolve().parent.parent / ".env", override=False)
 
-ASPECT_VERSION = "v2_zero_shot_sentence_chunks"
+ASPECT_VERSION = "v3_make_grain_zero_shot"
+MAKE_ATTRIBUTION_VERSION = "make_attribution_v1"
 DEFAULT_MODEL_NAME = "facebook/bart-large-mnli"
 ASPECTS = ["reliability", "value", "performance", "comfort"]
 ASPECT_LABELS = {
@@ -43,7 +50,10 @@ MAKES_LIST = [
     "Toyota", "Lexus", "Honda", "Acura", "Ford", "Lincoln", "Chevrolet", "Chevy", "Cadillac", "GMC", "Buick",
     "Jeep", "Dodge", "Ram", "Chrysler", "Subaru", "Nissan", "Infiniti", "Mazda", "Mitsubishi", "Hyundai",
     "Kia", "Genesis", "Volkswagen", "VW", "Audi", "Porsche", "BMW", "Mercedes-Benz", "Mercedes", "Volvo",
-    "Land Rover", "Jaguar", "Tesla", "Rivian", "Lucid", "Polestar", "Fiat", "Alfa Romeo", "Ferrari", "Lamborghini"
+    "Land Rover", "Jaguar", "Tesla", "Rivian", "Lucid", "Polestar", "Fiat", "Alfa Romeo", "Ferrari", "Lamborghini",
+    "Aston Martin", "Bentley", "Rolls-Royce", "McLaren", "Maserati", "Lotus", "Mini", "Pontiac", "Saab",
+    "Suzuki", "Isuzu", "Scion", "Hummer", "Saturn", "Oldsmobile", "Plymouth", "Mercury", "Geo",
+    "Koenigsegg", "Pagani", "Bugatti", "Saleen", "Fisker", "VinFast"
 ]
 
 MAKE_NORM_MAP = {
@@ -52,6 +62,73 @@ MAKE_NORM_MAP = {
     "mercedes": "Mercedes-Benz",
     "mercedes-benz": "Mercedes-Benz"
 }
+
+
+def build_make_alias_map(db_path: str | Path | None = None) -> dict[str, str]:
+    """Build one normalized alias map shared by new scoring and migration."""
+    aliases: dict[str, str] = {}
+    for make in MAKES_LIST:
+        normalized = normalize_vehicle_text(make)
+        if normalized:
+            aliases[normalized] = MAKE_ALIASES.get(normalized, normalized)
+    for alias, canonical in MAKE_ALIASES.items():
+        normalized_alias = normalize_vehicle_text(alias)
+        normalized_canonical = normalize_vehicle_text(canonical)
+        if normalized_alias and normalized_canonical:
+            aliases[normalized_alias] = normalized_canonical
+            aliases.setdefault(normalized_canonical, normalized_canonical)
+
+    path = Path(db_path) if db_path else None
+    if path and path.exists():
+        conn = None
+        try:
+            conn = sqlite3.connect(path)
+            table_exists = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='nhtsa_enrichment'"
+            ).fetchone()
+            if table_exists:
+                for (make,) in conn.execute(
+                    "SELECT DISTINCT nhtsa_Make FROM nhtsa_enrichment WHERE nhtsa_Make IS NOT NULL"
+                ):
+                    normalized = normalize_vehicle_text(make)
+                    if normalized:
+                        aliases[normalized] = MAKE_ALIASES.get(normalized, normalized)
+        except sqlite3.Error as exc:
+            logger.warning("Could not extend make aliases from %s: %s", path, exc)
+        finally:
+            if conn is not None:
+                conn.close()
+    return aliases
+
+
+def find_make_mentions(text: str, alias_map: dict[str, str]) -> set[str]:
+    normalized_text = normalize_vehicle_text(text)
+    if not normalized_text:
+        return set()
+    matches = set()
+    for alias, canonical in sorted(alias_map.items(), key=lambda item: len(item[0]), reverse=True):
+        if re.search(rf"(?<![A-Z0-9]){re.escape(alias)}(?![A-Z0-9])", normalized_text):
+            matches.add(canonical)
+    return matches
+
+
+def attribute_comment_make(
+    comment_text: str,
+    video_title: str,
+    alias_map: dict[str, str],
+) -> tuple[str | None, str]:
+    comment_matches = find_make_mentions(comment_text, alias_map)
+    if len(comment_matches) == 1:
+        return next(iter(comment_matches)), "comment"
+    if len(comment_matches) > 1:
+        return None, "ambiguous_comment"
+
+    title_matches = find_make_mentions(video_title, alias_map)
+    if len(title_matches) == 1:
+        return next(iter(title_matches)), "video_title"
+    if len(title_matches) > 1:
+        return None, "ambiguous_video_title"
+    return None, "unknown"
 
 YEAR_PATTERN = re.compile(r"\b(19[89]\d|20[0-2]\d)\b")
 
@@ -212,21 +289,38 @@ def load_all_scored_comments(db_path: str) -> pd.DataFrame:
         db.close()
 
 
-def run_phase1_preprocessing(df: pd.DataFrame) -> pd.DataFrame:
+def run_phase1_preprocessing(
+    df: pd.DataFrame,
+    alias_map: dict[str, str] | None = None,
+) -> pd.DataFrame:
     logger.info("Starting Phase 1: Data Ingestion & Preprocessing...")
     if df.empty:
         return df.copy()
 
-    df = df.copy()
-    df["Vehicle_Entity"] = df["video_title"].apply(extract_vehicle)
-    unidentified_count = df["Vehicle_Entity"].isna().sum()
-    logger.info("Extraction summary: %s identified, %s unidentified.", len(df) - unidentified_count, unidentified_count)
-
-    df_clean = df.dropna(subset=["Vehicle_Entity"]).copy()
+    alias_map = alias_map or build_make_alias_map()
+    df_clean = df.copy()
     df_clean["original_text"] = df_clean["text"]
     df_clean["text"] = df_clean["text"].apply(clean_comment_text)
     cleaned_drop_count = df_clean["text"].isna().sum()
     df_clean = df_clean.dropna(subset=["text"]).copy()
+    attributions = [
+        attribute_comment_make(text, title, alias_map)
+        for text, title in zip(df_clean["text"], df_clean["video_title"].fillna(""))
+    ]
+    df_clean["sentiment_make"] = [value[0] for value in attributions]
+    df_clean["make_attribution_source"] = [value[1] for value in attributions]
+    df_clean["make_attribution_version"] = MAKE_ATTRIBUTION_VERSION
+    df_clean["sentiment_status"] = np.where(
+        df_clean["sentiment_make"].notna(),
+        "ready",
+        df_clean["make_attribution_source"],
+    )
+    identified_count = int(df_clean["sentiment_make"].notna().sum())
+    logger.info(
+        "Make attribution summary: %s identified, %s ambiguous/unknown.",
+        identified_count,
+        len(df_clean) - identified_count,
+    )
     logger.info("Dropped %s rows during text cleaning. %s rows remain.", cleaned_drop_count, len(df_clean))
     return df_clean
 
@@ -256,6 +350,7 @@ def _aggregate_chunk_scores(chunk_scores: list[dict]) -> dict:
 def run_absa_on_comments(
     df: pd.DataFrame,
     model_name: str = DEFAULT_MODEL_NAME,
+    model_revision: str | None = None,
     limit: int = None,
 ) -> pd.DataFrame:
     logger.info("Initializing HuggingFace zero-shot classification pipeline...")
@@ -263,7 +358,10 @@ def run_absa_on_comments(
     from transformers import pipeline
 
     device = 0 if torch.cuda.is_available() else -1
-    classifier = pipeline("zero-shot-classification", model=model_name, device=device)
+    pipeline_kwargs = {"model": model_name, "device": device}
+    if model_revision:
+        pipeline_kwargs["revision"] = model_revision
+    classifier = pipeline("zero-shot-classification", **pipeline_kwargs)
     logger.info("Loaded classifier on device: %s", "GPU" if device == 0 else "CPU")
 
     if limit:
@@ -334,7 +432,12 @@ def run_absa_on_comments(
 
     df["processed_at"] = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
     df["model_name"] = model_name
+    resolved_revision = getattr(getattr(classifier, "model", None), "config", None)
+    df["model_revision"] = (
+        getattr(resolved_revision, "_commit_hash", None) or model_revision or "unresolved"
+    )
     df["aspect_version"] = ASPECT_VERSION
+    df["sentiment_status"] = "scored"
     return df
 
 
@@ -348,6 +451,22 @@ def apply_weights(df: pd.DataFrame) -> pd.DataFrame:
     df["comment_weight"] = df["consensus_weight"] * df["depth_weight"]
     for aspect in ASPECTS:
         df[f"Weighted_{aspect.capitalize()}_Score"] = df[f"{aspect}_sentiment"] * df["comment_weight"]
+    sentiment_numerator = pd.Series(0.0, index=df.index, dtype="float64")
+    confidence_total = pd.Series(0.0, index=df.index, dtype="float64")
+    mentioned_count = pd.Series(0, index=df.index, dtype="int64")
+    for aspect in ASPECTS:
+        mentioned = pd.to_numeric(df[f"{aspect}_mentioned"], errors="coerce").fillna(0).eq(1)
+        confidence = pd.to_numeric(df[f"{aspect}_confidence"], errors="coerce").fillna(0.0)
+        sentiment = pd.to_numeric(df[f"{aspect}_sentiment"], errors="coerce")
+        usable = mentioned & sentiment.notna() & confidence.gt(0)
+        sentiment_numerator = sentiment_numerator.add(
+            sentiment.where(usable, 0.0) * confidence.where(usable, 0.0),
+            fill_value=0.0,
+        )
+        confidence_total = confidence_total.add(confidence.where(usable, 0.0), fill_value=0.0)
+        mentioned_count = mentioned_count.add(usable.astype("int64"), fill_value=0)
+    df["overall_sentiment"] = sentiment_numerator.div(confidence_total.where(confidence_total.gt(0)))
+    df["overall_confidence"] = confidence_total.div(mentioned_count.where(mentioned_count.gt(0)))
     return df
 
 
@@ -361,108 +480,256 @@ def persist_scored_comments(df: pd.DataFrame, db_path: str) -> int:
         db.close()
 
 
-def run_phase4_aggregation(scored_df: pd.DataFrame, output_dir: str) -> tuple[pd.DataFrame, pd.DataFrame]:
-    logger.info("Starting Phase 4: Aggregation and Index Creation...")
-    db_path = os.path.join(output_dir, "CAR_YOUTUBE_COMMENTS.db")
-    if scored_df.empty:
-        logger.warning("No scored comments available for aggregation.")
-        df_agg = pd.DataFrame(columns=[
-            "Vehicle_Entity",
-            "Sample_Size",
-            "Reliability_Index",
-            "General_Enthusiast_Score",
-            "Sentiment_Volatility_StdDev",
-            "Sentiment_Trend_Slope",
-            "Confidence_Level",
-        ])
-    else:
-        grouped = scored_df.groupby("Vehicle_Entity")
-        aggregated_results = []
-        for entity, group in grouped:
-            sample_size = len(group)
+def prepare_unattributed_rows(df: pd.DataFrame) -> pd.DataFrame:
+    """Persist clean but unattributable comments so incremental runs do not retry them."""
+    result = df.copy()
+    for aspect in ASPECTS:
+        result[f"{aspect}_sentiment"] = np.nan
+        result[f"{aspect}_mentioned"] = 0
+        result[f"{aspect}_confidence"] = 0.0
+    result = apply_weights(result)
+    result["processed_at"] = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+    result["model_name"] = None
+    result["model_revision"] = None
+    result["aspect_version"] = ASPECT_VERSION
+    return result
 
-            reliability_group = group[group["reliability_mentioned"] == 1]
-            if not reliability_group.empty:
-                rel_weighted_sum = (reliability_group["reliability_sentiment"] * reliability_group["comment_weight"]).sum()
-                rel_weighted_avg = rel_weighted_sum / (reliability_group["comment_weight"].sum() + 1e-9)
-                reliability_index = (rel_weighted_avg + 1.0) * 50.0
-            else:
-                reliability_index = np.nan
 
-            total_weighted_sentiment = 0.0
-            total_weights = 0.0
-            for aspect in ASPECTS:
-                aspect_group = group[group[f"{aspect}_mentioned"] == 1]
-                if not aspect_group.empty:
-                    total_weighted_sentiment += (aspect_group[f"{aspect}_sentiment"] * aspect_group["comment_weight"]).sum()
-                    total_weights += aspect_group["comment_weight"].sum()
-
-            general_enthusiast_score = (
-                (total_weighted_sentiment / total_weights + 1.0) * 50.0
-                if total_weights > 0
-                else np.nan
-            )
-
-            times = []
-            sentiments = []
-            for _, row in group.iterrows():
-                date_val = pd.to_datetime(row["published_at"], errors="coerce")
-                if pd.isna(date_val):
-                    continue
-                for aspect in ASPECTS:
-                    sent = row[f"{aspect}_sentiment"]
-                    if not pd.isna(sent):
-                        times.append(date_val.timestamp() / (24 * 3600))
-                        sentiments.append(sent)
-
-            if len(sentiments) >= 5:
-                times_np = np.array(times)
-                sentiments_np = np.array(sentiments)
-                sentiment_std_dev = float(np.std(sentiments_np))
-                time_var = np.var(times_np)
-                sentiment_trend_slope = 0.0 if time_var == 0 else float(np.cov(times_np, sentiments_np)[0, 1] / time_var)
-            else:
-                sentiment_std_dev = np.nan
-                sentiment_trend_slope = np.nan
-
-            confidence_level = "High Confidence" if sample_size >= 30 else "Low Confidence"
-            aggregated_results.append({
-                "Vehicle_Entity": entity,
-                "Sample_Size": sample_size,
-                "Reliability_Index": reliability_index,
-                "General_Enthusiast_Score": general_enthusiast_score,
-                "Sentiment_Volatility_StdDev": sentiment_std_dev,
-                "Sentiment_Trend_Slope": sentiment_trend_slope,
-                "Confidence_Level": confidence_level,
-            })
-
-        df_agg = pd.DataFrame(aggregated_results)
-        if not df_agg.empty:
-            df_agg = df_agg.sort_values(by="General_Enthusiast_Score", ascending=False).reset_index(drop=True)
-
-    db = CarDatabase(db_path)
+def migrate_make_grain(
+    db_path: str | Path,
+    alias_map: dict[str, str] | None = None,
+    chunk_size: int = 10_000,
+) -> int:
+    """Backfill make attribution and overall scores without rerunning inference."""
+    db_path = Path(db_path)
+    alias_map = alias_map or build_make_alias_map(db_path)
+    db = YouTubeCommentsDatabase(str(db_path))
+    updated = 0
     try:
         conn = db._get_connection()
-        df_agg.to_sql("vehicle_sentiment_index", conn, if_exists="replace", index=False)
-        logger.info("Successfully rebuilt vehicle_sentiment_index from stored scored comments.")
+        last_rowid = 0
+        while True:
+            batch = conn.execute(
+                '''
+                SELECT rowid, text, video_title,
+                       reliability_sentiment, reliability_mentioned, reliability_confidence,
+                       value_sentiment, value_mentioned, value_confidence,
+                       performance_sentiment, performance_mentioned, performance_confidence,
+                       comfort_sentiment, comfort_mentioned, comfort_confidence,
+                       model_name, model_revision
+                FROM youtube_comments_scored
+                WHERE rowid > ?
+                  AND (make_attribution_version IS NULL OR make_attribution_version <> ?)
+                ORDER BY rowid
+                LIMIT ?
+                ''',
+                (last_rowid, MAKE_ATTRIBUTION_VERSION, int(chunk_size)),
+            ).fetchall()
+            if not batch:
+                break
+            updates = []
+            for row in batch:
+                sentiment_make, source = attribute_comment_make(row[1], row[2], alias_map)
+                numerator = 0.0
+                confidence_total = 0.0
+                confidence_values = []
+                for offset in (3, 6, 9, 12):
+                    sentiment, mentioned, confidence = row[offset:offset + 3]
+                    if mentioned == 1 and sentiment is not None and confidence is not None and confidence > 0:
+                        numerator += float(sentiment) * float(confidence)
+                        confidence_total += float(confidence)
+                        confidence_values.append(float(confidence))
+                overall = numerator / confidence_total if confidence_total else None
+                overall_confidence = (
+                    sum(confidence_values) / len(confidence_values) if confidence_values else None
+                )
+                status = "scored" if sentiment_make else source
+                updates.append(
+                    (
+                        sentiment_make,
+                        source,
+                        MAKE_ATTRIBUTION_VERSION,
+                        overall,
+                        overall_confidence,
+                        status,
+                        row[16] or ("legacy_unpinned" if row[15] else None),
+                        row[0],
+                    )
+                )
+            conn.executemany(
+                '''
+                UPDATE youtube_comments_scored
+                SET sentiment_make = ?, make_attribution_source = ?, make_attribution_version = ?,
+                    overall_sentiment = ?, overall_confidence = ?, sentiment_status = ?,
+                    model_revision = ?
+                WHERE rowid = ?
+                ''',
+                updates,
+            )
+            conn.commit()
+            updated += len(updates)
+            last_rowid = int(batch[-1][0])
+            logger.info("Migrated make attribution for %s scored comments...", updated)
     finally:
         db.close()
-    return df_agg, scored_df
+    return updated
+
+
+def _sqlite_comment_date(column: str = "published_at") -> str:
+    return f'''
+        CASE
+            WHEN {column} LIKE '____-__-__%' THEN SUBSTR({column}, 1, 10)
+            WHEN {column} LIKE '__-__-____%' THEN
+                SUBSTR({column}, 7, 4) || '-' || SUBSTR({column}, 1, 2) || '-' || SUBSTR({column}, 4, 2)
+            ELSE NULL
+        END
+    '''
+
+
+def rebuild_make_sentiment_tables(db_path: str | Path) -> pd.DataFrame:
+    """Rebuild current and cumulative monthly make aggregates in one transaction."""
+    db = YouTubeCommentsDatabase(str(db_path))
+    now_iso = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+    date_expr = _sqlite_comment_date()
+    try:
+        conn = db._get_connection()
+        conn.execute("BEGIN")
+        conn.execute("DELETE FROM make_sentiment_index")
+        conn.execute("DELETE FROM make_sentiment_monthly")
+        conn.execute(
+            f'''
+            INSERT INTO make_sentiment_index (
+                sentiment_make, sentiment_overall_score, sentiment_reliability_score,
+                sentiment_value_score, sentiment_performance_score, sentiment_comfort_score,
+                sentiment_comment_count, sentiment_video_count, sentiment_aspect_coverage,
+                sentiment_latest_comment_at, sentiment_model_versions, updated_at
+            )
+            SELECT
+                sentiment_make,
+                SUM(CASE WHEN overall_sentiment IS NOT NULL THEN overall_sentiment * COALESCE(comment_weight, 1.0) ELSE 0 END)
+                    / NULLIF(SUM(CASE WHEN overall_sentiment IS NOT NULL THEN COALESCE(comment_weight, 1.0) ELSE 0 END), 0),
+                SUM(CASE WHEN reliability_mentioned = 1 AND reliability_sentiment IS NOT NULL THEN reliability_sentiment * COALESCE(comment_weight, 1.0) ELSE 0 END)
+                    / NULLIF(SUM(CASE WHEN reliability_mentioned = 1 AND reliability_sentiment IS NOT NULL THEN COALESCE(comment_weight, 1.0) ELSE 0 END), 0),
+                SUM(CASE WHEN value_mentioned = 1 AND value_sentiment IS NOT NULL THEN value_sentiment * COALESCE(comment_weight, 1.0) ELSE 0 END)
+                    / NULLIF(SUM(CASE WHEN value_mentioned = 1 AND value_sentiment IS NOT NULL THEN COALESCE(comment_weight, 1.0) ELSE 0 END), 0),
+                SUM(CASE WHEN performance_mentioned = 1 AND performance_sentiment IS NOT NULL THEN performance_sentiment * COALESCE(comment_weight, 1.0) ELSE 0 END)
+                    / NULLIF(SUM(CASE WHEN performance_mentioned = 1 AND performance_sentiment IS NOT NULL THEN COALESCE(comment_weight, 1.0) ELSE 0 END), 0),
+                SUM(CASE WHEN comfort_mentioned = 1 AND comfort_sentiment IS NOT NULL THEN comfort_sentiment * COALESCE(comment_weight, 1.0) ELSE 0 END)
+                    / NULLIF(SUM(CASE WHEN comfort_mentioned = 1 AND comfort_sentiment IS NOT NULL THEN COALESCE(comment_weight, 1.0) ELSE 0 END), 0),
+                COUNT(*),
+                COUNT(DISTINCT video_id),
+                SUM(COALESCE(reliability_mentioned, 0) + COALESCE(value_mentioned, 0)
+                    + COALESCE(performance_mentioned, 0) + COALESCE(comfort_mentioned, 0)) / (4.0 * COUNT(*)),
+                MAX({date_expr}),
+                GROUP_CONCAT(DISTINCT COALESCE(model_name, 'unknown') || '@' || COALESCE(model_revision, 'unknown')),
+                ?
+            FROM youtube_comments_scored
+            WHERE sentiment_make IS NOT NULL AND sentiment_status = 'scored'
+            GROUP BY sentiment_make
+            ''',
+            (now_iso,),
+        )
+        conn.execute(
+            f'''
+            INSERT INTO make_sentiment_monthly (
+                sentiment_make, sentiment_month, sentiment_overall_score,
+                sentiment_reliability_score, sentiment_value_score,
+                sentiment_performance_score, sentiment_comfort_score,
+                sentiment_comment_count, sentiment_video_count,
+                sentiment_aspect_coverage, sentiment_latest_comment_at
+            )
+            WITH base AS (
+                SELECT *, {date_expr} AS comment_date,
+                       SUBSTR({date_expr}, 1, 7) || '-01' AS sentiment_month,
+                       COALESCE(comment_weight, 1.0) AS score_weight
+                FROM youtube_comments_scored
+                WHERE sentiment_make IS NOT NULL AND sentiment_status = 'scored'
+                  AND {date_expr} IS NOT NULL
+            ),
+            monthly AS (
+                SELECT sentiment_make, sentiment_month,
+                       SUM(CASE WHEN overall_sentiment IS NOT NULL THEN overall_sentiment * score_weight ELSE 0 END) AS overall_num,
+                       SUM(CASE WHEN overall_sentiment IS NOT NULL THEN score_weight ELSE 0 END) AS overall_den,
+                       SUM(CASE WHEN reliability_mentioned = 1 AND reliability_sentiment IS NOT NULL THEN reliability_sentiment * score_weight ELSE 0 END) AS reliability_num,
+                       SUM(CASE WHEN reliability_mentioned = 1 AND reliability_sentiment IS NOT NULL THEN score_weight ELSE 0 END) AS reliability_den,
+                       SUM(CASE WHEN value_mentioned = 1 AND value_sentiment IS NOT NULL THEN value_sentiment * score_weight ELSE 0 END) AS value_num,
+                       SUM(CASE WHEN value_mentioned = 1 AND value_sentiment IS NOT NULL THEN score_weight ELSE 0 END) AS value_den,
+                       SUM(CASE WHEN performance_mentioned = 1 AND performance_sentiment IS NOT NULL THEN performance_sentiment * score_weight ELSE 0 END) AS performance_num,
+                       SUM(CASE WHEN performance_mentioned = 1 AND performance_sentiment IS NOT NULL THEN score_weight ELSE 0 END) AS performance_den,
+                       SUM(CASE WHEN comfort_mentioned = 1 AND comfort_sentiment IS NOT NULL THEN comfort_sentiment * score_weight ELSE 0 END) AS comfort_num,
+                       SUM(CASE WHEN comfort_mentioned = 1 AND comfort_sentiment IS NOT NULL THEN score_weight ELSE 0 END) AS comfort_den,
+                       COUNT(*) AS comment_count,
+                       SUM(COALESCE(reliability_mentioned, 0) + COALESCE(value_mentioned, 0)
+                           + COALESCE(performance_mentioned, 0) + COALESCE(comfort_mentioned, 0)) AS aspect_mentions,
+                       MAX(comment_date) AS latest_comment_at
+                FROM base
+                GROUP BY sentiment_make, sentiment_month
+            ),
+            cumulative AS (
+                SELECT *,
+                       SUM(overall_num) OVER w AS cum_overall_num,
+                       SUM(overall_den) OVER w AS cum_overall_den,
+                       SUM(reliability_num) OVER w AS cum_reliability_num,
+                       SUM(reliability_den) OVER w AS cum_reliability_den,
+                       SUM(value_num) OVER w AS cum_value_num,
+                       SUM(value_den) OVER w AS cum_value_den,
+                       SUM(performance_num) OVER w AS cum_performance_num,
+                       SUM(performance_den) OVER w AS cum_performance_den,
+                       SUM(comfort_num) OVER w AS cum_comfort_num,
+                       SUM(comfort_den) OVER w AS cum_comfort_den,
+                       SUM(comment_count) OVER w AS cum_comment_count,
+                       SUM(aspect_mentions) OVER w AS cum_aspect_mentions,
+                       MAX(latest_comment_at) OVER w AS cum_latest_comment_at
+                FROM monthly
+                WINDOW w AS (PARTITION BY sentiment_make ORDER BY sentiment_month ROWS UNBOUNDED PRECEDING)
+            )
+            SELECT
+                c.sentiment_make,
+                c.sentiment_month,
+                c.cum_overall_num / NULLIF(c.cum_overall_den, 0),
+                c.cum_reliability_num / NULLIF(c.cum_reliability_den, 0),
+                c.cum_value_num / NULLIF(c.cum_value_den, 0),
+                c.cum_performance_num / NULLIF(c.cum_performance_den, 0),
+                c.cum_comfort_num / NULLIF(c.cum_comfort_den, 0),
+                c.cum_comment_count,
+                (SELECT COUNT(DISTINCT b.video_id) FROM base AS b
+                 WHERE b.sentiment_make = c.sentiment_make AND b.sentiment_month <= c.sentiment_month),
+                c.cum_aspect_mentions / (4.0 * c.cum_comment_count),
+                c.cum_latest_comment_at
+            FROM cumulative AS c
+            ''',
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_make_sentiment_monthly_lookup "
+            "ON make_sentiment_monthly(sentiment_make, sentiment_month)"
+        )
+        conn.commit()
+        result = pd.read_sql_query(
+            "SELECT * FROM make_sentiment_index ORDER BY sentiment_overall_score DESC",
+            conn,
+        )
+        logger.info("Rebuilt make sentiment tables for %s makes.", len(result))
+        return result
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        db.close()
+
+
+def run_phase4_aggregation(scored_df: pd.DataFrame, output_dir: str) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Compatibility wrapper around the make-level SQL aggregation."""
+    db_path = os.path.join(output_dir, "CAR_YOUTUBE_COMMENTS.db")
+    return rebuild_make_sentiment_tables(db_path), scored_df
 
 
 def run_tests():
     print("Running ABSA Pipeline Tests...")
-    test_titles = {
-        "2024 Toyota Camry Hybrid Review": "2024 Toyota Camry Hybrid",
-        "2021 Ford F-150 Raptor vs Ram TRX": "2021 Ford F-150 Raptor",
-        "Is the 2023 Honda Civic Type R worth $45k?": "2023 Honda Civic Type R",
-        "2022 Hyundai Ioniq 5: An Amazing EV": "2022 Hyundai Ioniq 5",
-        "Toyota Camry 2025 Review": "2025 Toyota Camry",
-        "Just a random video without car title": None,
-    }
-    for title, expected in test_titles.items():
-        res = extract_vehicle(title)
-        assert res == expected, f"Failed title extraction. Input: '{title}', Expected: '{expected}', Got: '{res}'"
+    alias_map = build_make_alias_map()
+    assert attribute_comment_make("Great ride", "Toyota Camry review", alias_map) == ("TOYOTA", "video_title")
+    assert attribute_comment_make("Honda is better", "Toyota Camry review", alias_map) == ("HONDA", "comment")
+    assert attribute_comment_make("Toyota beats Honda", "Toyota vs Honda", alias_map)[0] is None
+    assert attribute_comment_make("Great ride", "Toyota vs Honda", alias_map)[1] == "ambiguous_video_title"
 
     test_comments = {
         "This car is amazing! I love the handling and design.": "This car is amazing! I love the handling and design.",
@@ -477,7 +744,10 @@ def run_tests():
         res = clean_comment_text(comment)
         assert res == expected, f"Failed comment cleaning. Input: '{comment}', Expected: '{expected}', Got: '{res}'"
 
-    chunks = split_comment_into_chunks("Great power. But the ride is harsh and overpriced for what you get.")
+    chunks = split_comment_into_chunks(
+        "Great power. But the ride is harsh and overpriced for what you get.",
+        max_chunk_words=5,
+    )
     assert len(chunks) >= 2, "Expected sentence chunking to split mixed-topic comments."
     print("All tests passed successfully!")
 
@@ -489,8 +759,14 @@ def main():
     parser.add_argument("--test", action="store_true", help="Run validation tests")
     parser.add_argument("--limit", type=int, default=None, help="Limit number of comments to process")
     parser.add_argument("--run-all", action="store_true", help="Run all phases of the pipeline")
+    parser.add_argument(
+        "--migrate-make-grain",
+        action="store_true",
+        help="Backfill make attribution and rebuild make aggregates without model inference.",
+    )
     parser.add_argument("--force-reprocess", action="store_true", help="Ignore prior comment-level scoring state.")
     parser.add_argument("--model-name", type=str, default=DEFAULT_MODEL_NAME, help="Hugging Face model for zero-shot ABSA.")
+    parser.add_argument("--model-revision", type=str, default=None, help="Optional pinned Hugging Face model revision.")
     args = parser.parse_args()
 
     if args.test:
@@ -500,7 +776,34 @@ def main():
     script_dir = os.path.dirname(os.path.abspath(__file__))
     workspace_dir = os.path.dirname(script_dir)
     db_path = args.db_path or os.path.join(workspace_dir, "CAR_DATA_OUTPUT", "CAR_YOUTUBE_COMMENTS.db")
-    output_dir = os.path.dirname(db_path)
+    alias_map = build_make_alias_map(db_path)
+
+    if args.migrate_make_grain:
+        before_db = YouTubeCommentsDatabase(db_path)
+        try:
+            before_count = before_db._get_connection().execute(
+                "SELECT COUNT(*) FROM youtube_comments_scored"
+            ).fetchone()[0]
+        finally:
+            before_db.close()
+        updated = migrate_make_grain(db_path, alias_map=alias_map)
+        aggregate = rebuild_make_sentiment_tables(db_path)
+        after_db = YouTubeCommentsDatabase(db_path)
+        try:
+            after_count = after_db._get_connection().execute(
+                "SELECT COUNT(*) FROM youtube_comments_scored"
+            ).fetchone()[0]
+        finally:
+            after_db.close()
+        if before_count != after_count:
+            raise RuntimeError(
+                f"Migration changed scored row count from {before_count} to {after_count}."
+            )
+        print(
+            f"Migrated {updated} scored comments without inference; "
+            f"rebuilt aggregates for {len(aggregate)} makes."
+        )
+        return
 
     try:
         df_raw = load_data(db_path, force_reprocess=args.force_reprocess, limit=args.limit)
@@ -508,25 +811,36 @@ def main():
         logger.error("Failed to load data: %s", exc)
         return
 
-    df_clean = run_phase1_preprocessing(df_raw)
+    df_clean = run_phase1_preprocessing(df_raw, alias_map=alias_map)
     if args.inspect_phase1:
         print("\n=== Phase 1 Inspection: First 5 Rows of Cleaned Data ===")
-        inspect_cols = ["video_title", "Vehicle_Entity", "author", "like_count", "text", "published_at"]
+        inspect_cols = [
+            "video_title", "sentiment_make", "make_attribution_source",
+            "author", "like_count", "text", "published_at",
+        ]
         preview = df_clean[inspect_cols].head(5)
         print(preview.to_string(index=False))
         print("========================================================\n")
         return
 
     if args.run_all or (not args.inspect_phase1 and not args.test):
-        if not df_clean.empty:
-            df_absa = run_absa_on_comments(df_clean, model_name=args.model_name, limit=None)
+        attributable = df_clean[df_clean["sentiment_make"].notna()].copy()
+        unattributed = df_clean[df_clean["sentiment_make"].isna()].copy()
+        if not unattributed.empty:
+            persist_scored_comments(prepare_unattributed_rows(unattributed), db_path)
+        if not attributable.empty:
+            df_absa = run_absa_on_comments(
+                attributable,
+                model_name=args.model_name,
+                model_revision=args.model_revision,
+                limit=None,
+            )
             df_weighted = apply_weights(df_absa)
             persist_scored_comments(df_weighted, db_path)
         else:
             logger.info("No new comments required scoring in this run.")
 
-        all_scored_df = load_all_scored_comments(db_path)
-        df_agg, _ = run_phase4_aggregation(all_scored_df, output_dir)
+        df_agg = rebuild_make_sentiment_tables(db_path)
 
         print("\n=== Aggregated Results Summary ===")
         print(df_agg.head(10).to_string(index=False))

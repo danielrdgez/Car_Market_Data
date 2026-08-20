@@ -152,6 +152,9 @@ run_pipeline_scheduler.bat --dry-run
 - Preserve comment deduplication by `comment_id`.
 - Preserve video-level fetch progress in `youtube_video_fetch_state` and playlist discovery state in `youtube_playlist_fetch_state`; unseen videos should be prioritized ahead of refresh runs.
 - Keep ABSA incremental by `comment_id`. Do not revert to full-table rescoring unless the user explicitly asks for a forced reprocess.
+- Keep sentiment aggregation at canonical make grain. `make_sentiment_index` is the current rollup and `make_sentiment_monthly` is the cumulative point-in-time source for ML joins; do not restore year/make/model/trim sentiment cohorts.
+- Current-price and depreciation models may use only `sentiment_overall_score`, the four `sentiment_{aspect}_score` fields, `sentiment_comment_count`, `sentiment_video_count`, and `sentiment_aspect_coverage`. Join monthly sentiment on or before the listing/history month to prevent future-comment leakage.
+- Use `DataPipeline/absa_pipeline.py --migrate-make-grain` to backfill existing scored comments without inference. Do not combine this migration with `--force-reprocess`.
 - Keep aspect labels and thresholds documented when changing `absa_pipeline.py`.
 - Validate whether sentiment joins have enough support before claiming predictive lift.
 

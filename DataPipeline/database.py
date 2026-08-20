@@ -606,9 +606,54 @@ class YouTubeCommentsDatabase:
                     Weighted_Value_Score REAL,
                     Weighted_Performance_Score REAL,
                     Weighted_Comfort_Score REAL,
+                    sentiment_make TEXT,
+                    make_attribution_source TEXT,
+                    make_attribution_version TEXT,
+                    overall_sentiment REAL,
+                    overall_confidence REAL,
+                    sentiment_status TEXT,
                     processed_at TEXT,
                     model_name TEXT,
+                    model_revision TEXT,
                     aspect_version TEXT
+                )
+                '''
+            )
+            cursor.execute(
+                '''
+                CREATE TABLE IF NOT EXISTS make_sentiment_index
+                (
+                    sentiment_make TEXT PRIMARY KEY,
+                    sentiment_overall_score REAL,
+                    sentiment_reliability_score REAL,
+                    sentiment_value_score REAL,
+                    sentiment_performance_score REAL,
+                    sentiment_comfort_score REAL,
+                    sentiment_comment_count INTEGER,
+                    sentiment_video_count INTEGER,
+                    sentiment_aspect_coverage REAL,
+                    sentiment_latest_comment_at TEXT,
+                    sentiment_model_versions TEXT,
+                    updated_at TEXT
+                )
+                '''
+            )
+            cursor.execute(
+                '''
+                CREATE TABLE IF NOT EXISTS make_sentiment_monthly
+                (
+                    sentiment_make TEXT,
+                    sentiment_month TEXT,
+                    sentiment_overall_score REAL,
+                    sentiment_reliability_score REAL,
+                    sentiment_value_score REAL,
+                    sentiment_performance_score REAL,
+                    sentiment_comfort_score REAL,
+                    sentiment_comment_count INTEGER,
+                    sentiment_video_count INTEGER,
+                    sentiment_aspect_coverage REAL,
+                    sentiment_latest_comment_at TEXT,
+                    PRIMARY KEY (sentiment_make, sentiment_month)
                 )
                 '''
             )
@@ -624,6 +669,10 @@ class YouTubeCommentsDatabase:
             cursor.execute(
                 "CREATE INDEX IF NOT EXISTS idx_youtube_comments_sentiment_video_id ON youtube_comments_sentiment(video_id)"
             )
+            cursor.execute(
+                "CREATE INDEX IF NOT EXISTS idx_make_sentiment_monthly_lookup "
+                "ON make_sentiment_monthly(sentiment_make, sentiment_month)"
+            )
             conn.commit()
         self._ensure_columns(
             "youtube_comments_sentiment",
@@ -634,11 +683,24 @@ class YouTubeCommentsDatabase:
         self._ensure_columns(
             "youtube_comments_scored",
             {
+                "sentiment_make": "TEXT",
+                "make_attribution_source": "TEXT",
+                "make_attribution_version": "TEXT",
+                "overall_sentiment": "REAL",
+                "overall_confidence": "REAL",
+                "sentiment_status": "TEXT",
                 "processed_at": "TEXT",
                 "model_name": "TEXT",
+                "model_revision": "TEXT",
                 "aspect_version": "TEXT",
             },
         )
+        with self._get_connection() as conn:
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_youtube_comments_scored_make "
+                "ON youtube_comments_scored(sentiment_make)"
+            )
+            conn.commit()
         self._ensure_unique_index(
             "youtube_comments_scored",
             "comment_id",

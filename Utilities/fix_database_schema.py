@@ -170,6 +170,10 @@ def main():
         "Note: canonical identity columns and EPA tables are derived fields; create them by "
         "rerunning DataPipeline/DataCleaning.py, not by ALTER TABLE."
     )
+    print(
+        "Make-level sentiment columns and aggregate tables are managed separately by "
+        "DataPipeline/absa_pipeline.py --migrate-make-grain."
+    )
     logging.info("="*60)
     logging.info("Database Schema Migration Tool")
     logging.info("="*60)

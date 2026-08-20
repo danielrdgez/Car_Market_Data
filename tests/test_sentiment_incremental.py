@@ -1,3 +1,4 @@
+import logging
 import tempfile
 import unittest
 import sqlite3
@@ -7,7 +8,13 @@ from unittest.mock import patch
 import pandas as pd
 
 from DataPipeline.SentimentAnalysis import QuotaExceededError, run_queue
-from DataPipeline.absa_pipeline import apply_weights, load_data, run_phase4_aggregation
+from DataPipeline.absa_pipeline import (
+    apply_weights,
+    load_data,
+    migrate_make_grain,
+    rebuild_make_sentiment_tables,
+    run_phase4_aggregation,
+)
 from DataPipeline.database import YouTubeCommentsDatabase
 
 
@@ -35,6 +42,10 @@ def make_comment_rows(video_id: str, playlist_id: str, count: int) -> list[dict]
 
 class SentimentIncrementalTests(unittest.TestCase):
     def setUp(self):
+        for handler in list(logging.getLogger().handlers):
+            if isinstance(handler, logging.FileHandler) and not Path(handler.baseFilename).parent.exists():
+                logging.getLogger().removeHandler(handler)
+                handler.close()
         self.tmp = tempfile.TemporaryDirectory()
         self.db_path = Path(self.tmp.name) / "CAR_YOUTUBE_COMMENTS.db"
         self.db = YouTubeCommentsDatabase(str(self.db_path))
@@ -134,6 +145,10 @@ class SentimentIncrementalTests(unittest.TestCase):
 
         scored_df = raw_df.iloc[:1].copy()
         scored_df["Vehicle_Entity"] = "2024 Toyota Camry"
+        scored_df["sentiment_make"] = "TOYOTA"
+        scored_df["make_attribution_source"] = "video_title"
+        scored_df["make_attribution_version"] = "test"
+        scored_df["sentiment_status"] = "scored"
         scored_df["original_text"] = scored_df["text"]
         for aspect in ["reliability", "value", "performance", "comfort"]:
             scored_df[f"{aspect}_sentiment"] = 0.5
@@ -155,6 +170,10 @@ class SentimentIncrementalTests(unittest.TestCase):
 
         scored_df = raw_df.copy()
         scored_df["Vehicle_Entity"] = "2024 Toyota Camry"
+        scored_df["sentiment_make"] = "TOYOTA"
+        scored_df["make_attribution_source"] = "video_title"
+        scored_df["make_attribution_version"] = "test"
+        scored_df["sentiment_status"] = "scored"
         scored_df["original_text"] = scored_df["text"]
         for aspect in ["reliability", "value", "performance", "comfort"]:
             scored_df[f"{aspect}_sentiment"] = 0.2
@@ -181,6 +200,10 @@ class SentimentIncrementalTests(unittest.TestCase):
 
         scored_df = raw_df.copy()
         scored_df["Vehicle_Entity"] = "2024 Toyota Camry"
+        scored_df["sentiment_make"] = "TOYOTA"
+        scored_df["make_attribution_source"] = "video_title"
+        scored_df["make_attribution_version"] = "test"
+        scored_df["sentiment_status"] = "scored"
         scored_df["original_text"] = scored_df["text"]
         for aspect in ["reliability", "value", "performance", "comfort"]:
             scored_df[f"{aspect}_sentiment"] = 0.4
@@ -196,8 +219,42 @@ class SentimentIncrementalTests(unittest.TestCase):
         df_agg, _ = run_phase4_aggregation(all_scored, str(self.db_path.parent))
 
         self.assertEqual(len(df_agg), 1)
-        self.assertEqual(df_agg.iloc[0]["Vehicle_Entity"], "2024 Toyota Camry")
-        self.assertEqual(int(df_agg.iloc[0]["Sample_Size"]), 2)
+        self.assertEqual(df_agg.iloc[0]["sentiment_make"], "TOYOTA")
+        self.assertEqual(int(df_agg.iloc[0]["sentiment_comment_count"]), 2)
+
+    def test_make_migration_preserves_rows_and_builds_monthly_cutoffs(self):
+        raw_df = pd.DataFrame(make_comment_rows("video_migration", "playlist_migration", 2))
+        self.db.insert_sentiment_data(raw_df)
+        scored_df = raw_df.copy()
+        scored_df["Vehicle_Entity"] = "2024 Toyota Camry"
+        scored_df["original_text"] = scored_df["text"]
+        for aspect in ["reliability", "value", "performance", "comfort"]:
+            scored_df[f"{aspect}_sentiment"] = 0.5
+            scored_df[f"{aspect}_mentioned"] = 1
+            scored_df[f"{aspect}_confidence"] = 0.8
+        scored_df = apply_weights(scored_df)
+        scored_df["processed_at"] = "2026-07-06T00:00:00+00:00"
+        scored_df["model_name"] = "test-model"
+        scored_df["aspect_version"] = "legacy-version"
+        self.db.upsert_scored_comments(scored_df)
+        with self.db._get_connection() as conn:
+            before = conn.execute(
+                "SELECT COUNT(*) FROM youtube_comments_scored"
+            ).fetchone()[0]
+
+        migrated = migrate_make_grain(self.db_path)
+        aggregate = rebuild_make_sentiment_tables(self.db_path)
+        with self.db._get_connection() as conn:
+            after = conn.execute(
+                "SELECT COUNT(*) FROM youtube_comments_scored"
+            ).fetchone()[0]
+            monthly = pd.read_sql_query("SELECT * FROM make_sentiment_monthly", conn)
+
+        self.assertEqual(migrated, 2)
+        self.assertEqual(before, after)
+        self.assertEqual(aggregate.iloc[0]["sentiment_make"], "TOYOTA")
+        self.assertAlmostEqual(float(aggregate.iloc[0]["sentiment_overall_score"]), 0.5)
+        self.assertEqual(monthly.iloc[0]["sentiment_month"], "2026-07-01")
 
     def test_legacy_scored_table_is_upgraded_before_upsert(self):
         legacy_db_path = Path(self.tmp.name) / "legacy_comments.db"
@@ -255,6 +312,10 @@ class SentimentIncrementalTests(unittest.TestCase):
 
             scored_df = raw_df.copy()
             scored_df["Vehicle_Entity"] = "2024 Toyota Camry"
+            scored_df["sentiment_make"] = "TOYOTA"
+            scored_df["make_attribution_source"] = "video_title"
+            scored_df["make_attribution_version"] = "test"
+            scored_df["sentiment_status"] = "scored"
             scored_df["original_text"] = scored_df["text"]
             for aspect in ["reliability", "value", "performance", "comfort"]:
                 scored_df[f"{aspect}_sentiment"] = 0.3
@@ -274,7 +335,20 @@ class SentimentIncrementalTests(unittest.TestCase):
                     "PRAGMA table_info(youtube_comments_scored)"
                 ).fetchall()
             }
-            self.assertTrue({"processed_at", "model_name", "aspect_version"}.issubset(columns))
+            self.assertTrue(
+                {
+                    "sentiment_make",
+                    "make_attribution_source",
+                    "make_attribution_version",
+                    "overall_sentiment",
+                    "overall_confidence",
+                    "sentiment_status",
+                    "processed_at",
+                    "model_name",
+                    "model_revision",
+                    "aspect_version",
+                }.issubset(columns)
+            )
             indexes = legacy_db._get_connection().execute(
                 "PRAGMA index_list(youtube_comments_scored)"
             ).fetchall()

@@ -1,6 +1,6 @@
 # Project Summary
 
-Last updated: July 5, 2026
+Last updated: August 18, 2026
 
 ## Executive Overview
 
@@ -128,13 +128,15 @@ The cleaned database is the preferred input for EDA and modeling.
 
 `DataPipeline/absa_pipeline.py` performs aspect-based sentiment analysis:
 
-- Extracts vehicle entities from video titles.
+- Attributes each comment to one canonical make, preferring a unique make named in the comment and otherwise using a unique make in the video title.
+- Retains ambiguous or unknown make assignments for audit while excluding them from make aggregates.
 - Cleans comments and filters spam-like or low-information messages.
 - Uses zero-shot classification for reliability, value, performance, and comfort aspects.
 - Splits longer comments into smaller chunks before scoring to reduce mixed-topic dilution.
 - Applies comment weights based on likes and text depth.
 - Scores only comments whose `comment_id` has not already been processed unless forced.
-- Rebuilds `vehicle_sentiment_index` from the persistent `youtube_comments_scored` table after each run.
+- Derives an overall score from confidence-weighted supported aspects.
+- Rebuilds `make_sentiment_index` and cumulative point-in-time `make_sentiment_monthly` from the persistent `youtube_comments_scored` table after each run.
 
 Sentiment features are intended to support the capstone question about whether consumer perception improves price or depreciation models.
 
@@ -176,7 +178,7 @@ Important design choices:
 
 - Cohort grain is canonical make, model, model year, and trim; VIN assignment comes from `vehicle_identity` for stability across snapshots.
 - Monthly cohort frames are built from price history.
-- Features include market index, cohort lags, rolling prices, mileage, volume, NHTSA attributes, recall/complaint counts, and optional sentiment signals.
+- Features include market index, cohort lags, rolling prices, mileage, volume, NHTSA attributes, recall/complaint counts, and optional make-level sentiment available by each cohort month.
 - Models forecast one-month depreciation percentages and recursively emit a monthly median-price path up to five years ahead by default.
 - The time-series benchmark now includes global ML, SARIMAX, Prophet, and TimesFM model families when optional dependencies are installed and cohorts have enough monthly support.
 - The time-series entry point loads `HF_TOKEN` from the repository-root `.env` before importing TimesFM; an existing shell environment value takes precedence and the local file is Git-ignored.
@@ -193,10 +195,10 @@ observational grains, validation strategies, encoders, and forecast outputs.
 ```mermaid
 flowchart TB
     DB[(CAR_DATA_CLEANED.db)]
-    ABSA[(Optional CAR_YOUTUBE_COMMENTS.db<br/>Vehicle_Sentiment_Index)]
+    ABSA[(Optional CAR_YOUTUBE_COMMENTS.db<br/>make_sentiment_monthly)]
 
     subgraph CP[Current-price pipeline - Price_ML_Models.py]
-        CP_LOAD[Latest eligible listing snapshot per VIN<br/>Inner join NHTSA enrichment<br/>Optional ABSA vehicle sentiment join<br/>Chunked Arrow-backed SQLite reads]
+        CP_LOAD[Latest eligible listing snapshot per VIN<br/>Inner join NHTSA enrichment<br/>Optional point-in-time make sentiment join<br/>Chunked Arrow-backed SQLite reads]
         CP_FILTER[Validate positive price and nonnegative mileage<br/>Require canonical make, model, year, and title-derived trim<br/>Deduplicate to one current row per VIN]
         CP_FE[Engineer current-price features<br/>Age, mileage, recency, location, text, keywords,<br/>canonical identity combinations, market and safety signals]
         CP_LEAK[Leakage guard<br/>Remove price, price_band, VIN/date metadata,<br/>NHTSA base price, legacy identity, and audit fields]
@@ -233,7 +235,7 @@ flowchart TB
     end
 
     subgraph TS[Cohort-depreciation pipeline - Time_Series_Price.py]
-        TS_LOAD[Price history plus latest listing identity<br/>VIN consensus identity preferred<br/>NHTSA attributes and optional vehicle sentiment]
+        TS_LOAD[Price history plus latest listing identity<br/>VIN consensus identity preferred<br/>NHTSA attributes and as-of make sentiment]
         TS_CLEAN[Clean positive dated observations<br/>Optional max-price sensitivity cap<br/>Normalize canonical make, model, year, and trim proxy]
         TS_COHORT[Monthly make-model-year-trim cohorts<br/>Require configured VIN and history support]
         TS_FE[Aggregate and engineer cohort-time features<br/>Price, mileage, volume, calendar, market index,<br/>lags, rolling windows, safety, and sentiment]
@@ -287,7 +289,7 @@ for each run.
 | Mileage and age | `mileage`; derived `vehicle_age`, `vehicle_age_squared`, `miles_per_year`, `log_mileage`, `mileage_age_interaction`, `mileage_bucket`, and `model_year_bucket` | Numeric values use median imputation and float32 conversion. Buckets are encoded according to their observed cardinality. |
 | Listing time and geography | `loaddate`; derived `listing_recency_days`, `listing_month`, `listing_week`, and two-digit `location_region` from `locationCode` | Numeric calendar fields use median imputation. Location-like categoricals are target encoded. |
 | Listing text and state | Available title fields; derived length/word counts, certified/CPO, AWD/4WD, luxury-trim mentions, `pendingSale`, `priceRecentChange`, and `source_is_marketplace` | Counts and flags use the numeric branch. Raw title metadata is excluded, while derived text features remain eligible. |
-| Vehicle, market, safety, and sentiment | Cleaned listing attributes, usable NHTSA attributes, `body_fuel_segment`, `is_ev_or_hybrid`, and optional `Reliability_Index`, `General_Enthusiast_Score`, `Sentiment_Volatility_StdDev`, `Sentiment_Trend_Slope`, and `Confidence_Level` | Numeric fields use median imputation; categoricals with at most 50 values use one-hot unless identity-like, while the remainder use target encoding. |
+| Vehicle, market, safety, and sentiment | Cleaned listing attributes, usable NHTSA attributes, `body_fuel_segment`, `is_ev_or_hybrid`, and the eight optional `sentiment_*` make-level fields from the latest eligible monthly snapshot | Numeric fields use median imputation; categoricals with at most 50 values use one-hot unless identity-like, while the remainder use target encoding. |
 | Low-cardinality categoricals | Non-identity categorical columns with at most 50 observed values | Normalize missing values, impute `UNKNOWN`, then `OneHotEncoder(handle_unknown="infrequent_if_exist", min_frequency=10, max_categories=25)` with sparse float32 output. |
 | High-cardinality categoricals | Columns over 50 values plus names containing make/model/trim/manufacturer/segment/title/location tokens | Normalize missing values, impute `UNKNOWN`, then `TargetEncoder(min_samples_leaf=20, smoothing=10)` and float32 conversion. |
 | Linear candidate preprocessing | Combined numeric, one-hot, and target-encoded matrix for Ridge and ElasticNet | `StandardScaler(with_mean=False)` preserves sparse compatibility. Tree candidates use the unscaled combined matrix. |
@@ -303,7 +305,7 @@ for each run.
 | Volume and calendar | `volume`, `unique_vins`, `price_down_rate`, `month`, `quarter`, `cohort_month_number`, `cohort_age_months` | Median imputation. |
 | Cohort trajectory | `cohort_first_median_price`, `price_index_vs_cohort_first`, `cumulative_depreciation_pct`, `lag_median_price_1`, `lag_median_price_2`, `lag_price_index_1`, `rolling_median_price_3m`, `rolling_avg_mileage_3m`, `rolling_volume_3m`, `rolling_depreciation_pct_3m` | Median imputation; lag and rolling values are constructed from observations available at the forecast origin. |
 | Market context | `market_median_price`, `market_price_index`, `market_monthly_volume` | Median imputation. |
-| Sentiment, powertrain, and safety | `sentiment_score`, `sentiment_comment_count`, `sentiment_video_count`, `engine_hp`, `engine_cylinders`, `total_recalls`, `total_complaints` | Median imputation; sentiment remains optional when source data is unavailable. |
+| Sentiment, powertrain, and safety | `sentiment_overall_score`, four `sentiment_{aspect}_score` fields, `sentiment_comment_count`, `sentiment_video_count`, `sentiment_aspect_coverage`, `engine_hp`, `engine_cylinders`, `total_recalls`, `total_complaints` | Median imputation; monthly make sentiment is joined as-of the history month and remains optional when source data is unavailable. |
 | Targets and excluded leakage | `target_depreciation_pct_{horizon}m` is the supervised target; `target_median_price_{horizon}m` is retained for evaluation. `nhtsa_BasePrice`, `nhtsa_BasePrice_source`, and all future target columns are excluded from predictors. | Target rows are aligned by future cohort month. Rolling-origin validation restricts training to targets observable by each origin. |
 
 `ML/Model_Output.ipynb` reads generated reports and presents a KPI-style model summary.
@@ -311,6 +313,18 @@ for each run.
 ### Streamlit Dashboard
 
 `streamlit_app.py` provides an interactive UI over the cleaned database and generated model artifacts. Filters and primary labels use canonical identity; raw titles and NHTSA trims remain visible for comparison. The app reports normalization coverage, EPA matching, unresolved titles, and NHTSA identity disagreement, warns on a missing canonical schema, and disables predictions when database and model normalization versions differ. Current-price joblib artifacts retain compatibility with direct-script training through an explicit custom-object registration layer. Filter-scoped scoring also preserves its metric schema when individual models fail, allowing the dashboard to show model-specific diagnostics without masking them behind a secondary table error.
+
+The Vehicle estimator tab builds a target-free scenario row from user-known make,
+model, year, trim, mileage, and optional observed transmission/engine profiles.
+All other current-price inputs are resolved from deterministic modal values in
+the latest-per-VIN same-year cohort, with exact-trim selection preferred and a
+same-year fallback labeled when necessary. The resolved values and support counts
+are displayed before all available current-price artifacts are scored. Custom
+depreciation paths use the global one-month cohort model with both the predicted
+current-price and observed cohort-median anchors over a selectable 12- to
+60-month horizon. Saved SARIMAX, Prophet, and TimesFM outputs remain separate
+cohort reference paths because they cannot incorporate the custom scenario
+overrides.
 
 ## Validation and Testing
 
@@ -376,6 +390,7 @@ Sentiment ingestion:
 ```powershell
 python DataPipeline\SentimentAnalysis.py --playlist-id PLAYLIST_ID --max-videos 10 --max-comments 100
 python DataPipeline\SentimentAnalysis.py --refresh-days 30 --force-recheck
+python DataPipeline\absa_pipeline.py --migrate-make-grain
 python DataPipeline\absa_pipeline.py --run-all --limit 1000
 python DataPipeline\absa_pipeline.py --run-all --force-reprocess
 ```
@@ -383,7 +398,7 @@ python DataPipeline\absa_pipeline.py --run-all --force-reprocess
 Current-price modeling:
 
 ```powershell
-python ML\Price_ML_Models.py --sample-size 5000
+python ML\Price_ML_Models.py --sample-size 5000 --absa-db-path CAR_DATA_OUTPUT\CAR_YOUTUBE_COMMENTS.db
 # Explicit full-data run (also the default when the flag is omitted):
 python ML\Price_ML_Models.py --sample-size 0
 ```
@@ -395,7 +410,7 @@ eligible data; pass a positive sample size for a bounded end-to-end run.
 Current-price plus depreciation modeling:
 
 ```powershell
-python ML\Price_ML_Models.py --task all
+python ML\Price_ML_Models.py --task all --sample-size 5000 --absa-db-path CAR_DATA_OUTPUT\CAR_YOUTUBE_COMMENTS.db
 ```
 
 Depreciation forecasting only:

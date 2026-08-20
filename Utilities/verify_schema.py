@@ -29,6 +29,16 @@ CANONICAL_LISTING_COLUMNS = {
     "nhtsa_trim_agrees",
 }
 CANONICAL_TABLES = {"vehicle_identity", "epa_vehicle_catalog", "epa_catalog_metadata"}
+SENTIMENT_SCORED_COLUMNS = {
+    "sentiment_make",
+    "make_attribution_source",
+    "make_attribution_version",
+    "overall_sentiment",
+    "overall_confidence",
+    "sentiment_status",
+    "model_revision",
+}
+SENTIMENT_TABLES = {"make_sentiment_index", "make_sentiment_monthly"}
 
 
 def table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
@@ -47,6 +57,22 @@ def verify_schema(db_path: Path) -> bool:
             )
         }
         listing_columns = table_columns(conn, "listings") if "listings" in tables else set()
+        if "youtube_comments_scored" in tables:
+            scored_columns = table_columns(conn, "youtube_comments_scored")
+            missing_sentiment_columns = sorted(SENTIMENT_SCORED_COLUMNS - scored_columns)
+            missing_sentiment_tables = sorted(SENTIMENT_TABLES - tables)
+            print(f"Database: {db_path}")
+            for table in sorted(tables):
+                count = conn.execute(f'SELECT COUNT(*) FROM "{table}"').fetchone()[0]
+                print(f"  {table}: {count:,} rows")
+            if missing_sentiment_columns:
+                print("Missing make-level scored columns: " + ", ".join(missing_sentiment_columns))
+            if missing_sentiment_tables:
+                print("Missing make-level sentiment tables: " + ", ".join(missing_sentiment_tables))
+            if not missing_sentiment_columns and not missing_sentiment_tables:
+                print("Make-level sentiment schema verification passed")
+                return True
+            return False
         missing_columns = sorted(CANONICAL_LISTING_COLUMNS - listing_columns)
         missing_tables = sorted(CANONICAL_TABLES - tables)
         print(f"Database: {db_path}")

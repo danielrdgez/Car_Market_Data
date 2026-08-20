@@ -67,7 +67,6 @@ DROP_FEATURE_COLUMNS = {
     "vin",
     "date",
     "loaddate",
-    "Vehicle_Entity",
     "title",
     "canonical_title",
 }
@@ -532,39 +531,62 @@ def load_modeling_frame(
         nhtsa_select = [f"n.{c}" for c in nhtsa_cols]
         query_cols = listing_select + nhtsa_select
 
+        sentiment_columns = [
+            "sentiment_overall_score",
+            "sentiment_reliability_score",
+            "sentiment_value_score",
+            "sentiment_performance_score",
+            "sentiment_comfort_score",
+            "sentiment_comment_count",
+            "sentiment_video_count",
+            "sentiment_aspect_coverage",
+        ]
+        query_cols.extend([f"NULL AS {column}" for column in sentiment_columns])
+        declared_types.update({column: "REAL" for column in sentiment_columns})
         absa_join = ""
         if absa_db_path and Path(absa_db_path).exists():
             try:
                 conn.execute("ATTACH DATABASE ? AS absa", (str(absa_db_path),))
-                if _table_exists(conn, "absa.Vehicle_Sentiment_Index"):
-                    entity_expr = (
-                        "CAST(l.canonical_year AS TEXT) || ' ' || "
-                        "l.canonical_make || ' ' || l.canonical_model"
+                if _table_exists(conn, "absa.make_sentiment_monthly"):
+                    make_candidates = []
+                    if "canonical_make" in listings_cols:
+                        make_candidates.append("NULLIF(l.canonical_make, '')")
+                    if "nhtsa_Make" in nhtsa_schema:
+                        make_candidates.append("NULLIF(n.nhtsa_Make, '')")
+                    make_expr = (
+                        f"UPPER(COALESCE({', '.join(make_candidates)}))"
+                        if len(make_candidates) > 1
+                        else f"UPPER({make_candidates[0]})"
+                        if make_candidates
+                        else "NULL"
                     )
-                    query_cols.extend(
-                        [
-                            f"{entity_expr} AS Vehicle_Entity",
-                            "vsi.Reliability_Index",
-                            "vsi.General_Enthusiast_Score",
-                            "vsi.Sentiment_Volatility_StdDev",
-                            "vsi.Sentiment_Trend_Slope",
-                            "vsi.Confidence_Level",
-                        ]
+                    date_column = next(
+                        (column for column in ("loaddate", "date") if column in listings_cols),
+                        None,
                     )
-                    declared_types.update(
-                        {
-                            "Vehicle_Entity": "TEXT",
-                            "Reliability_Index": "REAL",
-                            "General_Enthusiast_Score": "REAL",
-                            "Sentiment_Volatility_StdDev": "REAL",
-                            "Sentiment_Trend_Slope": "REAL",
-                            "Confidence_Level": "REAL",
-                        }
-                    )
-                    absa_join = f"""
-                        LEFT JOIN absa.Vehicle_Sentiment_Index AS vsi
-                            ON {entity_expr} = vsi.Vehicle_Entity
-                    """
+                    if date_column:
+                        query_cols = query_cols[:-len(sentiment_columns)]
+                        query_cols.extend([f"msi.{column}" for column in sentiment_columns])
+                        raw_date = f"l.{date_column}"
+                        listing_date = f"""
+                            CASE
+                                WHEN {raw_date} LIKE '____-__-__%' THEN SUBSTR({raw_date}, 1, 10)
+                                WHEN {raw_date} LIKE '__-__-____%' THEN
+                                    SUBSTR({raw_date}, 7, 4) || '-' || SUBSTR({raw_date}, 1, 2) || '-' || SUBSTR({raw_date}, 4, 2)
+                                ELSE NULL
+                            END
+                        """
+                        listing_month = f"SUBSTR(({listing_date}), 1, 7) || '-01'"
+                        absa_join = f"""
+                            LEFT JOIN absa.make_sentiment_monthly AS msi
+                                ON msi.sentiment_make = {make_expr}
+                               AND msi.sentiment_month = (
+                                   SELECT MAX(msi2.sentiment_month)
+                                   FROM absa.make_sentiment_monthly AS msi2
+                                   WHERE msi2.sentiment_make = {make_expr}
+                                     AND msi2.sentiment_month <= {listing_month}
+                               )
+                        """
             except sqlite3.Error:
                 absa_join = ""
 
@@ -608,8 +630,14 @@ def load_modeling_frame(
 def engineer_current_price_features(
     df: pd.DataFrame,
     copy_frame: bool = True,
+    require_target: bool = True,
 ) -> pd.DataFrame:
-    """Create derived features from cleaned listing and NHTSA columns."""
+    """Create derived features from cleaned listing and NHTSA columns.
+
+    ``require_target=False`` is reserved for inference rows supplied by the
+    dashboard.  It keeps the feature engineering contract identical while
+    allowing a scenario row to omit the target price entirely.
+    """
     if copy_frame:
         df = df.copy()
     required_identity = {"canonical_make", "canonical_model", "canonical_year", "canonical_trim"}
@@ -618,14 +646,13 @@ def engineer_current_price_features(
         raise ValueError(
             "Cleaned database lacks canonical identity columns: " + ", ".join(missing_identity)
         )
+    if "price" not in df.columns:
+        df["price"] = np.nan
     df["price"] = pd.to_numeric(df["price"], errors="coerce")
     df["mileage"] = pd.to_numeric(df["mileage"], errors="coerce")
-    valid_rows = (
-        df["price"].notna()
-        & (df["price"] > 0)
-        & df["mileage"].notna()
-        & (df["mileage"] >= 0)
-    )
+    valid_rows = df["mileage"].notna() & (df["mileage"] >= 0)
+    if require_target:
+        valid_rows &= df["price"].notna() & (df["price"] > 0)
     if not bool(valid_rows.all()):
         df = df.loc[valid_rows].copy()
 
@@ -804,6 +831,24 @@ def engineer_current_price_features(
             df[column] = df[column].astype("float32[pyarrow]")
 
     return df.reset_index(drop=True)
+
+
+def make_inference_feature_matrix(df: pd.DataFrame) -> pd.DataFrame:
+    """Return current-price model features without requiring a target price.
+
+    This is intentionally separate from ``make_feature_matrix`` so training
+    and evaluation continue to require an observed ``price`` target.
+    """
+    required_identity = {"canonical_make", "canonical_model", "canonical_year", "canonical_trim"}
+    missing_identity = sorted(required_identity - set(df.columns))
+    if missing_identity:
+        raise ValueError(
+            "Inference frame lacks canonical identity columns: " + ", ".join(missing_identity)
+        )
+    drop_columns = DROP_FEATURE_COLUMNS | PRICE_LEAKAGE_FEATURE_COLUMNS | IDENTITY_DIAGNOSTIC_COLUMNS
+    feature_df = df.drop(columns=[c for c in drop_columns if c in df.columns], errors="ignore")
+    assert_canonical_identity_contract(feature_df)
+    return feature_df
 
 
 def keep_latest_listing_per_vin(df: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, Any]]:
@@ -1793,6 +1838,7 @@ def main() -> None:
         target_months = [int(x.strip()) for x in args.target_months.split(",") if x.strip()]
         run_cohort_forecast(
             db_path=Path(args.db_path),
+            absa_db_path=Path(args.absa_db_path) if args.absa_db_path else None,
             output_dir=Path(args.output_dir),
             sample_size=args.sample_size,
             target_months=target_months,

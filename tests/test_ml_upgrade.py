@@ -37,6 +37,49 @@ from ML.Time_Series_Price import load_history_frame
 from ML.Time_Series_Price import parse_model_families
 from ML.Time_Series_Price import stratified_depreciation_tuning_sample_positions
 
+NEW_SENTIMENT_COLUMNS = {
+    "sentiment_overall_score",
+    "sentiment_reliability_score",
+    "sentiment_value_score",
+    "sentiment_performance_score",
+    "sentiment_comfort_score",
+    "sentiment_comment_count",
+    "sentiment_video_count",
+    "sentiment_aspect_coverage",
+}
+
+
+def create_make_sentiment_fixture_db(path: Path) -> None:
+    conn = sqlite3.connect(path)
+    try:
+        conn.execute(
+            """
+            CREATE TABLE make_sentiment_monthly (
+                sentiment_make TEXT,
+                sentiment_month TEXT,
+                sentiment_overall_score REAL,
+                sentiment_reliability_score REAL,
+                sentiment_value_score REAL,
+                sentiment_performance_score REAL,
+                sentiment_comfort_score REAL,
+                sentiment_comment_count INTEGER,
+                sentiment_video_count INTEGER,
+                sentiment_aspect_coverage REAL
+            )
+            """
+        )
+        conn.executemany(
+            "INSERT INTO make_sentiment_monthly VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+                ("TOYOTA", "2025-12-01", 0.10, 0.20, 0.30, 0.40, 0.50, 10, 2, 0.50),
+                ("TOYOTA", "2026-02-01", 0.20, 0.30, 0.40, 0.50, 0.60, 20, 3, 0.60),
+                ("HONDA", "2026-02-01", 0.30, 0.40, 0.50, 0.60, 0.70, 30, 4, 0.70),
+            ],
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
 
 def create_raw_fixture_db(path: Path) -> None:
     conn = sqlite3.connect(path)
@@ -572,6 +615,44 @@ def create_current_price_loader_fixture_db(path: Path) -> None:
 
 
 class DataCleaningUpgradeTests(unittest.TestCase):
+    def test_current_price_loader_uses_only_make_level_sentiment_columns(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "cleaned.db"
+            sentiment_path = Path(tmp) / "sentiment.db"
+            create_current_price_loader_fixture_db(db_path)
+            create_make_sentiment_fixture_db(sentiment_path)
+
+            frame, _ = load_modeling_frame(
+                db_path,
+                absa_db_path=sentiment_path,
+                sample_size=0,
+            )
+
+            self.assertTrue(NEW_SENTIMENT_COLUMNS.issubset(frame.columns))
+            self.assertEqual(
+                set(frame.columns).intersection(
+                    {"Vehicle_Entity", "Reliability_Index", "General_Enthusiast_Score", "sentiment_score"}
+                ),
+                set(),
+            )
+            toyota = frame.loc[frame["canonical_make"].eq("TOYOTA")].iloc[0]
+            self.assertAlmostEqual(float(toyota["sentiment_overall_score"]), 0.20)
+            engineered = engineer_current_price_features(frame)
+            features, _, _ = make_feature_matrix(engineered)
+            self.assertTrue(NEW_SENTIMENT_COLUMNS.issubset(features.columns))
+
+    def test_depreciation_loader_excludes_future_make_sentiment(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "cleaned.db"
+            sentiment_path = Path(tmp) / "sentiment.db"
+            create_cleaned_gap_fixture_db(db_path)
+            create_make_sentiment_fixture_db(sentiment_path)
+
+            frame = load_history_frame(db_path, sample_size=10, absa_db_path=sentiment_path)
+
+            self.assertTrue(NEW_SENTIMENT_COLUMNS.issubset(frame.columns))
+            self.assertAlmostEqual(float(frame.iloc[0]["sentiment_overall_score"]), 0.10)
+
     def test_cleaning_retains_valid_make_outside_legacy_whitelist(self):
         with tempfile.TemporaryDirectory() as tmp:
             raw_db = Path(tmp) / "raw.db"
@@ -1129,9 +1210,14 @@ class ModelingUpgradeTests(unittest.TestCase):
                     "nhtsa_EngineCylinders": 4,
                     "nhtsa_total_recalls": 0,
                     "nhtsa_total_complaints": 0,
-                    "sentiment_score": None,
+                    "sentiment_overall_score": None,
+                    "sentiment_reliability_score": None,
+                    "sentiment_value_score": None,
+                    "sentiment_performance_score": None,
+                    "sentiment_comfort_score": None,
                     "sentiment_comment_count": 0,
                     "sentiment_video_count": 0,
+                    "sentiment_aspect_coverage": None,
                 }
             )
 
@@ -1185,9 +1271,14 @@ class ModelingUpgradeTests(unittest.TestCase):
                     "nhtsa_EngineCylinders": 8,
                     "nhtsa_total_recalls": 0,
                     "nhtsa_total_complaints": 0,
-                    "sentiment_score": None,
+                    "sentiment_overall_score": None,
+                    "sentiment_reliability_score": None,
+                    "sentiment_value_score": None,
+                    "sentiment_performance_score": None,
+                    "sentiment_comfort_score": None,
                     "sentiment_comment_count": 0,
                     "sentiment_video_count": 0,
+                    "sentiment_aspect_coverage": None,
                 }
             )
 

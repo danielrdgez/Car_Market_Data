@@ -20,7 +20,7 @@ Car-Price-Data-Visualization-Learning/
 |-- README.md                         # Project overview and runbook
 |-- PROJECT_SUMMARY.md                # Technical architecture and capstone narrative
 |-- requirements.txt                  # Python dependencies
-|-- streamlit_app.py                  # Interactive dashboard for actuals and models
+|-- streamlit_app.py                  # Interactive dashboard, model scoring, and vehicle estimator
 |-- run_pipeline_scheduler.bat        # Windows scheduler entry point
 |-- run_pipeline_scheduler.sh         # macOS/Linux scheduler entry point
 |-- DataPipeline/
@@ -165,10 +165,19 @@ python -m unittest tests\test_vehicle_normalization.py tests\test_streamlit_cano
 3. `DataPipeline/NHTSA_enrichment.py` enriches unenriched VINs with vPIC decode fields, safety ratings, recalls, and complaints.
 4. `DataPipeline/DataCleaning.py` builds `CAR_DATA_OUTPUT/CAR_DATA_CLEANED.db`, anchors canonical make/model to NHTSA, derives canonical trim only from listing titles, validates against the cached EPA catalog, creates VIN consensus identities, and adds audit indexes.
 5. `DataPipeline/SentimentAnalysis.py` discovers playlist videos, resumes comment collection at the video level, and stores progress in `CAR_YOUTUBE_COMMENTS.db`.
-6. `DataPipeline/absa_pipeline.py` scores only new comments by `comment_id` and rebuilds vehicle-level sentiment indexes from stored scored rows.
+6. `DataPipeline/absa_pipeline.py` scores only new attributable comments by `comment_id` and rebuilds current plus monthly make-level sentiment indexes from stored scored rows.
 7. `ML/Price_ML_Models.py` trains leakage-aware current-price models and writes reports to `MODELS_OUTPUT/`.
 8. `ML/Time_Series_Price.py` trains cohort-level monthly depreciation forecasts from historical price trajectories with global ML, SARIMAX, Prophet, and TimesFM model families when their dependencies are installed.
-9. `streamlit_app.py` reads `CAR_DATA_CLEANED.db` and `MODELS_OUTPUT/` artifacts to present filterable VIN actuals, NHTSA KPIs, global and filter-scoped model metrics, current-price predictions, cohort future-price forecasts, and time-series backtesting KPIs.
+9. `streamlit_app.py` reads `CAR_DATA_CLEANED.db` and `MODELS_OUTPUT/` artifacts to present filterable VIN actuals, NHTSA KPIs, global and filter-scoped model metrics, current-price predictions, cohort future-price forecasts, time-series backtesting KPIs, and a custom Vehicle estimator.
+
+The Vehicle estimator accepts canonical make, model, year, trim, and mileage inputs,
+with optional transmission and engine profiles selected from the same-year cohort.
+It fills remaining current-price fields from deterministic modal values and shows
+their provenance before scoring every available current-price artifact. Its
+depreciation view presents both a predicted-price anchor and an observed-cohort-
+median anchor using the global monthly model. Saved SARIMAX, Prophet, and TimesFM
+paths are shown separately as cohort references; they do not apply the custom
+vehicle's mileage or technical overrides.
 
 Current-price artifacts are trained by direct script execution, so the dashboard
 registers their custom estimator and transformer symbols before joblib loading.
@@ -184,25 +193,26 @@ The depreciation pipeline builds monthly cohorts by make, model, model year, and
 
 ## Sentiment and NLP
 
-`SentimentAnalysis.py` uses the YouTube Data API to collect comments for configured videos or playlists, but now keeps a per-video resume queue in SQLite so unseen videos run first, retryable errors back off, and completed videos refresh on a 30-day window by default. `absa_pipeline.py` extracts vehicle entities from video titles, filters low-quality comments, runs zero-shot aspect classification on new comments only, and rebuilds vehicle-level sentiment tables from the stored scored-comment table.
+`SentimentAnalysis.py` uses the YouTube Data API to collect comments for configured videos or playlists, but now keeps a per-video resume queue in SQLite so unseen videos run first, retryable errors back off, and completed videos refresh on a 30-day window by default. `absa_pipeline.py` attributes comments to one unambiguous canonical make, filters low-quality comments, runs zero-shot aspect classification on new attributable comments only, and rebuilds current plus cumulative monthly make-level sentiment tables. Ambiguous multi-make comments are retained for audit but excluded from aggregates.
 
 Useful sentiment commands:
 
 ```powershell
 python DataPipeline\SentimentAnalysis.py --playlist-id PLAYLIST_ID --max-videos 10 --max-comments 100
 python DataPipeline\SentimentAnalysis.py --refresh-days 30 --force-recheck
+python DataPipeline\absa_pipeline.py --migrate-make-grain
 python DataPipeline\absa_pipeline.py --run-all --limit 1000
 python DataPipeline\absa_pipeline.py --run-all --force-reprocess
 ```
 
-Set `YOUTUBE_API_KEY` or `GOOGLE_API_KEY` in the environment or `.env` before running sentiment ingestion.
+Use `--migrate-make-grain` once to backfill existing scored comments without rerunning the Hugging Face model. Set `YOUTUBE_API_KEY` or `GOOGLE_API_KEY` in the environment or `.env` before ingestion. Public Hugging Face models do not require authentication; optional Hub authentication uses `HF_TOKEN` from the same ignored `.env` file.
 
 ## Databases and Outputs
 
 - `CAR_DATA_OUTPUT/CAR_DATA.db`: raw listing snapshots, history tables, and NHTSA enrichment.
 - `CAR_DATA_OUTPUT/CAR_DATA_CLEANED.db`: cleaned analysis/modeling database, including `vehicle_identity`, `epa_vehicle_catalog`, and `epa_catalog_metadata`.
 - `CAR_DATA_OUTPUT/reference/epa_fuel_economy/`: ignored local cache of the official [FuelEconomy.gov vehicle dataset](https://www.fueleconomy.gov/feg/epadata/vehicles.csv.zip).
-- `CAR_DATA_OUTPUT/CAR_YOUTUBE_COMMENTS.db`: YouTube comment and sentiment-derived tables, including `youtube_video_fetch_state`, `youtube_playlist_fetch_state`, `youtube_comments_scored`, and `vehicle_sentiment_index`.
+- `CAR_DATA_OUTPUT/CAR_YOUTUBE_COMMENTS.db`: YouTube comment and sentiment-derived tables, including `youtube_video_fetch_state`, `youtube_playlist_fetch_state`, `youtube_comments_scored`, `make_sentiment_index`, and `make_sentiment_monthly`.
 - `MODELS_OUTPUT/model_report.json` and `MODELS_OUTPUT/model_report.md`: current-price model reports.
 - `MODELS_OUTPUT/cohort_depreciation_model_report.json` and `.md`: depreciation model reports.
 - `MODELS_OUTPUT/cohort_future_forecasts.csv`: monthly future cohort median-price forecasts by model family used by the dashboard.
