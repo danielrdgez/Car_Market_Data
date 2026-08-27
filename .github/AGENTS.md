@@ -96,3 +96,13 @@ cleaning with `--no-epa-refresh` as four blocking, fail-fast stages.
 - YouTube ingestion requires `YOUTUBE_API_KEY` or `GOOGLE_API_KEY`.
 - Full current-price runs can take hours. Pass a positive `--sample-size` for
   development and verification.
+
+## NHTSA Storage and Refresh
+
+- `CAR_DATA.db` keeps the backward-compatible latest `nhtsa_enrichment` projection; `CAR_DATA_NHTSA.db` stores normalized history, one dynamically widened vPIC value row per decode, query metadata, identity resolutions, safety fields, recalls, complaints/products, and normalized bulk fields without full-response or raw-row JSON blobs.
+- Refresh every historical VIN incrementally with `DataPipeline/NHTSA_enrichment.py --resume --refresh-days 30`; use `--refresh-all --max-vins N` for controlled backfills and smoke tests.
+- Before the first schema-changing run on an existing primary database, pass --backup-path <new-backup-path>; the backup destination must not already exist.
+- Use --backfill-legacy when documenting or launching a deliberate full refresh of all historical VINs; it is an alias for --refresh-all.
+- Use NHTSA make/model/model-year values first and listing fields/title parsing as field-level fallbacks. Preserve source, confidence, conflict, missing-result, and request-failed metadata.
+- Treat recall and complaint queries as make/model/year-level evidence unless the source explicitly supplies a VIN.
+- Update all project Markdown and agent guidance in the same change when NHTSA endpoints, schemas, refresh behavior, scheduler commands, or lineage change.

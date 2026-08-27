@@ -26,8 +26,8 @@ Car-Price-Data-Visualization-Learning/
 |-- DataPipeline/
 |   |-- Playwright_test.py            # Current Playwright global-queue scraper
 |   |-- DataAquisition.py             # Legacy/reference Selenium CDP scraper
-|   |-- database.py                   # SQLite schema and persistence helpers
-|   |-- NHTSA_enrichment.py           # vPIC, safety ratings, recalls, complaints
+|   |-- database.py                   # Listing schema plus separate NHTSA store
+|   |-- NHTSA_enrichment.py           # Complete vPIC, ratings, recalls, complaints
 |   |-- DataCleaning.py               # Polars-based cleaned database builder
 |   |-- VehicleNormalization.py        # EPA cache and canonical identity parser
 |   |-- SentimentAnalysis.py          # YouTube comments ingestion
@@ -77,9 +77,31 @@ Run the core data pipeline:
 
 ```powershell
 python DataPipeline\Playwright_test.py
-python DataPipeline\NHTSA_enrichment.py
+python DataPipeline\NHTSA_enrichment.py --resume --refresh-days 30
 python DataPipeline\DataCleaning.py
 ```
+
+The first historical refresh should be run deliberately with
+`--refresh-all`. Use a positive `--max-vins` value for a bounded smoke run:
+
+```powershell
+python DataPipeline\NHTSA_enrichment.py --refresh-all --max-vins 50 --rate-limit-delay 1.0
+python Utilities\verify_schema.py --nhtsa-db-path CAR_DATA_OUTPUT\CAR_DATA_NHTSA.db
+```
+
+Before the first run against an existing CAR_DATA.db, create a one-time
+recoverable backup with --backup-path
+CAR_DATA_OUTPUT\backups\CAR_DATA_pre_nhtsa.db. The command refuses to overwrite
+an existing backup; routine scheduled runs do not repeat this multi-gigabyte
+operation.
+
+NHTSA enrichment resumes from successful cached responses by default. The
+pipeline stores normalized response history in `CAR_DATA_NHTSA.db`; the legacy
+`nhtsa_enrichment` table remains a latest-value compatibility projection. Schema
+version 2 intentionally omits full API-response JSON, per-record JSON copies,
+request payloads, and raw bulk-row blobs. Recreate a schema-version-1 NHTSA
+database before running this version; the script refuses to mix both layouts.
+Use --backfill-legacy when you want a self-documenting full historical refresh; it is an alias for --refresh-all and bypasses the response freshness cache.
 
 Run the complete macOS pipeline in sequence:
 
@@ -161,8 +183,8 @@ python -m unittest tests\test_vehicle_normalization.py tests\test_streamlit_cano
 ## Data Workflow
 
 1. `DataPipeline/Playwright_test.py` is the active scraper. It runs a global queue of `(make, source button)` tasks, intercepts `queue-results` network responses, and writes results incrementally to SQLite.
-2. `DataPipeline/database.py` stores listing snapshots, normalized `price_history`, normalized `listing_history`, and NHTSA enrichment tables in SQLite.
-3. `DataPipeline/NHTSA_enrichment.py` enriches unenriched VINs with vPIC decode fields, safety ratings, recalls, and complaints.
+2. `DataPipeline/database.py` stores listing snapshots, normalized `price_history`, normalized `listing_history`, and the compatibility NHTSA snapshot in `CAR_DATA.db`; normalized NHTSA history is stored in `CAR_DATA_NHTSA.db` without raw/full-response JSON duplication.
+3. `DataPipeline/NHTSA_enrichment.py` refreshes all historical VINs incrementally with complete vPIC fields, two-step safety ratings, full recall/complaint records, request metadata, and listing fallback identity context.
 4. `DataPipeline/DataCleaning.py` builds `CAR_DATA_OUTPUT/CAR_DATA_CLEANED.db`, anchors canonical make/model to NHTSA, derives canonical trim only from listing titles, validates against the cached EPA catalog, creates VIN consensus identities, and adds audit indexes.
 5. `DataPipeline/SentimentAnalysis.py` discovers playlist videos, resumes comment collection at the video level, and stores progress in `CAR_YOUTUBE_COMMENTS.db`.
 6. `DataPipeline/absa_pipeline.py` scores only new attributable comments by `comment_id` and rebuilds current plus monthly make-level sentiment indexes from stored scored rows.
@@ -209,7 +231,8 @@ Use `--migrate-make-grain` once to backfill existing scored comments without rer
 
 ## Databases and Outputs
 
-- `CAR_DATA_OUTPUT/CAR_DATA.db`: raw listing snapshots, history tables, and NHTSA enrichment.
+- `CAR_DATA_OUTPUT/CAR_DATA.db`: raw listing snapshots, history tables, and the backward-compatible latest NHTSA projection.
+- `CAR_DATA_OUTPUT/CAR_DATA_NHTSA.db`: one dynamically widened vPIC value row per decode, identity resolutions, safety variants/fields, recall and complaint/product records, ingestion runs, API extra fields, and normalized bulk-source fields. Full response and raw-row JSON blobs are not stored.
 - `CAR_DATA_OUTPUT/CAR_DATA_CLEANED.db`: cleaned analysis/modeling database, including `vehicle_identity`, `epa_vehicle_catalog`, and `epa_catalog_metadata`.
 - `CAR_DATA_OUTPUT/reference/epa_fuel_economy/`: ignored local cache of the official [FuelEconomy.gov vehicle dataset](https://www.fueleconomy.gov/feg/epadata/vehicles.csv.zip).
 - `CAR_DATA_OUTPUT/CAR_YOUTUBE_COMMENTS.db`: YouTube comment and sentiment-derived tables, including `youtube_video_fetch_state`, `youtube_playlist_fetch_state`, `youtube_comments_scored`, `make_sentiment_index`, and `make_sentiment_monthly`.
@@ -230,3 +253,5 @@ Use `--migrate-make-grain` once to backfill existing scored comments without rer
 - Avoid target leakage in modeling. Do not train on fields derived from the target price.
 - When adding dependencies, update `requirements.txt` in the same change.
 - When making research claims or recommending new techniques, verify against current primary sources or official documentation.
+- NHTSA recall and complaint records are generally make/model/year-level evidence, not VIN-specific reliability rates. Preserve source grain and report exposure limitations before interpreting them as reliability measures.
+- Any change to NHTSA endpoints, schemas, refresh behavior, scheduler commands, or data lineage must update the README, PROJECT_SUMMARY, AGENTS.md, and relevant `.github` guidance in the same change.

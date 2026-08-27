@@ -58,11 +58,12 @@ if "%DRY_RUN%"=="1" (
 )
 
 :: --- STEP 2: NHTSA ENRICHMENT ---
+:: Writes normalized source fields only; no full API-response or raw-row JSON blobs.
 echo [2/4] Running NHTSA_enrichment...
 if "%DRY_RUN%"=="1" (
-    echo [DRY RUN] %PY_CMD% "DataPipeline\NHTSA_enrichment.py"
+    echo [DRY RUN] %PY_CMD% "DataPipeline\NHTSA_enrichment.py" --resume --refresh-days 30 --rate-limit-delay 1.0
 ) else (
-    %PY_CMD% "DataPipeline\NHTSA_enrichment.py"
+    %PY_CMD% "DataPipeline\NHTSA_enrichment.py" --resume --refresh-days 30 --rate-limit-delay 1.0
     if errorlevel 1 (
         set "ERR=%errorlevel%"
         echo [ERROR] NHTSA_enrichment failed with exit code %ERR%.

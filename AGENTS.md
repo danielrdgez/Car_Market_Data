@@ -44,7 +44,7 @@ ML/                 Current-price models, depreciation forecasts, model notebook
 Utilities/          Health checks and schema migration/verification tools
 tests/              Focused regression tests
 streamlit_app.py    Streamlit dashboard for actuals, model metrics, predictions, forecasts
-CAR_DATA_OUTPUT/    Databases, logs, CSV exports
+CAR_DATA_OUTPUT/    Databases, logs, CSV exports, and the separate NHTSA store
 MODELS_OUTPUT/      Model artifacts and generated reports
 ```
 
@@ -57,6 +57,7 @@ python Utilities\health_check.py
 python Utilities\verify_schema.py
 python -m unittest tests\test_ml_upgrade.py
 python -m unittest tests\test_sentiment_incremental.py
+python -m unittest tests\test_nhtsa_enrichment.py
 python -m py_compile DataPipeline\Playwright_test.py DataPipeline\DataAquisition.py DataPipeline\DataCleaning.py DataPipeline\VehicleNormalization.py DataPipeline\NHTSA_enrichment.py DataPipeline\SentimentAnalysis.py DataPipeline\absa_pipeline.py ML\Price_ML_Models.py ML\Time_Series_Price.py Utilities\health_check.py
 ```
 
@@ -98,11 +99,14 @@ run_pipeline_scheduler.bat --dry-run
 
 - `listings` is a snapshot table keyed by `(vin, loaddate)`.
 - `price_history` and `listing_history` are normalized history tables.
-- `nhtsa_enrichment` is VIN-level metadata.
+- `nhtsa_enrichment` is the backward-compatible latest NHTSA projection in `CAR_DATA.db`; normalized NHTSA history is stored in `CAR_DATA_NHTSA.db`.
+- `CAR_DATA_NHTSA.db` stores one dynamically widened vPIC value row per decode, source/query metadata, identity resolutions, safety variants/fields, recalls, complaints/products, and normalized bulk fields. Do not persist full API responses, per-record JSON copies, request payloads, or raw bulk-row blobs.
 - Keep all NHTSA-derived fields prefixed with `nhtsa_`.
+- Preserve source grain: recalls and complaints queried by make/model/year must not be presented as VIN-specific reliability rates.
 - Do not drop source rows during enrichment joins unless the task explicitly asks for a scoped modeling dataset.
 - Prefer additive schema changes. If a schema migration is needed, update `database.py`, `Utilities/verify_schema.py`, `Utilities/fix_database_schema.py`, tests, and documentation together.
 - Do not run destructive database operations unless the user explicitly asks and a backup path is clear.
+- Before the first NHTSA migration of an existing CAR_DATA.db, use NHTSA_enrichment.py --backup-path <new-backup-path>; the SQLite backup is recoverable and refuses to overwrite an existing destination. Omit it for routine scheduled runs.
 
 ## Cleaning and Data Quality Rules
 
@@ -118,6 +122,9 @@ run_pipeline_scheduler.bat --dry-run
 - Retain every valid NHTSA-enriched scraped make. Do not reintroduce a hard-coded make whitelist.
 - Preserve `nhtsa_BasePrice` provenance; when NHTSA base price is missing, cleaned output may fill it from earliest cleaned `price_history` price, then earliest cleaned `listing_history` price.
 - Validate VINs before enrichment.
+- Use NHTSA make/model/model-year values first and listing fields/title parsing as field-level fallbacks; persist source, confidence, and conflict metadata.
+- Use NHTSA_enrichment.py --backfill-legacy for an explicit full historical re-enrichment; it is equivalent to --refresh-all and bypasses the freshness cache.
+- Preserve every source field in typed columns or normalized field/value tables while excluding duplicate transport wrappers and opaque raw JSON. Continue distinguishing successful, empty, invalid, missing-result, stale, and request-failed states.
 - Keep cleaned output reproducible from `CAR_DATA.db` to `CAR_DATA_CLEANED.db`.
 - Create or preserve indexes used by modeling and time-series queries.
 
@@ -164,7 +171,8 @@ run_pipeline_scheduler.bat --dry-run
 - Prefer citing durable sources in generated reports or docs when the claim affects methodology.
 - Keep `README.md` concise and user-facing.
 - Keep `PROJECT_SUMMARY.md` as the detailed technical and capstone narrative.
-- Update docs in the same change when workflows, dependencies, schemas, or model outputs change.
+- Update docs in the same change when workflows, dependencies, schemas, model outputs, NHTSA endpoints, refresh behavior, scheduler commands, or data lineage change.
+- Keep every tracked project Markdown and agent guidance file synchronized: `README.md`, `PROJECT_SUMMARY.md`, `AGENTS.md`, `.github/AGENTS.md`, `.github/copilot-instructions.md`, and `.github/instructions/*.md`. Do not create duplicate Markdown files for this workflow.
 - Do not create extra markdown files unless the user asks. Update `README.md`, `PROJECT_SUMMARY.md`, and this file first.
 
 ## Dependency Rules
@@ -200,5 +208,5 @@ For most changes, a good finish includes:
 1. The relevant code or documentation is updated.
 2. The change respects acquisition, schema, cleaning, modeling, and research constraints above.
 3. Lightweight validation has been run, or the reason it could not be run is documented.
-4. `README.md`, `PROJECT_SUMMARY.md`, and `AGENTS.md` are updated when workflow or architecture changes.
+4. All relevant project Markdown and agent guidance files are updated when workflow or architecture changes.
 5. The final response clearly states what changed and what was verified.

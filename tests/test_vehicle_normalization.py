@@ -57,6 +57,17 @@ class VehicleNormalizationTests(unittest.TestCase):
         self.assertEqual(disagreement.canonical_model, "TACOMA")
         self.assertFalse(disagreement.nhtsa_model_agrees)
 
+    def test_nhtsa_year_precedes_title_year_and_preserves_disagreement(self) -> None:
+        parsed = self.normalizer.parse_title(
+            "2003 Honda Accord EX",
+            nhtsa_make="HONDA",
+            nhtsa_model="ACCORD",
+            nhtsa_year=2004,
+        )
+        self.assertEqual(parsed.canonical_year, 2004)
+        self.assertFalse(parsed.nhtsa_year_agrees)
+        self.assertEqual(parsed.canonical_trim, "EX")
+
     def test_empty_title_trim_is_explicitly_unresolved(self) -> None:
         parsed = self.normalizer.parse_title(
             "2022 Honda Civic Sedan",

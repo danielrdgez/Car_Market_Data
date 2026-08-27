@@ -56,4 +56,15 @@ The active scraper is `DataPipeline/Playwright_test.py`. It uses Playwright resp
 - Visualization: Plotly for Python EDA, ggplot2 for R EDA
 - Modeling: scikit-learn, LightGBM, category encoders, joblib
 - NLP/sentiment: YouTube Data API, transformers, torch
-- Enrichment: NHTSA vPIC, SafetyRatings, Recalls, Complaints APIs
+- Enrichment: NHTSA vPIC, SafetyRatings, Recalls, Complaints APIs, and official bulk datasets. Normalized NHTSA history is stored in `CAR_DATA_OUTPUT/CAR_DATA_NHTSA.db`; `CAR_DATA.db` retains the compatibility projection.
+
+## NHTSA Implementation Rules
+
+- Use vPIC batches of no more than 50 VINs with the documented lowercase `data` form field and model-year hints when available.
+- Perform both Safety Ratings calls: model-year/make/model variant lookup followed by a `VehicleId` detail lookup for every variant.
+- Persist all available source fields in typed columns or normalized field/value tables, but never duplicate full API responses, request payloads, record JSON, or raw bulk-row blobs; compatibility columns are a derived projection only.
+- Resolve identity per field with NHTSA first and listing data as fallback, recording source and conflicts.
+- Use conservative rate limiting, retries, resumable cache reads, and incremental SQLite writes.
+- Use --backup-path for a one-time live SQLite backup before the first migration of an existing primary database; never overwrite an existing backup.
+- Use --backfill-legacy as the explicit full-history refresh alias when the goal is to reprocess every historical VIN with current mappings.
+- Update README.md, PROJECT_SUMMARY.md, AGENTS.md, and relevant `.github` guidance whenever this workflow or its schema changes.

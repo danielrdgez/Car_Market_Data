@@ -31,7 +31,8 @@ Primary databases:
 Core tables:
 
 - `listings`: listing snapshots keyed by `(vin, loaddate)`.
-- `nhtsa_enrichment`: VIN-level NHTSA specs, safety, recall, and complaint fields.
+- `nhtsa_enrichment`: latest compatibility projection of NHTSA specs, safety, recall, and complaint fields.
+- `CAR_DATA_NHTSA.db`: complete NHTSA raw response history and source-grain records for audit and deeper analysis.
 - `listing_history`: longitudinal listing records by VIN and date.
 - `price_history`: longitudinal price records by VIN and date.
 - `youtube_comments_sentiment`: raw YouTube comments.
@@ -52,6 +53,8 @@ Preferred joins:
 - Treat outliers as evidence to inspect before removal; visualize before filtering.
 - Distinguish true zero mileage from missing mileage.
 - Check NHTSA coverage rates by make, model, model year, and VIN.
+- Check raw NHTSA ingestion status, response freshness, duplicate fingerprints, orphan links, and coverage by source before interpreting enrichment features.
+- Label recalls and complaints as make/model/year-level evidence unless a record contains a VIN; do not call their counts failure rates without an exposure denominator.
 - Audit canonical trim population, source/confidence, EPA coverage, suspicious cardinality, title remainders, and NHTSA agreement without treating NHTSA trim disagreement as a canonical error.
 - Include explicit GT350 and GT350R checks and keep exact database-wide rates behind `RUN_FULL_SCAN`.
 - Validate whether sentiment joins have enough sample support before using them in conclusions.

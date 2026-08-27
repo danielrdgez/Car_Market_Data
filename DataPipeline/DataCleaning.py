@@ -651,8 +651,14 @@ class DataCleaningPipeline:
         listings = self._cast_to_int(listings, ["locationCode"])
         listings = self._cast_to_float(listings, ["distance"])
 
-        nhtsa = self._ensure_columns(nhtsa, ["nhtsa_Trim", "nhtsa_Trim2"])
-        nhtsa = self._filter_non_empty(nhtsa, ["vin", "nhtsa_Make", "nhtsa_Model", "nhtsa_ModelYear"]).with_columns(
+        nhtsa = self._ensure_columns(
+            nhtsa,
+            ["nhtsa_Make", "nhtsa_Model", "nhtsa_ModelYear", "nhtsa_Trim", "nhtsa_Trim2"],
+        )
+        # A failed or partial NHTSA decode must not remove a valid listing from
+        # the cleaned dataset. NHTSA fields remain preferred when populated;
+        # VehicleNormalizer supplies listing-title fallbacks when they are not.
+        nhtsa = self._filter_non_empty(nhtsa, ["vin"]).with_columns(
             [
                 pl.col("nhtsa_Make").cast(pl.String).str.strip_chars().str.to_uppercase().alias("nhtsa_Make"),
                 pl.col("nhtsa_Model").cast(pl.String).str.strip_chars().str.to_uppercase().alias("nhtsa_Model"),
@@ -677,7 +683,7 @@ class DataCleaningPipeline:
         listing_context_columns = [
             "vin", "nhtsa_Make", "nhtsa_Model", "nhtsa_ModelYear", "nhtsa_Trim", "nhtsa_Trim2"
         ]
-        scoped_listings = listings.join(nhtsa.select(listing_context_columns), on="vin", how="inner")
+        scoped_listings = listings.join(nhtsa.select(listing_context_columns), on="vin", how="left")
         scoped_listings = VehicleNormalizer(epa_catalog).normalize_listings(scoped_listings)
         scoped_listings = self._add_listing_trim_features(scoped_listings)
         scoped_listings = self._filter_contextual_price_outliers(scoped_listings, "price", "listings")
@@ -750,7 +756,7 @@ class DataCleaningPipeline:
 
         nhtsa = self._fill_nhtsa_base_price_from_history(nhtsa, price_history, listing_history)
         keep_nhtsa_columns = [c for c in nhtsa.columns if c not in NHTSA_DROP_COLUMNS]
-        scoped_nhtsa = nhtsa.join(scoped_vins, on="vin", how="inner").select(keep_nhtsa_columns)
+        scoped_nhtsa = scoped_vins.join(nhtsa, on="vin", how="left").select(keep_nhtsa_columns)
 
         target_conn = sqlite3.connect(str(self.target_db_path))
         try:

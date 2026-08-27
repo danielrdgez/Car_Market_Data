@@ -1,6 +1,6 @@
 # Project Summary
 
-Last updated: August 18, 2026
+Last updated: August 26, 2026
 
 ## Executive Overview
 
@@ -35,7 +35,8 @@ Acquisition
 Enrichment
   Raw VINs
   -> NHTSA vPIC, SafetyRatings, Recalls, Complaints
-  -> nhtsa_enrichment
+  -> CAR_DATA_NHTSA.db normalized source history
+  -> nhtsa_enrichment compatibility projection
 
 Cleaning
   CAR_DATA.db
@@ -79,6 +80,7 @@ Main tables:
 - `price_history`: normalized price history entries from listing payloads.
 - `listing_history`: normalized listing history entries.
 - `nhtsa_enrichment`: VIN-level NHTSA specs, safety, recall, and complaint fields.
+- `CAR_DATA_NHTSA.db`: normalized NHTSA source history and source-grain records, separate from the listing database, with no full-response or raw-row JSON blobs.
 - `youtube_comments_sentiment`: YouTube comment ingestion output.
 
 Important behavior:
@@ -86,11 +88,11 @@ Important behavior:
 - Acquisition writes are incremental.
 - Thread-safe acquisition uses thread-local SQLite connections and a shared write lock.
 - History tables use `INSERT OR IGNORE` with uniqueness constraints.
-- NHTSA inserts use batch `INSERT OR REPLACE`.
+- NHTSA records are deduplicated by individual result/record hashes and retained in typed tables, one dynamically widened vPIC row per decode, or normalized field/value tables for sparse extras; transport wrappers and duplicate JSON payloads are discarded. The primary database receives an explicit compatibility projection.
 
 ### NHTSA Enrichment
 
-`DataPipeline/NHTSA_enrichment.py` enriches VINs that are present in `listings` but missing from `nhtsa_enrichment`.
+`DataPipeline/NHTSA_enrichment.py` refreshes every distinct VIN present in `listings`, using the separate `CAR_DATA_NHTSA.db` as the normalized NHTSA store and retaining `nhtsa_enrichment` as a latest-successful compatibility projection.
 
 Sources:
 
@@ -98,8 +100,26 @@ Sources:
 - NHTSA SafetyRatings API.
 - NHTSA Recalls API.
 - NHTSA Complaints API.
+- Official downloadable NHTSA investigation, complaint, recall, manufacturer communication, and technical-service-bulletin files can be imported through the bulk importer without dropping source fields; rows are flattened into `nhtsa_bulk_fields` rather than retained as opaque JSON.
 
-The enricher batches VIN decode requests up to 50 VINs, uses worker threads, caches make/model/year safety, recall, and complaint lookups, and prefixes all derived columns with `nhtsa_`.
+The enricher batches VIN decode requests up to 50 VINs, includes listing model-year hints, uses conservative retries and rate limiting, caches successful responses by freshness window, performs the two-step Safety Ratings lookup for every returned `VehicleId`, and prefixes compatibility columns with `nhtsa_`. NHTSA make/model/year values are selected first; listing year and title-derived make/model are field-level fallbacks with source and conflict metadata.
+
+Raw vPIC variables are stored dynamically as variable/value rows and raw JSON so newly added NHTSA fields are not silently discarded. Empty, invalid, missing-result, request-failed, and successful responses remain distinguishable. Recalls and complaints retain all response fields and are interpreted at their source grain rather than as direct VIN failure rates.
+
+Useful commands:
+
+```powershell
+python DataPipeline\NHTSA_enrichment.py --refresh-all --max-vins 50 --rate-limit-delay 1.0
+python DataPipeline\NHTSA_enrichment.py --resume --refresh-days 30
+python Utilities\verify_schema.py --nhtsa-db-path CAR_DATA_OUTPUT\CAR_DATA_NHTSA.db
+```
+
+Use --backfill-legacy instead of --refresh-all when the purpose is explicitly to reprocess every historical VIN with the current NHTSA mappings and values.
+
+For the first migration of an existing primary database, pass
+--backup-path CAR_DATA_OUTPUT\backups\CAR_DATA_pre_nhtsa.db. The backup uses
+SQLite's live-database backup API and refuses to overwrite an existing file;
+scheduled incremental runs should omit this one-time option.
 
 ### Cleaning
 
@@ -117,7 +137,8 @@ Current cleaning choices:
 - Imports the complete cached EPA file into `epa_vehicle_catalog`, records provenance in `epa_catalog_metadata`, and creates a confidence/recency-ranked VIN consensus in `vehicle_identity`.
 - Fills missing or non-positive `nhtsa_BasePrice` from the earliest cleaned `price_history` price for the VIN, then the earliest cleaned `listing_history` price when price history is unavailable, while recording `nhtsa_BasePrice_source`.
 - Normalizes date and numeric columns.
-- Retains every valid NHTSA-enriched make/model/model-year row; there is no hard-coded make whitelist.
+- Retains every listing even when NHTSA decoding is partial; NHTSA make/model/model-year remains preferred when present and listing identity supplies fallbacks with provenance.
+- Does not copy the detailed NHTSA database into the cleaned database; cleaned output uses the compatibility projection while normalized source records remain queryable in `CAR_DATA_NHTSA.db`.
 - Creates indexes for modeling and time-series reads.
 
 The cleaned database is the preferred input for EDA and modeling.
@@ -334,6 +355,7 @@ Recommended validation commands:
 python Utilities\health_check.py
 python Utilities\verify_schema.py
 python -m unittest tests\test_ml_upgrade.py
+python -m unittest tests\test_nhtsa_enrichment.py
 python -m unittest tests\test_vehicle_normalization.py
 python -m py_compile DataPipeline\Playwright_test.py DataPipeline\DataAquisition.py DataPipeline\DataCleaning.py DataPipeline\VehicleNormalization.py DataPipeline\NHTSA_enrichment.py DataPipeline\SentimentAnalysis.py DataPipeline\absa_pipeline.py ML\Price_ML_Models.py ML\Time_Series_Price.py Utilities\health_check.py Utilities\verify_schema.py
 ```
@@ -343,6 +365,10 @@ python -m py_compile DataPipeline\Playwright_test.py DataPipeline\DataAquisition
 - Cleaned output preserves key predictive listing fields and indexes.
 - Current-price train/test splitting has no VIN overlap.
 - Price-history gap loading correctly labels duplicate-like trajectories.
+
+`tests/test_nhtsa_enrichment.py` checks the documented batch payload, complete
+raw-field persistence, two-step safety ratings, full recall/complaint storage,
+and compatibility projection behavior using mocked responses.
 
 `tests/test_sentiment_incremental.py` checks:
 
@@ -363,7 +389,7 @@ Core pipeline:
 
 ```powershell
 python DataPipeline\Playwright_test.py
-python DataPipeline\NHTSA_enrichment.py
+python DataPipeline\NHTSA_enrichment.py --resume --refresh-days 30 --rate-limit-delay 1.0
 python DataPipeline\DataCleaning.py
 ```
 

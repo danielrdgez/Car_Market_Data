@@ -22,7 +22,7 @@ EPA_VEHICLES_URL = "https://www.fueleconomy.gov/feg/epadata/vehicles.csv.zip"
 EPA_ARCHIVE_NAME = "vehicles.csv.zip"
 EPA_METADATA_NAME = "metadata.json"
 EPA_REQUIRED_COLUMNS = {"id", "year", "make", "model"}
-NORMALIZATION_VERSION = "title_epa_v1"
+NORMALIZATION_VERSION = "title_epa_v2"
 
 UNKNOWN_VALUES = {
     "",
@@ -552,13 +552,23 @@ class VehicleNormalizer:
         nhtsa_trim2: Any = None,
     ) -> ParsedIdentity:
         title_text = normalize_vehicle_text(title)
-        year = self._parse_year(title_text)
+        title_year = self._parse_year(title_text)
+        try:
+            nhtsa_year_value = int(float(nhtsa_year)) if nhtsa_year is not None else None
+        except (TypeError, ValueError):
+            nhtsa_year_value = None
+        if nhtsa_year_value is not None and not 1886 <= nhtsa_year_value <= 2100:
+            nhtsa_year_value = None
+        # NHTSA is authoritative when it supplies a valid year. The title year
+        # remains available through the agreement flag for conflict auditing.
+        year = nhtsa_year_value or title_year
         make, matched_make = self._parse_make(title_text, nhtsa_make)
         model, matched_model = self._parse_model(title_text, year, make, nhtsa_model)
 
         remainder = title_text
-        if year is not None:
-            remainder = _remove_phrase(remainder, str(year))
+        for year_value in {year, title_year}:
+            if year_value is not None:
+                remainder = _remove_phrase(remainder, str(year_value))
         if matched_make:
             remainder = _remove_phrase(remainder, matched_make)
         if matched_model:
@@ -581,11 +591,6 @@ class VehicleNormalizer:
             confidence = "low"
             status = "best_candidate"
 
-        nhtsa_year_value: int | None
-        try:
-            nhtsa_year_value = int(float(nhtsa_year)) if nhtsa_year is not None else None
-        except (TypeError, ValueError):
-            nhtsa_year_value = None
         nhtsa_make_text = MAKE_ALIASES.get(normalize_vehicle_text(nhtsa_make), normalize_vehicle_text(nhtsa_make))
         nhtsa_model_text = normalize_vehicle_text(nhtsa_model)
         nhtsa_trims = {
@@ -614,7 +619,7 @@ class VehicleNormalizer:
             epa_vehicle_id=epa_vehicle_id,
             epa_match_status=epa_status,
             normalization_version=NORMALIZATION_VERSION,
-            nhtsa_year_agrees=(year == nhtsa_year_value) if year and nhtsa_year_value else None,
+            nhtsa_year_agrees=(title_year == nhtsa_year_value) if title_year and nhtsa_year_value else None,
             nhtsa_make_agrees=bool(matched_make) if nhtsa_make_text else None,
             nhtsa_model_agrees=bool(matched_model) if nhtsa_model_text else None,
             nhtsa_trim_agrees=(canonical_trim in nhtsa_trims) if nhtsa_trims else None,

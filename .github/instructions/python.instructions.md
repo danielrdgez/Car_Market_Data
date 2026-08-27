@@ -48,10 +48,22 @@ If touching this file:
    - `listings`: listing snapshots keyed by VIN and load date.
    - `price_history`: normalized price history rows.
    - `listing_history`: normalized listing history rows.
-   - `nhtsa_enrichment`: VIN-level official metadata and safety/recall/complaint fields.
+   - `nhtsa_enrichment`: latest VIN-level compatibility projection in `CAR_DATA.db`.
+   - `CAR_DATA_NHTSA.db`: complete raw/normalized NHTSA response history and source-grain records.
 5. Prefer additive schema changes and update tests/docs with any schema change.
 6. Canonical make/model use NHTSA anchors when present; title parsing verifies them and exclusively supplies canonical trim.
 7. Keep EPA refresh/cache behavior conditional, atomic, offline-capable, and versioned.
+8. Use the NHTSA enricher's --backup-path for a one-time recoverable backup before migrating an existing primary database; routine scheduled runs omit it.
+9. Use --backfill-legacy when a full historical VIN re-enrichment is intentional; it is equivalent to --refresh-all.
+
+NHTSA-specific implementation:
+
+1. Use the vPIC batch `data` field with at most 50 `vin,modelYear` entries.
+2. Persist every response field, variable/value identifier when supplied, request status, and raw JSON.
+3. Perform the Safety Ratings variant lookup and then a detail lookup for every `VehicleId`.
+4. Store all recall and complaint records without truncation, and retain their source grain.
+5. Resolve NHTSA identity fields before listing fallbacks and record provenance/conflicts.
+6. Keep NHTSA writes incremental, resumable, rate-limited, and documented in the project Markdown and agent files.
 
 ## 5. Modeling and Research Standards
 

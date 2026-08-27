@@ -25,6 +25,15 @@ applyTo: ["DataPipeline/DataCleaning.py", "DataPipeline/VehicleNormalization.py"
 - Keep merge semantics as left-join style behavior to avoid dropping source rows.
 - Prefix all NHTSA-derived fields with `nhtsa_` to avoid naming collisions.
 - Cache repeated make/model/year lookups where possible to reduce redundant safety, recall, and complaint calls.
+- Store normalized NHTSA history in `CAR_DATA_OUTPUT/CAR_DATA_NHTSA.db`; treat `nhtsa_enrichment` in `CAR_DATA.db` as a compatibility projection.
+- Store every source field in typed columns, one dynamically widened vPIC row per decode, or normalized field/value tables for sparse extras, while excluding full-response JSON, request payloads, per-record JSON copies, and raw bulk-row blobs. Preserve response messages, error codes, HTTP status, request timestamps, and source hashes.
+- Include model-year hints in vPIC batch payloads and never exceed 50 VINs per request.
+- Query Safety Ratings variants first, then retrieve details for every returned `VehicleId`.
+- Preserve every recall and complaint row and all source fields; do not confuse make/model/year counts with VIN-specific reliability rates.
+- Use NHTSA make/model/year first and listing values as field-level fallbacks, recording source, confidence, and conflicts.
+- Refresh old VINs through resumable cache-aware runs instead of processing only VINs absent from the compatibility table.
+- Before the first run that alters an existing primary schema, create a new backup with --backup-path; do not overwrite prior backups.
+- Use --backfill-legacy for a deliberate all-historical-VIN refresh that bypasses the NHTSA response freshness cache.
 
 ## Modeling Data Standards
 - Avoid target leakage in cleaned or engineered datasets.
@@ -37,3 +46,4 @@ applyTo: ["DataPipeline/DataCleaning.py", "DataPipeline/VehicleNormalization.py"
 - Keep generated code and markdown professional and emoji-free.
 - Use only minimal comments for non-obvious logic.
 - When introducing new packages, update `requirements.txt` in the same change.
+- When NHTSA behavior, schema, scheduler commands, or lineage changes, update all project Markdown and agent guidance files in the same change.

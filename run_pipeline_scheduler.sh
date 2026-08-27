@@ -77,7 +77,8 @@ echo "Python command   : $PYTHON_CMD"
 echo "================================================================"
 
 run_step 1 "Playwright_test" "DataPipeline/Playwright_test.py"
-run_step 2 "NHTSA_enrichment" "DataPipeline/NHTSA_enrichment.py"
+# Writes normalized source fields only; no full API-response or raw-row JSON blobs.
+run_step 2 "NHTSA_enrichment" "DataPipeline/NHTSA_enrichment.py" --resume --refresh-days 30 --rate-limit-delay 1.0
 
 # Refresh and validate the shared EPA cache before cleaning imports it into SQLite.
 run_step 3 "VehicleNormalization EPA refresh" "DataPipeline/VehicleNormalization.py"

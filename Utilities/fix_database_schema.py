@@ -174,6 +174,10 @@ def main():
         "Make-level sentiment columns and aggregate tables are managed separately by "
         "DataPipeline/absa_pipeline.py --migrate-make-grain."
     )
+    print(
+        "CAR_DATA_NHTSA.db schema version 2 is normalized-only and is not migrated by "
+        "this utility. Recreate a version-1 NHTSA database before rerunning enrichment."
+    )
     logging.info("="*60)
     logging.info("Database Schema Migration Tool")
     logging.info("="*60)
