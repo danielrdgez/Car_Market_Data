@@ -16,6 +16,7 @@ The main research goals are:
 
 ## Learn These Files First
 
+- `DATA_DICTIONARY.md`: field-level reference for `CAR_DATA.db`, `CAR_YOUTUBE_COMMENTS.db`, and `CAR_DATA_NHTSA.db`. Keep it synchronized when their schemas, mappings, status vocabularies, calculations, or time semantics change; distinguish observed constraints from intended rules.
 - `README.md`: public project overview, workflow, and commands.
 - `PROJECT_SUMMARY.md`: technical architecture, research framing, caveats, and runbook.
 - `.github/AGENTS.md`: older GitHub-scoped agent guidance that this root file consolidates.

@@ -4,6 +4,8 @@ applyTo: "**/*.py"
 
 # Python and Scraper Guidelines: Automotive Market ML Capstone
 
+Keep [DATA_DICTIONARY.md](../../DATA_DICTIONARY.md) synchronized when code changes schemas, field mappings, status vocabularies, calculations, or time semantics in `CAR_DATA.db`, `CAR_YOUTUBE_COMMENTS.db`, or `CAR_DATA_NHTSA.db`. Record actual SQLite constraints separately from intended application rules.
+
 ## 1. Global Logic and Strategy
 
 Goal: collect automotive market data as structured network payloads, enrich it, clean it, and model it with research-grade validation.

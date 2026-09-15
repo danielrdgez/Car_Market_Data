@@ -1,5 +1,7 @@
 # Global Project Instructions: Automotive Market ML Capstone
 
+Use [DATA_DICTIONARY.md](../DATA_DICTIONARY.md) as the field reference for `CAR_DATA.db`, `CAR_YOUTUBE_COMMENTS.db`, and `CAR_DATA_NHTSA.db`. Keep it synchronized with their schema, mapping, status, calculation, and time-semantic changes; distinguish actual SQLite constraints from intended application behavior.
+
 ## Project Overview
 
 This repository is a master's capstone data science project focused on current new and used vehicle market pricing. It aggregates vehicle listings from AutoTempest-style result pages, enriches VINs with official NHTSA data, integrates YouTube consumer-comment sentiment, and trains machine learning models for price prediction and depreciation forecasting.

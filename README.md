@@ -231,6 +231,8 @@ Use `--migrate-make-grain` once to backfill existing scored comments without rer
 
 ## Databases and Outputs
 
+See [DATA_DICTIONARY.md](DATA_DICTIONARY.md) for every table and column in the three raw/source databases below, including keys, lineage, units, status codes, sentiment formulas, and known schema limitations.
+
 - `CAR_DATA_OUTPUT/CAR_DATA.db`: raw listing snapshots, history tables, and the backward-compatible latest NHTSA projection.
 - `CAR_DATA_OUTPUT/CAR_DATA_NHTSA.db`: one dynamically widened vPIC value row per decode, identity resolutions, safety variants/fields, recall and complaint/product records, ingestion runs, API extra fields, and normalized bulk-source fields. Full response and raw-row JSON blobs are not stored.
 - `CAR_DATA_OUTPUT/CAR_DATA_CLEANED.db`: cleaned analysis/modeling database, including `vehicle_identity`, `epa_vehicle_catalog`, and `epa_catalog_metadata`.

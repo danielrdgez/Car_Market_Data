@@ -1,6 +1,8 @@
 # Project Summary
 
-Last updated: August 26, 2026
+Last updated: September 15, 2026
+
+The [data dictionary](DATA_DICTIONARY.md) documents the inspected schemas of `CAR_DATA.db`, `CAR_YOUTUBE_COMMENTS.db`, and `CAR_DATA_NHTSA.db`: 32 project tables and 682 columns, plus SQLite internal sequence tables. It distinguishes stored constraints from intended behavior, documents lineage and sentiment calculations, and records legacy foreign-key and temporal-availability limitations. The cleaned database and model outputs are outside that dictionary's scope.
 
 ## Executive Overview
 

@@ -1,5 +1,7 @@
 # Capstone Project: Advanced Automotive Market Analysis
 
+Use [DATA_DICTIONARY.md](../../DATA_DICTIONARY.md) for the three source databases' grains, field definitions, units, and temporal caveats. Do not treat legacy foreign keys, monthly sentiment labels, or latest NHTSA projections as proof of valid joins or historical availability; update the dictionary when definitions change.
+
 ## 1. Role and Persona
 
 Act as an expert lead data scientist specializing in automotive economics, applied machine learning, time-series analysis, and consumer sentiment/NLP.

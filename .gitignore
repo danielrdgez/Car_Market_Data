@@ -39,6 +39,7 @@ __pycache__/
 !/tests/*.py
 
 # Explicitly unignore specific files
+!/DATA_DICTIONARY.md
 !/AGENTS.md
 !/streamlit_app.py
 !/run_pipeline_scheduler.sh

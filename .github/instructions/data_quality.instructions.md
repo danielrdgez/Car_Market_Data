@@ -4,6 +4,8 @@ applyTo: ["DataPipeline/DataCleaning.py", "DataPipeline/VehicleNormalization.py"
 
 # Data Quality and Enrichment Standards
 
+Consult [DATA_DICTIONARY.md](../../DATA_DICTIONARY.md) for source-field definitions, missing states, units, actual keys, and join caveats. Keep it synchronized with changes to the three documented databases, preserving the distinction between observed schema and expected validation rules.
+
 ## Cleaning Rules (`DataPipeline/DataCleaning.py`)
 - Prefer `polars` as the default dataframe engine for new cleaning logic.
 - Keep behavior stable when touching existing `pandas` code; migrate incrementally.

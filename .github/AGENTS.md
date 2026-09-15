@@ -1,5 +1,7 @@
 # GitHub Agent Guide
 
+Use [DATA_DICTIONARY.md](../DATA_DICTIONARY.md) for the three source databases' field definitions, actual constraints, lineage, and caveats. Update it when their schemas, mappings, statuses, calculations, or time semantics change; do not infer physical constraints from constructor code alone.
+
 This file mirrors the root `AGENTS.md` for tools that read instructions from `.github/`. If the two files ever disagree, update both and treat the root `AGENTS.md` as the source of truth.
 
 ## Mission-Critical Context
