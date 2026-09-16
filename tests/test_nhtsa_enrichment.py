@@ -124,6 +124,36 @@ class NHTSAEnrichmentTests(unittest.TestCase):
             self.assertEqual(len(calls[-1][2]["data"]["data"].split(";")), 50)
             enricher.close()
 
+    def test_enrichment_candidates_are_distinct_vins(self):
+        with tempfile.TemporaryDirectory() as directory:
+            car_path = Path(directory) / "CAR_DATA.db"
+            database = CarDatabase(str(car_path))
+            database.insert_rows([
+                {"vin": VIN, "loaddate": "2024-01-01", "year": 2003, "price": 10000, "mileage": 100000},
+                {"vin": VIN, "loaddate": "2024-01-02", "year": 2003, "price": 9500, "mileage": 101000},
+                {"vin": " 1hgcm82633a004352 ", "loaddate": "2024-01-03", "year": 2003},
+            ])
+            self.assertEqual(database.get_vins_for_enrichment(), [VIN])
+            context = database.get_vins_for_enrichment(include_listing_context=True)
+            self.assertEqual([row["vin"] for row in context], [VIN])
+            database.close()
+
+    def test_bulk_vpic_cache_is_vin_only(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = NHTSADataStore(Path(directory) / "CAR_DATA_NHTSA.db")
+            try:
+                run_id = store.start_run(source="test", mode="incremental")
+                store.store_vpic_result(
+                    run_id, VIN, {"VIN": VIN, "Make": "HONDA"},
+                    model_year_hint=2003,
+                    response={"Results": [{"VIN": VIN, "Make": "HONDA"}]},
+                )
+                cached = store.get_latest_successful_vpic_by_vin(max_age_days=30)
+                self.assertIn(VIN, cached)
+                self.assertEqual(cached[VIN]["model_year_hint"], 2003)
+            finally:
+                store.close()
+
     def test_full_enrichment_persists_normalized_fields_without_raw_json(self):
         with tempfile.TemporaryDirectory() as directory:
             enricher, car_path = self.make_enricher(directory)

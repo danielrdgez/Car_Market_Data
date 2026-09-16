@@ -581,6 +581,53 @@ class NHTSADataStore:
             "fetched_at": row[2],
         }
 
+    def get_latest_successful_vpic_by_vin(
+        self, *, max_age_days: Optional[int] = None
+    ) -> dict[str, dict[str, Any]]:
+        """Return the newest successful VPIC check for each VIN in one query.
+
+        Resume identity is deliberately VIN-only.  The model-year hint is
+        retained in the returned metadata for auditability, but does not
+        participate in cache matching.
+        """
+        query = """
+            WITH ranked AS (
+                SELECT decode_id, vin, model_year_hint, fetched_at,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY vin
+                           ORDER BY fetched_at DESC, decode_id DESC
+                       ) AS row_number
+                FROM nhtsa_vpic_decodes
+                WHERE response_status = 'success'
+            )
+            SELECT decode_id, vin, model_year_hint, fetched_at
+            FROM ranked
+            WHERE row_number = 1
+        """
+        cutoff = None
+        if max_age_days is not None:
+            cutoff = datetime.now(timezone.utc) - timedelta(days=max_age_days)
+        with self._lock:
+            rows = self.conn.execute(query).fetchall()
+        cached: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            vin = str(row[1]).strip().upper()
+            if not vin:
+                continue
+            if cutoff is not None:
+                try:
+                    fetched = datetime.fromisoformat(str(row[3]).replace("Z", "+00:00"))
+                except ValueError:
+                    continue
+                if fetched < cutoff:
+                    continue
+            cached[vin] = {
+                "decode_id": int(row[0]),
+                "model_year_hint": row[2],
+                "fetched_at": row[3],
+            }
+        return cached
+
     def get_latest_vehicle_query(
         self,
         query_type: str,
@@ -1411,7 +1458,7 @@ class CarDatabase:
             return {row[0]: {'price': row[1], 'mileage': row[2]} for row in cursor.fetchall()}
 
     def get_vins_for_enrichment(self, include_listing_context: bool = False):
-        """Return every distinct VIN and its latest listing fallback context.
+        """Return distinct VINs and, optionally, minimal fallback context.
 
         The historical implementation returned only VINs absent from the wide
         enrichment table.  That made old records permanently stale.  Callers can
@@ -1419,18 +1466,27 @@ class CarDatabase:
         for the context dictionaries needed for field-level fallback.
         """
         with self._get_connection() as conn:
+            if not include_listing_context:
+                return [row[0] for row in conn.execute(
+                    "SELECT DISTINCT UPPER(TRIM(vin)) FROM listings "
+                    "WHERE vin IS NOT NULL AND TRIM(vin) <> ''"
+                )]
             cursor = conn.execute(
                 """
-                SELECT l.*
-                FROM listings AS l
-                INNER JOIN (
-                    SELECT vin, MAX(loaddate) AS latest_loaddate
+                WITH ranked AS (
+                    SELECT UPPER(TRIM(vin)) AS normalized_vin,
+                           year,
+                           title, vehicleTitle, details,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY UPPER(TRIM(vin))
+                               ORDER BY loaddate DESC, rowid DESC
+                           ) AS row_number
                     FROM listings
                     WHERE vin IS NOT NULL AND TRIM(vin) <> ''
-                    GROUP BY vin
-                ) AS latest
-                    ON latest.vin = l.vin AND latest.latest_loaddate = l.loaddate
-                ORDER BY l.vin
+                )
+                SELECT normalized_vin AS vin, year, title, vehicleTitle, details
+                FROM ranked
+                WHERE row_number = 1
                 """
             )
             column_names = [description[0] for description in cursor.description]

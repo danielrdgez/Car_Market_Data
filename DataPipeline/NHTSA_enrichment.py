@@ -732,6 +732,9 @@ class NHTSAEnricher:
 
         try:
             pending: list[dict[str, Any]] = []
+            cached = {} if (refresh_all or not resume) else self.nhtsa.get_latest_successful_vpic_by_vin(
+                max_age_days=self.refresh_days
+            )
             for context in contexts:
                 vin = self._normalise_vin(context.get("vin"))
                 status = self._vin_status(vin)
@@ -744,17 +747,15 @@ class NHTSAEnricher:
                     failed += 1
                     continue
 
-                hint = self._model_year(context.get("listing_model_year"))
-                cached = None if (refresh_all or not resume) else self.nhtsa.get_latest_vpic_record(
-                    vin, hint, max_age_days=self.refresh_days
-                )
-                if cached is not None:
-                    _, ok = self._process_result(
-                        run_id, context, cached["result"], decode_id=cached["decode_id"]
-                    )
-                    successful += int(ok)
-                else:
+                if vin not in cached:
                     pending.append(context)
+
+            cached_count = requested - len(pending) - failed
+            successful += max(0, cached_count)
+            print(
+                f"Distinct VINs: {requested}; cached/skipped: {max(0, cached_count)}; "
+                f"pending: {len(pending)}"
+            )
 
             for offset in range(0, len(pending), self.MAX_BATCH_SIZE):
                 batch = pending[offset : offset + self.MAX_BATCH_SIZE]
