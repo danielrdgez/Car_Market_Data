@@ -3,16 +3,19 @@ import tempfile
 import unittest
 import sqlite3
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pandas as pd
 
 from DataPipeline.SentimentAnalysis import QuotaExceededError, run_queue
 from DataPipeline.absa_pipeline import (
+    ASPECT_LABELS,
     apply_weights,
     load_data,
     migrate_make_grain,
     rebuild_make_sentiment_tables,
+    run_absa_on_comments,
+    run_incremental_batches,
     run_phase4_aggregation,
 )
 from DataPipeline.database import YouTubeCommentsDatabase
@@ -41,6 +44,28 @@ def make_comment_rows(video_id: str, playlist_id: str, count: int) -> list[dict]
 
 
 class SentimentIncrementalTests(unittest.TestCase):
+    def test_incremental_batches_commit_and_skip_persisted_comments(self):
+        raw = pd.DataFrame(make_comment_rows("batch_video", "playlist", 3))
+        self.db.insert_sentiment_data(raw)
+
+        def unattributed(frame, **kwargs):
+            result = frame.copy()
+            result["original_text"] = result["text"]
+            result["sentiment_make"] = None
+            result["make_attribution_source"] = "unknown_make"
+            result["make_attribution_version"] = "test"
+            result["sentiment_status"] = "unknown_make"
+            return result
+
+        with patch("DataPipeline.absa_pipeline.run_phase1_preprocessing", side_effect=unattributed) as preprocess, \
+                patch("DataPipeline.absa_pipeline.run_absa_on_comments") as inference:
+            run_incremental_batches(str(self.db_path), {"TOYOTA": "TOYOTA"}, batch_size=2)
+            self.assertEqual(preprocess.call_count, 2)
+            run_incremental_batches(str(self.db_path), {"TOYOTA": "TOYOTA"}, batch_size=2)
+            self.assertEqual(preprocess.call_count, 2)
+            inference.assert_not_called()
+        self.assertEqual(self.db._get_connection().execute("SELECT COUNT(*) FROM youtube_comments_scored").fetchone()[0], 3)
+
     def setUp(self):
         for handler in list(logging.getLogger().handlers):
             if isinstance(handler, logging.FileHandler) and not Path(handler.baseFilename).parent.exists():
@@ -221,6 +246,65 @@ class SentimentIncrementalTests(unittest.TestCase):
         self.assertEqual(len(df_agg), 1)
         self.assertEqual(df_agg.iloc[0]["sentiment_make"], "TOYOTA")
         self.assertEqual(int(df_agg.iloc[0]["sentiment_comment_count"]), 2)
+
+    def test_absa_can_reuse_classifier_across_batches(self):
+        classifier = Mock()
+        classifier.model.config._commit_hash = 'test-revision'
+        labels = [label for pair in ASPECT_LABELS.values() for label in pair.values()]
+        classifier.return_value = [{'labels': labels, 'scores': [0.8, 0.2] * 4}]
+        for text in ['Reliable vehicle with comfortable seats.', 'Good value and handling.']:
+            result = run_absa_on_comments(
+                pd.DataFrame({'text': [text]}), model_name='test-model',
+                model_revision='test-revision', classifier=classifier,
+            )
+            self.assertEqual(result.iloc[0]['model_revision'], 'test-revision')
+            self.assertEqual(result.iloc[0]['sentiment_status'], 'scored')
+            self.assertAlmostEqual(result.iloc[0]['reliability_sentiment'], 0.6)
+        self.assertEqual(classifier.call_count, 2)
+        self.assertTrue(classifier.call_args.kwargs['multi_label'])
+
+    def test_monthly_video_counts_are_distinct_across_months_and_per_make(self):
+        rows = [
+            ('a', 'shared', 'TOYOTA', 'scored', '2026-01-01', 0.2, 1.0),
+            ('b', 'shared', 'TOYOTA', 'scored', '2026-01-15', 0.6, 1.0),
+            ('c', 'shared', 'TOYOTA', 'scored', '2026-02-01', 0.8, 1.0),
+            ('d', 'new', 'TOYOTA', 'scored', '02-20-2026', 0.4, 1.0),
+            ('e', None, 'TOYOTA', 'scored', '2026-02-21', 0.0, 1.0),
+            ('f', 'shared', 'TOYOTA', 'scored', '2026-03-01', 1.0, 1.0),
+            ('g', 'shared', 'HONDA', 'scored', '2026-02-01', -0.5, 1.0),
+            ('h', 'undated', 'TOYOTA', 'scored', 'unparseable', 0.0, 1.0),
+            ('i', 'excluded', 'TOYOTA', 'unknown', '2026-01-01', 0.0, 1.0),
+        ]
+        conn = self.db._get_connection()
+        conn.executemany('''
+            INSERT INTO youtube_comments_scored
+                (comment_id, video_id, sentiment_make, sentiment_status,
+                 published_at, overall_sentiment, comment_weight)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        ''', rows)
+        conn.commit()
+
+        for _ in range(2):
+            rebuild_make_sentiment_tables(self.db_path)
+            monthly = conn.execute('''
+                SELECT sentiment_make, sentiment_month, sentiment_video_count,
+                       sentiment_comment_count, sentiment_overall_score
+                FROM make_sentiment_monthly
+                ORDER BY sentiment_make, sentiment_month
+            ''').fetchall()
+            self.assertEqual([tuple(row[:4]) for row in monthly], [
+                ('HONDA', '2026-02-01', 1, 1),
+                ('TOYOTA', '2026-01-01', 1, 2),
+                ('TOYOTA', '2026-02-01', 2, 5),
+                ('TOYOTA', '2026-03-01', 2, 6),
+            ])
+            for row, expected in zip(monthly, [-0.5, 0.4, 0.4, 0.5]):
+                self.assertAlmostEqual(row[4], expected)
+            current = conn.execute('''
+                SELECT sentiment_video_count, sentiment_comment_count
+                FROM make_sentiment_index WHERE sentiment_make = 'TOYOTA'
+            ''').fetchone()
+            self.assertEqual(tuple(current), (3, 7))
 
     def test_make_migration_preserves_rows_and_builds_monthly_cutoffs(self):
         raw_df = pd.DataFrame(make_comment_rows("video_migration", "playlist_migration", 2))

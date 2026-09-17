@@ -352,17 +352,22 @@ def run_absa_on_comments(
     model_name: str = DEFAULT_MODEL_NAME,
     model_revision: str | None = None,
     limit: int = None,
+    classifier=None,
 ) -> pd.DataFrame:
-    logger.info("Initializing HuggingFace zero-shot classification pipeline...")
-    import torch
-    from transformers import pipeline
+    """Score comments, optionally reusing a caller-owned matching classifier."""
+    if classifier is None:
+        logger.info("Initializing HuggingFace zero-shot classification pipeline...")
+        import torch
+        from transformers import pipeline
 
-    device = 0 if torch.cuda.is_available() else -1
-    pipeline_kwargs = {"model": model_name, "device": device}
-    if model_revision:
-        pipeline_kwargs["revision"] = model_revision
-    classifier = pipeline("zero-shot-classification", **pipeline_kwargs)
-    logger.info("Loaded classifier on device: %s", "GPU" if device == 0 else "CPU")
+        device = 0 if torch.cuda.is_available() else -1
+        pipeline_kwargs = {"model": model_name, "device": device}
+        if model_revision:
+            pipeline_kwargs["revision"] = model_revision
+        classifier = pipeline("zero-shot-classification", **pipeline_kwargs)
+        logger.info("Loaded classifier on device: %s", "GPU" if device == 0 else "CPU")
+    else:
+        logger.info("Reusing the supplied zero-shot classifier.")
 
     if limit:
         df = df.iloc[:limit].copy()
@@ -665,8 +670,20 @@ def rebuild_make_sentiment_tables(db_path: str | Path) -> pd.DataFrame:
                 FROM base
                 GROUP BY sentiment_make, sentiment_month
             ),
+            video_first_month AS (
+                SELECT sentiment_make, video_id, MIN(sentiment_month) AS first_month
+                FROM base
+                WHERE video_id IS NOT NULL
+                GROUP BY sentiment_make, video_id
+            ),
+            monthly_new_videos AS (
+                SELECT sentiment_make, first_month AS sentiment_month,
+                       COUNT(*) AS new_video_count
+                FROM video_first_month
+                GROUP BY sentiment_make, first_month
+            ),
             cumulative AS (
-                SELECT *,
+                SELECT monthly.*,
                        SUM(overall_num) OVER w AS cum_overall_num,
                        SUM(overall_den) OVER w AS cum_overall_den,
                        SUM(reliability_num) OVER w AS cum_reliability_num,
@@ -678,9 +695,11 @@ def rebuild_make_sentiment_tables(db_path: str | Path) -> pd.DataFrame:
                        SUM(comfort_num) OVER w AS cum_comfort_num,
                        SUM(comfort_den) OVER w AS cum_comfort_den,
                        SUM(comment_count) OVER w AS cum_comment_count,
+                       SUM(COALESCE(new_video_count, 0)) OVER w AS cum_video_count,
                        SUM(aspect_mentions) OVER w AS cum_aspect_mentions,
                        MAX(latest_comment_at) OVER w AS cum_latest_comment_at
                 FROM monthly
+                LEFT JOIN monthly_new_videos USING (sentiment_make, sentiment_month)
                 WINDOW w AS (PARTITION BY sentiment_make ORDER BY sentiment_month ROWS UNBOUNDED PRECEDING)
             )
             SELECT
@@ -692,8 +711,7 @@ def rebuild_make_sentiment_tables(db_path: str | Path) -> pd.DataFrame:
                 c.cum_performance_num / NULLIF(c.cum_performance_den, 0),
                 c.cum_comfort_num / NULLIF(c.cum_comfort_den, 0),
                 c.cum_comment_count,
-                (SELECT COUNT(DISTINCT b.video_id) FROM base AS b
-                 WHERE b.sentiment_make = c.sentiment_make AND b.sentiment_month <= c.sentiment_month),
+                c.cum_video_count,
                 c.cum_aspect_mentions / (4.0 * c.cum_comment_count),
                 c.cum_latest_comment_at
             FROM cumulative AS c
@@ -752,12 +770,59 @@ def run_tests():
     print("All tests passed successfully!")
 
 
+def run_incremental_batches(db_path, alias_map, batch_size=128, limit=None,
+                            model_name=DEFAULT_MODEL_NAME, model_revision=None):
+    """Commit each inference batch; existing comment IDs are never rescored."""
+    db = YouTubeCommentsDatabase(db_path)
+    try:
+        upper = db._get_connection().execute("SELECT COALESCE(MAX(rowid),0) FROM youtube_comments_sentiment").fetchone()[0]
+    finally:
+        db.close()
+    classifier = None
+    cursor = examined = 0
+    while limit is None or examined < limit:
+        size = min(batch_size, limit - examined) if limit is not None else batch_size
+        db = YouTubeCommentsDatabase(db_path)
+        try:
+            raw = pd.read_sql_query("""SELECT r.rowid AS execution_rowid, r.*
+                FROM youtube_comments_sentiment r WHERE r.rowid > ? AND r.rowid <= ?
+                AND NOT EXISTS (SELECT 1 FROM youtube_comments_scored s WHERE s.comment_id=r.comment_id)
+                ORDER BY r.rowid LIMIT ?""", db._get_connection(), params=(cursor, upper, size))
+        finally:
+            db.close()
+        if raw.empty:
+            break
+        cursor = int(raw.pop("execution_rowid").iloc[-1])
+        examined += len(raw)
+        clean = run_phase1_preprocessing(raw, alias_map=alias_map)
+        if clean.empty:
+            continue
+        attributable = clean[clean["sentiment_make"].notna()].copy()
+        unattributed = clean[clean["sentiment_make"].isna()].copy()
+        if not unattributed.empty:
+            persist_scored_comments(prepare_unattributed_rows(unattributed), db_path)
+        if not attributable.empty:
+            if classifier is None:
+                import torch
+                from transformers import pipeline
+                options = {"model": model_name, "device": 0 if torch.cuda.is_available() else -1}
+                if model_revision:
+                    options["revision"] = model_revision
+                classifier = pipeline("zero-shot-classification", **options)
+            scored = run_absa_on_comments(attributable, model_name=model_name,
+                                          model_revision=model_revision, classifier=classifier)
+            persist_scored_comments(apply_weights(scored), db_path)
+        logger.info("Incremental ABSA committed through raw row %s; examined %s comments", cursor, examined)
+    return rebuild_make_sentiment_tables(db_path)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Automotive Aspect-Based Sentiment Analysis Pipeline")
     parser.add_argument("--db-path", type=str, default="", help="Path to CAR_YOUTUBE_COMMENTS.db")
     parser.add_argument("--inspect-phase1", action="store_true", help="Run only Phase 1 & inspect preprocessing results")
     parser.add_argument("--test", action="store_true", help="Run validation tests")
     parser.add_argument("--limit", type=int, default=None, help="Limit number of comments to process")
+    parser.add_argument("--batch-size", type=int, default=128, help="Comments committed per incremental inference batch")
     parser.add_argument("--run-all", action="store_true", help="Run all phases of the pipeline")
     parser.add_argument(
         "--migrate-make-grain",
@@ -768,6 +833,10 @@ def main():
     parser.add_argument("--model-name", type=str, default=DEFAULT_MODEL_NAME, help="Hugging Face model for zero-shot ABSA.")
     parser.add_argument("--model-revision", type=str, default=None, help="Optional pinned Hugging Face model revision.")
     args = parser.parse_args()
+    if args.batch_size < 1 or (args.limit is not None and args.limit < 1):
+        parser.error("batch-size and limit must be positive")
+    if args.migrate_make_grain and args.force_reprocess:
+        parser.error("Make-grain migration cannot be combined with force-reprocess")
 
     if args.test:
         run_tests()
@@ -803,6 +872,12 @@ def main():
             f"Migrated {updated} scored comments without inference; "
             f"rebuilt aggregates for {len(aggregate)} makes."
         )
+        return
+
+    if not args.force_reprocess and not args.inspect_phase1:
+        aggregate = run_incremental_batches(db_path, alias_map, args.batch_size, args.limit,
+                                            args.model_name, args.model_revision)
+        print(aggregate.head(10).to_string(index=False))
         return
 
     try:

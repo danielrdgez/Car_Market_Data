@@ -192,7 +192,7 @@ Important design choices:
 - Time cutoff validation when possible, with VIN overlap removed from train rows.
 - Group shuffle fallback by VIN.
 - Target-derived `price_band` is excluded from model inputs; it is used for diagnostics and for training the high-value classifier labels inside the training split.
-- Candidate models include Ridge, ElasticNet, LightGBM, and RandomForest, and every candidate uses the same leakage-safe everyday/high-value classifier router before fitting segment-specific regressors.
+- Candidate models include Ridge, ElasticNet, LightGBM, and RandomForest, plus median and plain Ridge/LightGBM baselines; routed candidates fit everyday/high-value experts.
 - Outputs include JSON and Markdown reports plus `.joblib` model artifacts.
 
 `ML/Time_Series_Price.py` trains cohort-level depreciation forecasts.
@@ -201,14 +201,14 @@ Important design choices:
 
 - Cohort grain is canonical make, model, model year, and trim; VIN assignment comes from `vehicle_identity` for stability across snapshots.
 - Monthly cohort frames are built from price history.
-- Features include market index, cohort lags, rolling prices, mileage, volume, NHTSA attributes, recall/complaint counts, and optional make-level sentiment available by each cohort month.
+- Features include market index, cohort lags, rolling prices, mileage, volume, NHTSA attributes, optional collected-time NHTSA features and prior-completed-month make sentiment.
 - Models forecast one-month depreciation percentages and recursively emit a monthly median-price path up to five years ahead by default.
 - The time-series benchmark now includes global ML, SARIMAX, Prophet, and TimesFM model families when optional dependencies are installed and cohorts have enough monthly support.
 - The time-series entry point loads `HF_TOKEN` from the repository-root `.env` before importing TimesFM; an existing shell environment value takes precedence and the local file is Git-ignored.
 - Backtesting outputs are written as row-level cohort/model/horizon results plus KPI tables with future-price MAE, WAPE, bias, depreciation error, R2, and skill against a no-change baseline.
 - Forecast origins use each cohort's latest retained price-history month; normal runs keep high-value histories because `--max-price` defaults to disabled and is only an opt-in sensitivity cap.
 - The script uses global models across cohorts to share signal across sparse vehicle segments.
-- Target-specific hyperparameters are tuned on a representative bounded cohort-month sample with an inner temporal holdout, then refit on the full training frame.
+- Global forecast hyperparameters use fixed defaults in both rolling-origin fits and final artifacts; optimization requires nested origin-specific tuning before promotion.
 
 #### Machine Learning Pipeline Diagram
 
@@ -230,14 +230,14 @@ flowchart TB
         CP_GROUP[Fallback: GroupShuffleSplit by VIN]
         CP_NUM[Numeric branch<br/>Median imputation and float32 cast]
         CP_LOW[Low-cardinality categorical branch<br/>UNKNOWN imputation and infrequent-aware one-hot encoding]
-        CP_HIGH[High-cardinality or identity branch<br/>UNKNOWN imputation and smoothed target encoding]
-        CP_COMBINE[ColumnTransformer<br/>Combine numeric, one-hot, and target-encoded blocks]
+        CP_HIGH[High-cardinality or identity branch<br/>UNKNOWN imputation and bounded one-hot encoding]
+        CP_COMBINE[ColumnTransformer<br/>Combine numeric, one-hot blocks]
         CP_SCALE[Linear candidates only<br/>Sparse-safe StandardScaler]
-        CP_MODELS[Ridge | ElasticNet | LightGBM | RandomForest<br/>All regressors use log1p target transformation]
-        CP_TUNE[Randomized hyperparameter search<br/>Up to 200k stratified rows and GroupKFold by VIN<br/>Refit selected settings on the training split]
-        CP_ROUTE[Leakage-safe high-value router<br/>Training-label classifier for price above 150k<br/>Everyday and high-value experts plus global blend]
+        CP_MODELS[Ridge | ElasticNet | LightGBM | RandomForest<br/>Plain and routed log-price regressors plus median baseline]
+        CP_TUNE[Randomized hyperparameter search<br/>Up to 200k stratified rows; expanding-date CV or grouped fallback<br/>Refit selected settings on the training split]
+        CP_ROUTE[Optional high-value router<br/>Training-label classifier for price above 150k<br/>Everyday and high-value experts plus global blend]
         CP_EVAL[Test evaluation<br/>MAE, RMSE, RMSLE, MAPE, R2<br/>Price-band, high-value, make, and year segments]
-        CP_SELECT[Select lowest-MAE candidate]
+        CP_SELECT[Select by validation MAE<br/>Independent interval calibration and final test]
         CP_OUT[MODELS_OUTPUT<br/>Candidate and best-model joblib artifacts<br/>JSON and Markdown reports<br/>Feature-weight CSV]
 
         CP_LOAD --> CP_FILTER --> CP_FE --> CP_LEAK --> CP_SPLIT
@@ -260,7 +260,7 @@ flowchart TB
     subgraph TS[Cohort-depreciation pipeline - Time_Series_Price.py]
         TS_LOAD[Price history plus latest listing identity<br/>VIN consensus identity preferred<br/>NHTSA attributes and as-of make sentiment]
         TS_CLEAN[Clean positive dated observations<br/>Optional max-price sensitivity cap<br/>Normalize canonical make, model, year, and trim proxy]
-        TS_COHORT[Monthly make-model-year-trim cohorts<br/>Require configured VIN and history support]
+        TS_COHORT[Monthly make-model-year-trim cohorts<br/>One VIN contribution per month; origin-known support]
         TS_FE[Aggregate and engineer cohort-time features<br/>Price, mileage, volume, calendar, market index,<br/>lags, rolling windows, safety, and sentiment]
         TS_TARGET[Origin-safe targets<br/>Future median price and depreciation by horizon<br/>Future target columns never enter model features]
         TS_SUPPORT{At least 50 complete<br/>cohort-month rows?}
@@ -270,14 +270,14 @@ flowchart TB
         TS_GUARD{At least two training rows<br/>and a varying target?}
         TS_CONST[DummyRegressor mean baseline]
         TS_GLOBAL[Global supervised model<br/>LightGBM when installed<br/>Otherwise HistGradientBoosting]
-        TS_TUNE[Bounded stratified tuning sample<br/>Inner temporal holdout<br/>Refit on full horizon training frame]
-        TS_BACKTEST[Expanding rolling-origin backtest<br/>Each origin uses only targets observable by that date]
+        TS_TUNE[Fixed default parameters<br/>Identical parameter policy across rolling origins<br/>Final fit on complete observable targets]
+        TS_BACKTEST[Expanding rolling-origin backtest<br/>Origin-known targets; recursive multi-step evaluation]
         TS_RECURSE[Recursive global monthly path<br/>Default 60-month forecast]
         TS_LOCAL[Eligible local cohort histories]
         TS_SARIMAX[SARIMAX]
         TS_PROPHET[Prophet]
         TS_TIMESFM[TimesFM]
-        TS_LOCAL_BT[Local holdout backtests and future paths]
+        TS_LOCAL_BT[Local rolling backtests and future paths]
         TS_OUT[MODELS_OUTPUT<br/>Horizon joblib artifacts and model reports<br/>Future forecasts, row-level backtests, and KPI CSVs]
 
         TS_LOAD --> TS_CLEAN --> TS_COHORT --> TS_FE --> TS_TARGET --> TS_SUPPORT
@@ -293,29 +293,32 @@ flowchart TB
         TS_LOCAL_BT --> TS_OUT
     end
 
+    NHTSA_TEXT[(Optional NHTSA feature sidecar<br/>Collected before observation month)]
+    NHTSA_TEXT -. MMY .-> CP_LOAD
+    NHTSA_TEXT -. MMY .-> TS_LOAD
+    TS_COHORT --> TS_SIMPLE[No-change and drift baselines] --> TS_OUT
     DB --> CP_LOAD
     DB --> TS_LOAD
-    ABSA -. optional .-> CP_LOAD
+    ABSA -. prior completed month .-> CP_LOAD
+    ABSA -. prior completed month .-> TS_LOAD
 ```
 
 ##### Current-price feature and encoder reference
 
-The exact raw columns are schema-driven: eligible cleaned listing fields, NHTSA
-enrichment fields other than base-price leakage fields, and the optional ABSA
-aggregates are retained unless they appear in the exclusion policy below. The
-generated `model_report.json` records the resolved numeric and categorical lists
-for each run.
+Predictors are selected by ALLOWED_PRICE_FEATURES and the chosen ablation group.
+Generated reports record the actual numeric and categorical columns. All categorical
+branches use bounded one-hot encoding; no target statistics enter preprocessing.
 
 | Feature or processing group | Inputs and derived fields | Encoder or transformation |
 |---|---|---|
-| Canonical identity | `canonical_make`, `canonical_model`, `canonical_year`, `canonical_trim`; derived `trim_proxy`, `make_model_year`, and `make_model_year_trim` | Identity-like categorical columns are forced into the high-cardinality target-encoding branch. Only title-derived canonical trim can become a trim predictor. |
+| Canonical identity | `canonical_make`, `canonical_model`, `canonical_year`, `canonical_trim`; derived `trim_proxy`, `make_model_year`, and `make_model_year_trim` | Identity-like categorical columns are forced into the high-cardinality bounded one-hot branch. Only title-derived canonical trim can become a trim predictor. |
 | Mileage and age | `mileage`; derived `vehicle_age`, `vehicle_age_squared`, `miles_per_year`, `log_mileage`, `mileage_age_interaction`, `mileage_bucket`, and `model_year_bucket` | Numeric values use median imputation and float32 conversion. Buckets are encoded according to their observed cardinality. |
-| Listing time and geography | `loaddate`; derived `listing_recency_days`, `listing_month`, `listing_week`, and two-digit `location_region` from `locationCode` | Numeric calendar fields use median imputation. Location-like categoricals are target encoded. |
-| Listing text and state | Available title fields; derived length/word counts, certified/CPO, AWD/4WD, luxury-trim mentions, `pendingSale`, `priceRecentChange`, and `source_is_marketplace` | Counts and flags use the numeric branch. Raw title metadata is excluded, while derived text features remain eligible. |
-| Vehicle, market, safety, and sentiment | Cleaned listing attributes, usable NHTSA attributes, `body_fuel_segment`, `is_ev_or_hybrid`, and the eight optional `sentiment_*` make-level fields from the latest eligible monthly snapshot | Numeric fields use median imputation; categoricals with at most 50 values use one-hot unless identity-like, while the remainder use target encoding. |
+| Listing time and geography | `loaddate`; derived `listing_recency_days`, `listing_month`, `listing_week`, and two-digit `location_region` from `locationCode` | Numeric calendar fields use median imputation. Location-like categoricals use bounded one-hot encoding. |
+| Listing text and state | Available title fields; derived length/word counts, certified/CPO, AWD/4WD, luxury-trim mentions, `pendingSale` and `source_is_marketplace` | Counts and flags use the numeric branch. Raw title metadata is excluded, while derived text features remain eligible. |
+| Vehicle, market, safety, and sentiment | Cleaned listing attributes, usable NHTSA attributes, `body_fuel_segment`, `is_ev_or_hybrid`, and the eight optional `sentiment_*` make-level fields from the latest eligible monthly snapshot | Numeric fields use median imputation; categoricals with at most 50 values use one-hot unless identity-like, with bounded one-hot encoding for the remainder too. |
 | Low-cardinality categoricals | Non-identity categorical columns with at most 50 observed values | Normalize missing values, impute `UNKNOWN`, then `OneHotEncoder(handle_unknown="infrequent_if_exist", min_frequency=10, max_categories=25)` with sparse float32 output. |
-| High-cardinality categoricals | Columns over 50 values plus names containing make/model/trim/manufacturer/segment/title/location tokens | Normalize missing values, impute `UNKNOWN`, then `TargetEncoder(min_samples_leaf=20, smoothing=10)` and float32 conversion. |
-| Linear candidate preprocessing | Combined numeric, one-hot, and target-encoded matrix for Ridge and ElasticNet | `StandardScaler(with_mean=False)` preserves sparse compatibility. Tree candidates use the unscaled combined matrix. |
+| High-cardinality categoricals | Columns over 50 values plus names containing make/model/trim/manufacturer/segment/title/location tokens | Normalize missing values, impute `UNKNOWN`, then bounded `OneHotEncoder(min_frequency=10, max_categories=25)` and float32 conversion. |
+| Linear candidate preprocessing | Combined numeric and one-hot matrix for Ridge and ElasticNet | `StandardScaler(with_mean=False)` preserves sparse compatibility. Tree candidates use the unscaled combined matrix. |
 | Excluded leakage and metadata | `price`, `price_band`, `nhtsa_BasePrice`, `nhtsa_BasePrice_source`, VIN/date/title identifiers, legacy/raw trim fields, canonical audit/provenance fields, EPA IDs, and identity agreement flags | Dropped before preprocessing. `price_band` remains diagnostic-only, and the high-value label is created only inside training. |
 
 ##### Cohort-depreciation feature and encoder reference
@@ -323,12 +326,12 @@ for each run.
 | Feature or processing group | Exact model inputs | Encoder or transformation |
 |---|---|---|
 | Cohort identity | `make`, `model`, `model_year`, `trim_proxy` | Constant `UNKNOWN` imputation followed by `OrdinalEncoder(handle_unknown="use_encoded_value", unknown_value=-1, encoded_missing_value=-1)`. |
-| Vehicle categories | `body_class`, `drive_type`, `fuel_type`, `electrification_level`, `dominant_seller_type`, `dominant_source_name` | Same unknown-safe ordinal encoding as cohort identity. |
+| Vehicle categories | `body_class`, `drive_type`, `fuel_type`, `electrification_level`, (latest seller/source metadata excluded) | Same unknown-safe ordinal encoding as cohort identity. |
 | Price and mileage state | `median_price`, `avg_price`, `price_p25`, `price_p75`, `avg_mileage`, `median_mileage`, `avg_vehicle_age_months`, `avg_miles_per_year` | Median imputation. These values are observed at the forecast origin, not future targets. |
 | Volume and calendar | `volume`, `unique_vins`, `price_down_rate`, `month`, `quarter`, `cohort_month_number`, `cohort_age_months` | Median imputation. |
 | Cohort trajectory | `cohort_first_median_price`, `price_index_vs_cohort_first`, `cumulative_depreciation_pct`, `lag_median_price_1`, `lag_median_price_2`, `lag_price_index_1`, `rolling_median_price_3m`, `rolling_avg_mileage_3m`, `rolling_volume_3m`, `rolling_depreciation_pct_3m` | Median imputation; lag and rolling values are constructed from observations available at the forecast origin. |
 | Market context | `market_median_price`, `market_price_index`, `market_monthly_volume` | Median imputation. |
-| Sentiment, powertrain, and safety | `sentiment_overall_score`, four `sentiment_{aspect}_score` fields, `sentiment_comment_count`, `sentiment_video_count`, `sentiment_aspect_coverage`, `engine_hp`, `engine_cylinders`, `total_recalls`, `total_complaints` | Median imputation; monthly make sentiment is joined as-of the history month and remains optional when source data is unavailable. |
+| Sentiment, powertrain, and safety | `sentiment_overall_score`, four `sentiment_{aspect}_score` fields, `sentiment_comment_count`, `sentiment_video_count`, `sentiment_aspect_coverage`, `engine_hp`, `engine_cylinders`, optional collected-time `nhtsa_*` sidecar fields | Median imputation; monthly make sentiment uses the previous completed month and remains optional when source data is unavailable. |
 | Targets and excluded leakage | `target_depreciation_pct_{horizon}m` is the supervised target; `target_median_price_{horizon}m` is retained for evaluation. `nhtsa_BasePrice`, `nhtsa_BasePrice_source`, and all future target columns are excluded from predictors. | Target rows are aligned by future cohort month. Rolling-origin validation restricts training to targets observable by each origin. |
 
 `ML/Model_Output.ipynb` reads generated reports and presents a KPI-style model summary.
@@ -452,6 +455,228 @@ Streamlit dashboard:
 ```powershell
 streamlit run streamlit_app.py
 ```
+
+## Modeling Roadmap and NHTSA Text Workflow
+
+Updated 2026-09-16. The implementation below replaces the earlier deferred plan.
+The long ABSA worker was stopped at the user's request; its follow-up automation
+is paused. Existing committed scores are preserved. No production inference or
+full model training was run to validate these code changes. Final verification:
+82 unit tests passed with Hugging Face offline; Python compilation, all 13
+notebook code-cell syntax checks, CLI help checks and git diff whitespace checks
+passed. Synthetic fixtures exercised the pilot/cache/build/review workflow and
+model reports; these checks do not establish real-data predictive lift.
+
+### Implemented safeguards and research corrections
+
+- Current price uses distinct valid dates to choose temporal splits, removes VIN
+  overlap, and records grouped fallback when date support is insufficient. An
+  explicit unsupported cutoff raises an error. Separate train, validation,
+  calibration, and test partitions prevent test-based model selection.
+- Age uses listing observation year. The compatibility name listing_recency_days
+  now means days since 2000-01-01, a fixed calendar reference. Old artifacts must
+  be retrained; dashboard inference checks feature contract pit-v1.
+- A reviewed predictor allowlist excludes source identifiers, operational fields,
+  base prices filled from observed prices, latest recall/complaint projections,
+  and raw identity diagnostics. Static decoded equipment remains eligible.
+- Bounded one-hot encoding replaces in-sample target encoding. This is a simpler
+  target-independent baseline; temporal/group cross-fitted target encoding remains
+  an optional later experiment, not an unverified requirement for improvement.
+- Median, plain Ridge, and plain LightGBM compete with the existing four routed
+  candidates. Tuning and selection use MAE. Tuning prefers expanding-date folds
+  with VIN exclusion, with grouped fallback. The independent calibration split
+  supplies 90% marginal residual intervals when at least 30 rows exist; report
+  test coverage and width. Temporal drift prevents a coverage guarantee.
+- Forecast data contributes only the last retained observation per VIN/month.
+  Targets and lags use exact calendar months; absent targets remain absent.
+  Mileage is forward-filled within VIN only. Optional missing features are
+  imputed rather than causing all rows to be deleted. Latest seller/source
+  metadata is excluded from historical predictors.
+- Cohort support is measured at the origin. Local models fill gaps using only
+  their own training prefix and evaluate observed actuals only. Global rolling
+  fits and final artifacts use fixed defaults with origin-known target dates, avoiding parameters
+  selected on later periods. One-month recursive backtests evaluate multiple
+  future months with the same recursive feature updates used in deployment.
+- Monthly recursion requires a one-month fitted model. Price lags, rolling price
+  state, price indices, and vehicle age advance; price quantiles retain relative
+  spreads. Mileage, market state, volume, and external evidence are held fixed
+  scenarios. Unsupported five-year horizons are extrapolations, not validated
+  forecasts. No future recall, complaint, or sentiment values are supplied.
+- No-change and calendar-drift baselines appear in forecast/backtest CSVs.
+  cohort_backtesting_matched_kpis.csv additionally compares common cases across
+  the model methods present at each horizon. Local-family cohort caps still
+  limit the evaluated population; do not generalize those results to all makes.
+
+### NHTSA sources, grain, caching, and joins
+
+DataPipeline/NHTSA_text_features.py is a separate source-specific pipeline. It
+reads CAR_DATA_NHTSA.db without modifying it and writes the optional derived
+CAR_NHTSA_TEXT_FEATURES.db sidecar. This avoids migrating the large source store.
+
+| Source | Text roles | Implemented features | Join grain |
+| --- | --- | --- | --- |
+| YouTube | Existing opinion aspects | Only overall, reliability, value, performance, comfort, comment/video counts, aspect coverage | Canonical make; latest completed publication month |
+| Complaints | summary | Distinct report count; known flag; scored-text coverage; structured crash/fire/injury/death report shares; propulsion/control loss, recurring failure, repair delay topic scores | Exact normalized make/model/model year from query_id |
+| Recalls | summary plus consequence; remedy separately | Distinct campaign count; known flag; coverage; potential propulsion/control/fire hazards and software/replacement remedy scores | Exact normalized query make/model/model year |
+
+ODI number and campaign number deduplicate events within a query association;
+record_key is the fallback when an official identifier is absent. Component rows
+contribute unique text to the same event. The same report can legitimately belong
+to multiple MMY associations. Text reuse does not merge distinct events. Masked
+complaint VINs are not listing VIN join keys; manufacturer is not a make key.
+The implemented crosswalk only normalizes case/punctuation/spacing. No fuzzy or
+unreviewed model aliases are inferred; unmatched associations remain missing.
+
+Scores are cached by normalized text hash and field role inside a sidecar pinned
+to a single model commit and taxonomy/chunking/hypothesis version. A different
+model/revision requires a separate sidecar. Inference covers overlapping token
+chunks; max pooling identifies topic evidence, not calibrated probabilities or
+validated evidence spans. No raw response JSON or copied narratives are stored
+in the sidecar. Pilot CSV exports contain source text for human annotation; the
+review command exports that pilot with cached scores. Existing pilot/review CSVs
+are protected from overwrite; choose another output path for a new export.
+NHTSA text uses neither YouTube spam filters nor popularity weighting.
+
+The strict join uses the most recent retained query collected *before* the start
+of the listing/history month, separately for complaints and recalls, and never
+multiplies source model rows. Failure stays unknown; confirmed empty is zero
+reports. Text scores remain missing until all available event texts in that
+query have been scored. Coverage and report counts remain inspectable. Severity
+shares use only reports with known corresponding structured flags/counts; they
+are report shares, not vehicle failure rates. There is no exposure denominator.
+
+Collection timestamps, not filing/incident/report dates, control this version.
+The inspected retained query history starts 2026-08-27, so early historical
+observations cannot obtain strict NHTSA text features. Deduplicated query hashes
+retain the first stored timestamp and do not log every refresh. These joins are
+collected-data reconstructions, not complete archives of every API state.
+Older filing dates do not prove that today's narrative/remedy was available then.
+An event-date retrospective mode and trailing 3/12-month activity features were
+removed from the initial implementation because date-format/version and coverage
+assumptions are not established. Do not label acquisition bursts as new defects.
+
+### Evaluation gates and remaining research
+
+The CLI feature groups are baseline (default), youtube, nhtsa-structured, nhtsa,
+and all. Each retains the same fundamentals and split rules; nhtsa adds text to
+structured NHTSA, while all additionally adds YouTube. Save each run separately.
+Missing optional sources do not prevent baseline modeling, but coverage must be
+checked before interpreting an enriched experiment. Frozen input databases are
+needed for identical comparison cases across separate runs.
+
+Pilot extraction is bounded and samples unique text within each role, in source
+order. It is a starting annotation queue, not a representative evaluation set.
+Supplement with make/year/time, long-text, negation and rare-label strata; split
+by campaign/ODI family, double-label a subset, and reserve a held-out test set.
+Compare pinned BART-MNLI and an appropriately pinned DeBERTa model using per-label
+precision/recall/F1, abstention and throughput. Calibrate or select thresholds on
+development labels only. Human annotation and real held-out experiments have
+not been performed, so neither NLP lift nor a best NLP model is claimed.
+
+Optional later work remains: validated alias mappings and conflict audits;
+source-date reconstruction with verified formats; coverage-denominated recent
+activity windows; variant-resolved historical crash ratings; matched-VIN versus
+changing-cohort price changes; dependence-aware uncertainty and supported
+forecast intervals; TF-IDF/supervised text baselines; optional Chronos-2. These
+require evidence or annotations before promotion. Existing latest crash-rating
+projections remain excluded instead of being silently used historically.
+Latest canonical identity and cleaned outlier thresholds can themselves contain
+hindsight. Price-history event medians do not measure standing inventory, causal
+safety effects, or realized sale prices. YouTube publication-time reconstructions
+still carry collection/edit/like-count hindsight caveats.
+
+### Reviewed run order (2026-09-16)
+
+Run from PowerShell at the repository root. Stop if any command fails. These are
+commands for the user to run later; implementation validation did not execute
+inference or production training. No scraper/enrichment refresh is necessary
+merely to reuse the existing databases.
+
+```powershell
+Set-Location E:\Car-Price-Data-Visualization-Learning
+$python = '.\.venv\Scripts\python.exe'
+& $python -m unittest tests.test_ml_upgrade tests.test_canonical_backtesting tests.test_sentiment_incremental tests.test_nhtsa_text_features tests.test_streamlit_vehicle_scenario
+```
+
+1. Rebuild existing make attribution/aggregates without inference. Then resume
+   unprocessed comments using bounded commits. The second command can take hours;
+   rerunning it skips persisted comment IDs. Filtered-out raw text may be visited
+   again but does not trigger inference. Never add --force-reprocess for this run.
+
+```powershell
+& $python DataPipeline\absa_pipeline.py --migrate-make-grain
+& $python DataPipeline\absa_pipeline.py --run-all --batch-size 128 --model-revision d7645e127eaf1aefc7862fd59a17a5aa8558b8ce
+```
+
+2. Export a small NHTSA annotation queue and build structured-only features.
+   These two commands perform no inference. Inspect nhtsa_text_pilot.csv and
+   annotate/validate labels before treating text scores as production evidence.
+
+```powershell
+& $python DataPipeline\NHTSA_text_features.py pilot --limit 300
+& $python DataPipeline\NHTSA_text_features.py build
+```
+
+3. When ready for the NLP experiment, score a bounded batch, inspect it, then
+   resume all unprocessed unique text and rebuild the derived feature rows.
+   --device 0 selects CUDA; use --device -1 for CPU. Full scoring can be long.
+
+```powershell
+& $python DataPipeline\NHTSA_text_features.py score --pilot-only --limit 300 --device 0
+& $python DataPipeline\NHTSA_text_features.py review
+# Review the exported nhtsa_text_pilot_scored.csv before the full experiment.
+& $python DataPipeline\NHTSA_text_features.py score --device 0
+& $python DataPipeline\NHTSA_text_features.py build
+```
+
+4. Compare the five feature groups with frozen inputs and separate artifacts.
+   The following are bounded development runs; a later production rerun may use
+   --sample-size 0. These are research runs, not evidence of predictive lift until
+   reports are reviewed. NHTSA text comparisons need adequate complete coverage.
+
+```powershell
+$run = '.\MODELS_OUTPUT\review_' + (Get-Date -Format 'yyyyMMdd_HHmmss')
+foreach ($group in @('baseline', 'youtube', 'nhtsa-structured', 'nhtsa', 'all')) {
+    $out = Join-Path $run $group
+    & $python ML\Price_ML_Models.py --sample-size 5000 --feature-set $group --output-dir $out
+    if ($LASTEXITCODE -ne 0) { throw "Current-price run failed: $group" }
+    & $python ML\Time_Series_Price.py --sample-size 5000 --feature-set $group --time-series-models global_ml --target-months 1 --forecast-months 60 --output-dir $out
+    if ($LASTEXITCODE -ne 0) { throw "Forecast run failed: $group" }
+}
+```
+
+5. Review reports, source coverage, validation MAE, calibration/test intervals,
+   forecast horizon support and matched-case KPIs before choosing a feature group.
+   Optional SARIMAX/Prophet/TimesFM runs should use the same frozen input and group.
+   The dashboard and notebook accept MODEL_OUTPUT_DIR; select the reviewed run
+   instead of overwriting older artifacts.
+
+```powershell
+$env:MODEL_OUTPUT_DIR = (Resolve-Path (Join-Path $run 'baseline')).Path
+& $python -m streamlit run streamlit_app.py
+```
+
+Start the notebook kernel with the same environment variable, or set its
+OUTPUT_DIR to the selected run. Old artifacts remain available for reports, but
+must be retrained before inference using the changed feature semantics.
+
+### Research checked for this plan
+
+- [NHTSA datasets and APIs](https://www.nhtsa.gov/nhtsa-datasets-and-apis): official
+  source scope and make/model/year queries.
+- [NHTSA complaint file definition](https://static.nhtsa.gov/odi/ffdd/cmpl/CMPL.txt):
+  incident versus received/added dates and repeated ODI numbers across components.
+  This bulk specification does not override the API formats observed locally.
+- [Automotive aspect sentiment dataset research](https://aclanthology.org/2020.coling-main.83/):
+  domain-specific aspect annotation; does not establish transfer to recalls.
+- [Automotive complaint language-model research](https://arxiv.org/abs/2012.02558):
+  technical complaint understanding; not evidence of vehicle-price improvement.
+- [BART-MNLI model card](https://huggingface.co/facebook/bart-large-mnli) and
+  [DeBERTa zero-shot model card](https://huggingface.co/MoritzLaurer/deberta-v3-base-zeroshot-v2.0):
+  candidate NLI classification approaches; local pilot validation remains required.
+- [Target encoder cross-fitting](https://scikit-learn.org/stable/auto_examples/preprocessing/plot_target_encoder_cross_val.html)
+  and [rolling-origin evaluation](https://otexts.com/fpp3/tscv.html): validation
+  methods underlying the modeling corrections.
 
 ## Known Caveats
 

@@ -43,6 +43,10 @@ warnings.filterwarnings(
 # Load repository-local credentials before importing optional Hub-backed models.
 # Existing shell environment variables take precedence over values in .env.
 BASE_DIR = Path(__file__).resolve().parent.parent
+import sys
+if str(BASE_DIR) not in sys.path:
+    sys.path.insert(0, str(BASE_DIR))
+from DataPipeline.NHTSA_text_features import FEATURE_DB, FEATURE_COLUMNS as NHTSA_FEATURE_COLUMNS, attach_features
 load_dotenv(BASE_DIR / ".env", override=False)
 
 try:
@@ -187,8 +191,6 @@ CATEGORICAL_FEATURES = [
     "drive_type",
     "fuel_type",
     "electrification_level",
-    "dominant_seller_type",
-    "dominant_source_name",
 ]
 
 NUMERIC_FEATURES = [
@@ -379,6 +381,9 @@ def parse_args() -> argparse.Namespace:
         default=MIN_ROLLING_HISTORY_MONTHS,
         help="Minimum canonical-cohort months before a rolling backtest origin.",
     )
+    parser.add_argument("--nhtsa-feature-db", type=Path, default=FEATURE_DB)
+    parser.add_argument("--feature-set", choices=["baseline", "youtube", "nhtsa-structured", "nhtsa", "all"], default="baseline",
+                        help="Controlled feature ablation; NLP is opt-in until validated.")
     return parser.parse_args()
 
 
@@ -629,7 +634,7 @@ def load_history_frame(
                SELECT MAX(msi2.sentiment_month)
                FROM absa.make_sentiment_monthly AS msi2
                WHERE msi2.sentiment_make = {sentiment_make_expr}
-                 AND msi2.sentiment_month <= {history_month_expr}
+                 AND msi2.sentiment_month < {history_month_expr}
            )
             """
             if has_sentiment
@@ -743,9 +748,7 @@ def clean_history_frame(df: pd.DataFrame, max_price: int | None) -> pd.DataFrame
     history = history.sort_values(["vin", "history_date"]).reset_index(drop=True)
 
     history["mileage"] = history.groupby("vin", observed=True)["mileage"].ffill()
-    history["mileage"] = history.groupby("vin", observed=True)["mileage"].bfill()
-    history = history.dropna(subset=["mileage"])
-    history = history[history["mileage"].ge(0)]
+    history = history[history["mileage"].isna() | history["mileage"].ge(0)]
 
     history["make"] = history["canonical_make"].map(normalize_label)
     history["model"] = history["canonical_model"].map(normalize_label)
@@ -770,8 +773,9 @@ def clean_history_frame(df: pd.DataFrame, max_price: int | None) -> pd.DataFrame
 
     history["engine_hp"] = pd.to_numeric(history["nhtsa_EngineHP"], errors="coerce")
     history["engine_cylinders"] = pd.to_numeric(history["nhtsa_EngineCylinders"], errors="coerce")
-    history["total_recalls"] = pd.to_numeric(history["nhtsa_total_recalls"], errors="coerce").fillna(0)
-    history["total_complaints"] = pd.to_numeric(history["nhtsa_total_complaints"], errors="coerce").fillna(0)
+    # Latest projections cannot establish historical availability.
+    history["total_recalls"] = np.nan
+    history["total_complaints"] = np.nan
     for column in [
         "sentiment_overall_score",
         "sentiment_reliability_score",
@@ -793,9 +797,7 @@ def clean_history_frame(df: pd.DataFrame, max_price: int | None) -> pd.DataFrame
         (history["history_date"] - model_year_start).dt.days / 30.4375
     ).clip(lower=0)
     history["miles_per_year"] = history["mileage"] / (history["vehicle_age_months"] / 12).clip(lower=0.25)
-    history["price_down_signal"] = (
-        history["trend"].fillna("").astype(str).str.lower().str.contains("down|drop|decrease")
-    ).astype("int8")
+    history["price_down_signal"] = history.groupby("vin", observed=True)["price"].diff().lt(0).astype("int8")
     history["month_start"] = history["history_date"].dt.to_period("M").dt.start_time
     return history
 
@@ -807,6 +809,7 @@ def build_cohort_monthly_frame(
     min_cohort_months: int,
 ) -> pd.DataFrame:
     group_cols = COHORT_COLUMNS + ["month_start"]
+    history = history.sort_values("history_date").drop_duplicates(["vin", "month_start"], keep="last")
 
     monthly = (
         history.groupby(group_cols, dropna=False)
@@ -844,9 +847,11 @@ def build_cohort_monthly_frame(
         .reset_index()
     )
 
+    available_features = [c for c in NHTSA_FEATURE_COLUMNS if c in history]
+    if available_features:
+        external = history.groupby(group_cols, dropna=False)[available_features].mean().reset_index()
+        monthly = monthly.merge(external, on=group_cols, how="left", validate="one_to_one")
     monthly = monthly[monthly["unique_vins"].ge(min_monthly_vins)].copy()
-    cohort_sizes = monthly.groupby(COHORT_COLUMNS, dropna=False)["month_start"].transform("nunique")
-    monthly = monthly[cohort_sizes.ge(min_cohort_months)].copy()
     if monthly.empty:
         raise ValueError(
             "No cohort-month rows survived support filters. Lower --min-monthly-vins "
@@ -882,31 +887,32 @@ def build_cohort_monthly_frame(
     )
     monthly["cumulative_depreciation_pct"] = monthly["price_index_vs_cohort_first"] - 1
 
-    monthly["lag_median_price_1"] = group["median_price"].shift(1)
-    monthly["lag_median_price_2"] = group["median_price"].shift(2)
-    monthly["lag_price_index_1"] = group["price_index_vs_cohort_first"].shift(1)
-    monthly["rolling_median_price_3m"] = group["median_price"].transform(
-        lambda s: s.shift(1).rolling(3, min_periods=1).median()
-    )
-    monthly["rolling_avg_mileage_3m"] = group["avg_mileage"].transform(
-        lambda s: s.shift(1).rolling(3, min_periods=1).mean()
-    )
-    monthly["rolling_volume_3m"] = group["volume"].transform(
-        lambda s: s.shift(1).rolling(3, min_periods=1).mean()
-    )
-    monthly["rolling_depreciation_pct_3m"] = group["median_price"].transform(
-        lambda s: s.pct_change().shift(1).rolling(3, min_periods=1).mean()
-    )
+    lookup = monthly.set_index(COHORT_COLUMNS + ["month_start"])
 
+    def calendar_value(column: str, offset: int) -> pd.Series:
+        keys = monthly[COHORT_COLUMNS + ["month_start"]].copy()
+        keys["month_start"] += pd.DateOffset(months=offset)
+        values = lookup[column].reindex(pd.MultiIndex.from_frame(keys)).to_numpy()
+        return pd.Series(values, index=monthly.index)
+
+    monthly["lag_median_price_1"] = calendar_value("median_price", -1)
+    monthly["lag_median_price_2"] = calendar_value("median_price", -2)
+    monthly["lag_price_index_1"] = calendar_value("price_index_vs_cohort_first", -1)
+    prices = pd.concat([calendar_value("median_price", -i) for i in (1, 2, 3)], axis=1)
+    monthly["rolling_median_price_3m"] = prices.median(axis=1)
+    for source, dest in [("avg_mileage", "rolling_avg_mileage_3m"), ("volume", "rolling_volume_3m")]:
+        monthly[dest] = pd.concat([calendar_value(source, -i) for i in (1, 2, 3)], axis=1).mean(axis=1)
+    changes = [calendar_value("median_price", -i) / calendar_value("median_price", -i-1).replace(0, np.nan) - 1 for i in (1, 2, 3)]
+    monthly["rolling_depreciation_pct_3m"] = pd.concat(changes, axis=1).mean(axis=1)
     for horizon in target_months:
-        periods = max(1, int(horizon))
-        future_price = group["median_price"].shift(-periods)
-        future_month = group["month_start"].shift(-periods)
-        monthly[f"target_month_start_{horizon}m"] = future_month
+        if int(horizon) < 1:
+            raise ValueError("Forecast horizons must be positive calendar months")
+        future_price = calendar_value("median_price", int(horizon))
+        monthly[f"target_month_start_{horizon}m"] = monthly["month_start"] + pd.DateOffset(months=int(horizon))
         monthly[f"target_median_price_{horizon}m"] = future_price
-        monthly[f"target_depreciation_pct_{horizon}m"] = (
-            future_price / monthly["median_price"].replace(0, np.nan) - 1
-        )
+        monthly[f"target_depreciation_pct_{horizon}m"] = future_price / monthly["median_price"].replace(0, np.nan) - 1
+    # Eligibility is based only on support accumulated by this origin.
+    monthly["cohort_supported"] = monthly["cohort_month_number"].ge(max(0, min_cohort_months - 1))
 
     return monthly
 
@@ -916,7 +922,7 @@ def build_regression_pipeline(
     y: pd.Series | None = None,
     regressor_params: dict[str, Any] | None = None,
 ) -> tuple[Pipeline, str]:
-    numeric_features = [column for column in NUMERIC_FEATURES if column in X.columns]
+    numeric_features = [column for column in NUMERIC_FEATURES + NHTSA_FEATURE_COLUMNS if column in X.columns]
     categorical_features = [column for column in CATEGORICAL_FEATURES if column in X.columns]
 
     preprocessor = ColumnTransformer(
@@ -1203,8 +1209,7 @@ def _cohort_price_series(group: pd.DataFrame) -> pd.Series:
     series.index = pd.to_datetime(series.index)
     series = series[~series.index.duplicated(keep="last")]
     series = series.asfreq("MS")
-    series = series.interpolate(limit_direction="both")
-    return series.dropna()
+    return series
 
 
 def _forecast_output_from_predictions(
@@ -1286,7 +1291,7 @@ def eligible_rolling_origins(
     if not required.issubset(monthly.columns):
         return []
     ranked = monthly.sort_values(COHORT_COLUMNS + ["month_start"]).copy()
-    ranked["_history_months"] = ranked.groupby(COHORT_COLUMNS, dropna=False).cumcount() + 1
+    ranked["_history_months"] = ranked["cohort_month_number"] + 1 if "cohort_month_number" in ranked else ranked.groupby(COHORT_COLUMNS, dropna=False).cumcount() + 1
     eligible = ranked[
         ranked["_history_months"].ge(int(min_history_months))
         & ranked[target_col].notna()
@@ -1330,7 +1335,7 @@ def rolling_origin_global_backtest(
     for origin in origins:
         origin = pd.Timestamp(origin)
         train_end = origin - pd.DateOffset(months=int(horizon))
-        train = model_df[pd.to_datetime(model_df["month_start"], errors="coerce") <= train_end]
+        train = model_df[pd.to_datetime(model_df[f"target_month_start_{horizon}m"], errors="coerce") <= origin]
         test = model_df[pd.to_datetime(model_df["month_start"], errors="coerce").eq(origin)].copy()
         if train.shape[0] < MIN_TEMPORAL_TRAIN_ROWS or test.empty:
             continue
@@ -1339,10 +1344,12 @@ def rolling_origin_global_backtest(
         prior = model_df[pd.to_datetime(model_df["month_start"], errors="coerce") <= origin]
         history_counts = prior.groupby(COHORT_COLUMNS, dropna=False).size().rename("_history_months")
         test = test.join(history_counts, on=COHORT_COLUMNS)
-        test = test[test["_history_months"].ge(int(min_history_months))].drop(columns="_history_months")
+        support = test["cohort_month_number"] + 1 if "cohort_month_number" in test else test["_history_months"]
+        test = test[support.ge(int(min_history_months))].drop(columns="_history_months")
         if test.empty:
             continue
-        model, _ = build_regression_pipeline(train[feature_columns], train[target_col], tuned_params)
+        # Parameters selected on later dates are unavailable at this origin.
+        model, _ = build_regression_pipeline(train[feature_columns], train[target_col], None)
         model.fit(train[feature_columns], train[target_col])
         pred_dep = model.predict(test[feature_columns])
         scored = supervised_backtest_rows(
@@ -1353,10 +1360,62 @@ def rolling_origin_global_backtest(
             future_price_col=future_price_col,
             model_key=target_col,
             model_family="global_ml",
-            forecast_method="recursive_global_ml_model",
+            forecast_method="direct_global_ml_model",
         )
         rows.append(rolling_origin_metadata(scored, origin, first_month, min_history_months))
     return pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()
+
+
+def rolling_recursive_backtest(monthly, feature_columns, forecast_months, min_history_months):
+    """Evaluate the deployed one-month recursion using only origin-known labels."""
+    frames = []
+    target = "target_depreciation_pct_1m"
+    actuals = monthly[COHORT_COLUMNS + ["month_start", "median_price"]].rename(
+        columns={"month_start": "forecast_date", "median_price": "actual_median_price"})
+    for origin in eligible_rolling_origins(monthly, 1, min_history_months):
+        train = monthly[monthly["target_month_start_1m"].le(origin) & monthly[target].notna()
+                        & monthly["cohort_supported"]]
+        test = monthly[monthly["month_start"].eq(origin)
+                       & monthly["cohort_month_number"].ge(min_history_months - 1)]
+        if len(train) < MIN_TEMPORAL_TRAIN_ROWS or test.empty:
+            continue
+        model, _ = build_regression_pipeline(train[feature_columns], train[target], None)
+        model.fit(train[feature_columns], train[target])
+        available_steps = (monthly.month_start.max().year - origin.year) * 12 + monthly.month_start.max().month - origin.month
+        predictions = forecast_latest_cohorts_recursive(test, model, feature_columns, 1,
+                                                        min(forecast_months, available_steps))
+        scored = predictions.merge(actuals, on=COHORT_COLUMNS + ["forecast_date"], how="inner", validate="many_to_one")
+        scored = scored.rename(columns={"observed_month_start": "origin_month_start"})
+        scored["actual_depreciation_pct"] = scored["actual_median_price"] / scored["observed_median_price"] - 1
+        scored["absolute_error"] = (scored["actual_median_price"] - scored["predicted_median_price"]).abs()
+        scored["naive_absolute_error"] = (scored["actual_median_price"] - scored["observed_median_price"]).abs()
+        scored["model_key"] = target
+        frames.append(rolling_origin_metadata(scored, origin, monthly.month_start.min(), min_history_months))
+    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+
+
+def simple_forecast_baselines(monthly, forecast_months, min_history_months):
+    """No-change and calendar-month drift on observed cohort prices."""
+    future, backtests = [], []
+    for _, group in monthly.groupby(COHORT_COLUMNS, dropna=False):
+        group = group.sort_values("month_start")
+        if len(group) < min_history_months:
+            continue
+        actuals = dict(zip(group.month_start, group.median_price))
+        for family in ("naive", "drift"):
+            for position in range(min_history_months - 1, len(group)):
+                row = group.iloc[position]
+                first = group.iloc[0]
+                months = (row.month_start.year - first.month_start.year) * 12 + row.month_start.month - first.month_start.month
+                drift = (row.median_price - first.median_price) / months if months and family == "drift" else 0
+                predictions = np.maximum(0, row.median_price + drift * np.arange(1, forecast_months + 1))
+                if position == len(group) - 1:
+                    future.append(_forecast_output_from_predictions(row, predictions, f"{family}_baseline", family))
+                scored = local_backtest_rows(row, row.month_start, float(row.median_price), predictions,
+                                            actuals, list(range(1, forecast_months + 1)), family, family, f"{family}_baseline")
+                if not scored.empty:
+                    backtests.append(rolling_origin_metadata(scored, row.month_start, first.month_start, min_history_months))
+    return future, backtests
 
 
 def local_backtest_rows(
@@ -1535,7 +1594,11 @@ def forecast_latest_cohorts_recursive(
     step_months: int,
     forecast_months: int,
 ) -> pd.DataFrame:
+    if step_months != 1:
+        raise ValueError("Monthly recursive forecasts require a fitted one-month model (--target-months must include 1).")
     working = latest_features.copy()
+    price_memory = [working.get(c, working["median_price"]).to_numpy(dtype=float).copy()
+                    for c in ["lag_median_price_2", "lag_median_price_1", "median_price"]]
     observed_month = pd.to_datetime(latest_features["month_start"])
     elapsed_months = 0
     frames: list[pd.DataFrame] = []
@@ -1572,10 +1635,22 @@ def forecast_latest_cohorts_recursive(
         output["cohort_id"] = _cohort_id_frame(output)
         frames.append(output)
 
-        working["median_price"] = predicted_price
-        for column in ["avg_price", "price_p25", "price_p75", "lag_median_price_1", "rolling_median_price_3m"]:
+        prior_index = working.get("price_index_vs_cohort_first", pd.Series(np.nan, index=working.index)).copy()
+        working["lag_median_price_2"] = working.get("lag_median_price_1", np.nan)
+        working["lag_median_price_1"] = current_price
+        working["lag_price_index_1"] = prior_index
+        working["rolling_median_price_3m"] = np.nanmedian(np.vstack(price_memory[-3:]), axis=0)
+        for column in ["avg_price", "price_p25", "price_p75"]:
             if column in working.columns:
-                working[column] = predicted_price
+                working[column] = working[column] * np.divide(predicted_price, current_price, out=np.ones_like(current_price), where=current_price != 0)
+        past = np.vstack(price_memory[-4:])
+        if len(past) > 1:
+            working["rolling_depreciation_pct_3m"] = np.nanmean(np.diff(past, axis=0) / np.where(past[:-1] == 0, np.nan, past[:-1]), axis=0)
+        working["median_price"] = predicted_price
+        price_memory.append(predicted_price.copy())
+        if "avg_vehicle_age_months" in working:
+            working["avg_vehicle_age_months"] += 1
+        # Mileage, market conditions, volume and external evidence are held fixed scenarios.
         if "price_index_vs_cohort_first" in working.columns:
             working["price_index_vs_cohort_first"] = (
                 working["median_price"] / working["cohort_first_median_price"].replace(0, np.nan)
@@ -1695,10 +1770,8 @@ def select_local_model_cohorts(monthly: pd.DataFrame, max_cohorts: int) -> pd.Da
         .reset_index()
     )
     summary = summary[summary["cohort_months"].ge(MIN_LOCAL_MODEL_MONTHS)].copy()
-    summary = summary.sort_values(
-        ["cohort_months", "cohort_volume", "latest_month", "latest_unique_vins"],
-        ascending=[False, False, False, False],
-    )
+    # Stable identity ordering avoids ranking historical evaluation cohorts by future volume.
+    summary = summary.sort_values(COHORT_COLUMNS)
     if max_cohorts and max_cohorts > 0:
         summary = summary.head(int(max_cohorts))
     return summary
@@ -1770,16 +1843,16 @@ def run_local_forecaster(
             if series.shape[0] < MIN_LOCAL_MODEL_MONTHS:
                 continue
             latest_row = latest_lookup[key]
-            actual_lookup = {pd.Timestamp(index): float(value) for index, value in series.items()}
+            actual_lookup = {pd.Timestamp(index): float(value) for index, value in series.dropna().items()}
 
             if model_family == "sarimax":
-                future_pred = forecast_sarimax_series(series, forecast_steps)
+                future_pred = forecast_sarimax_series(series.ffill(), forecast_steps)
                 backtest_pred = np.array([])
             elif model_family == "prophet":
-                future_pred = forecast_prophet_series(series, forecast_steps)
+                future_pred = forecast_prophet_series(series.ffill(), forecast_steps)
                 backtest_pred = np.array([])
             else:
-                future_pred = forecast_timesfm_batch(timesfm_model, [series], forecast_steps)[0]
+                future_pred = forecast_timesfm_batch(timesfm_model, [series.ffill()], forecast_steps)[0]
                 backtest_pred = np.array([])
 
             future_frames.append(
@@ -1791,7 +1864,10 @@ def run_local_forecaster(
                 )
             )
             for origin_position in range(MIN_LOCAL_MODEL_MONTHS - 1, len(series)):
-                train_series = series.iloc[: origin_position + 1]
+                prefix = series.iloc[: origin_position + 1]
+                if pd.isna(prefix.iloc[-1]) or prefix.notna().sum() < MIN_LOCAL_MODEL_MONTHS:
+                    continue
+                train_series = prefix.ffill()
                 origin_month = pd.Timestamp(train_series.index.max())
                 if not any(pd.Timestamp(origin_month + pd.DateOffset(months=h)) in actual_lookup for h in target_months):
                     continue
@@ -1855,8 +1931,13 @@ def train_cohort_models(
     max_local_model_cohorts: int,
     timesfm_model_id: str,
     min_rolling_history_months: int = MIN_ROLLING_HISTORY_MONTHS,
+    nhtsa_feature_db: Path = FEATURE_DB,
+    feature_set: str = "baseline",
 ) -> dict[str, Any]:
     raw = load_history_frame(db_path, sample_size, absa_db_path=absa_db_path)
+    if feature_set in {"all", "nhtsa", "nhtsa-structured"}:
+        raw = attach_features(raw, "history_date", nhtsa_feature_db)
+    enrichment_profile = raw.attrs.get("nhtsa_features", {"available": False, "reason": "excluded by feature set"})
     history = clean_history_frame(raw, max_price=max_price)
     monthly = build_cohort_monthly_frame(
         history,
@@ -1867,16 +1948,25 @@ def train_cohort_models(
 
     feature_columns = [
         column
-        for column in CATEGORICAL_FEATURES + NUMERIC_FEATURES
+        for column in CATEGORICAL_FEATURES + NUMERIC_FEATURES + NHTSA_FEATURE_COLUMNS
         if column in monthly.columns and column not in PRICE_LEAKAGE_FEATURE_COLUMNS
     ]
+    feature_columns = [c for c in feature_columns
+                       if (feature_set in {"all", "youtube"} or not c.startswith("sentiment_"))
+                       and (feature_set in {"all", "nhtsa", "nhtsa-structured"} or c not in NHTSA_FEATURE_COLUMNS)
+                       and (feature_set != "nhtsa-structured" or c not in NHTSA_FEATURE_COLUMNS or not c.endswith("_score"))
+                       and c not in {"total_recalls", "total_complaints"}]
     cutoff = choose_cutoff(monthly, split_date)
     report: dict[str, Any] = {
         "task": "cohort_depreciation",
+        "future_covariate_scenario": "Mileage, market state, volume and external evidence held fixed; vehicle age advances monthly. Long unsupported horizons are extrapolations.",
+        "historical_caveats": "Latest canonical identity and cleaned outlier thresholds can contain hindsight; strict collection-time NLP joins do not make the whole dataset point-in-time.",
         "modeling_approach": (
             "Global supervised monthly time-series model across make/model/year/trim cohorts, "
             "trained to predict one-step monthly depreciation and recursively forecast 60 months."
         ),
+        "feature_set": feature_set,
+        "nhtsa_features": enrichment_profile,
         "rows_loaded": int(raw.shape[0]),
         "history_rows_after_cleaning": int(history.shape[0]),
         "cohort_month_rows": int(monthly.shape[0]),
@@ -1970,7 +2060,7 @@ def train_cohort_models(
         for horizon in target_months:
             target_col = f"target_depreciation_pct_{horizon}m"
             future_price_col = f"target_median_price_{horizon}m"
-            model_df = monthly.dropna(subset=feature_columns + [target_col, future_price_col]).copy()
+            model_df = monthly[monthly["cohort_supported"]].dropna(subset=[target_col, future_price_col]).copy()
             if model_df.shape[0] < MIN_MODEL_ROWS:
                 report["models"][target_col] = {
                     "model_family": "global_ml",
@@ -1998,25 +2088,25 @@ def train_cohort_models(
             y_train = train[target_col]
 
             _, model_name = build_regression_pipeline(X_train, y_train)
-            tuned_params, tuning_metadata = tune_depreciation_hyperparameters(
-                train=train,
-                feature_columns=feature_columns,
-                target_col=target_col,
-                horizon=horizon,
-                model_name=model_name,
-            )
-            model, model_name = build_regression_pipeline(X_train, y_train, tuned_params)
-            model.fit(X_train, y_train)
-            rolling_rows = rolling_origin_global_backtest(
-                model_df=model_df,
-                feature_columns=feature_columns,
-                target_col=target_col,
-                future_price_col=future_price_col,
-                horizon=horizon,
-                tuned_params=tuned_params,
-                min_history_months=min_rolling_history_months,
-            )
-            metrics = metrics_from_backtest_rows(rolling_rows)
+            tuned_params = None
+            tuning_metadata = {
+                "enabled": False,
+                "reason": "Fixed defaults match every rolling-origin fit; nested tuning is required before enabling optimized parameters.",
+            }
+            if horizon == 1:
+                rolling_rows = rolling_recursive_backtest(monthly, feature_columns, forecast_months, min_rolling_history_months)
+            else:
+                rolling_rows = rolling_origin_global_backtest(
+                    model_df=model_df,
+                    feature_columns=feature_columns,
+                    target_col=target_col,
+                    future_price_col=future_price_col,
+                    horizon=horizon,
+                    tuned_params=tuned_params,
+                    min_history_months=min_rolling_history_months,
+                )
+            scored_horizon = rolling_rows[rolling_rows["forecast_month"].eq(horizon)] if not rolling_rows.empty else rolling_rows
+            metrics = metrics_from_backtest_rows(scored_horizon)
             if not rolling_rows.empty:
                 backtest_frames.append(rolling_rows)
 
@@ -2028,6 +2118,7 @@ def train_cohort_models(
             final_model.fit(model_df[feature_columns], model_df[target_col])
 
             artifact_name = f"Cohort_Depreciation_{horizon}m.joblib"
+            final_model.feature_contract_version_ = "pit-v1"
             joblib.dump(final_model, output_dir / artifact_name)
             fitted_horizon_models[int(horizon)] = final_model
             feature_importance = extract_pipeline_feature_importance(final_model)
@@ -2041,7 +2132,8 @@ def train_cohort_models(
                 "future_price_column": future_price_col,
                 "split_date": str(model_cutoff.date()) if not pd.isna(model_cutoff) else None,
                 "train_rows": int(train.shape[0]),
-                "test_rows": int(rolling_rows.shape[0]),
+                "test_rows": int(scored_horizon.shape[0]),
+                "recursive_backtest_rows_all_horizons": int(rolling_rows.shape[0]),
                 "train_cohorts": int(train[COHORT_COLUMNS].drop_duplicates().shape[0]),
                 "test_cohorts": int(rolling_rows[COHORT_COLUMNS].drop_duplicates().shape[0]) if not rolling_rows.empty else 0,
                 "complete_rows": int(model_df.shape[0]),
@@ -2103,6 +2195,9 @@ def train_cohort_models(
             if local_report.get("skipped"):
                 report["models"][model_key]["skipped"] = local_report["skipped"]
 
+    baseline_future, baseline_backtests = simple_forecast_baselines(monthly, forecast_months, min_rolling_history_months)
+    future_forecast_frames.extend(baseline_future)
+    backtest_frames.extend(baseline_backtests)
     backtest_results = pd.concat(backtest_frames, ignore_index=True) if backtest_frames else pd.DataFrame()
     if not backtest_results.empty:
         backtest_results = backtest_results.sort_values(
@@ -2117,6 +2212,17 @@ def train_cohort_models(
         report["backtest_kpi_output"] = kpi_path.name
         report["backtest_rows"] = int(backtest_results.shape[0])
         report["backtest_kpi_rows"] = int(kpis.shape[0])
+        matched = []
+        case = COHORT_COLUMNS + ["origin_month_start", "forecast_date"]
+        for _, horizon_rows in backtest_results.groupby("forecast_month"):
+            labels = horizon_rows[["model_family", "forecast_method"]].drop_duplicates().shape[0]
+            support = horizon_rows.groupby(case, dropna=False).size()
+            common = support[support.eq(labels)].reset_index()[case]
+            matched.append(horizon_rows.merge(common, on=case, how="inner", validate="many_to_one"))
+        matched_rows = pd.concat(matched, ignore_index=True)
+        backtesting_kpi_frame(matched_rows).to_csv(output_dir / "cohort_backtesting_matched_kpis.csv", index=False)
+        report["matched_backtest_rows"] = len(matched_rows)
+        report["matched_backtest_kpi_output"] = "cohort_backtesting_matched_kpis.csv"
     else:
         report["backtest_output"] = None
         report["backtest_kpi_output"] = None
@@ -2124,7 +2230,9 @@ def train_cohort_models(
         report["backtest_kpi_rows"] = 0
 
     if fitted_horizon_models:
-        recursive_horizon = min(fitted_horizon_models)
+        if 1 not in fitted_horizon_models:
+            raise ValueError("No one-month model fitted; cannot produce monthly recursive forecasts. Include --target-months 1.")
+        recursive_horizon = 1
         future_forecast_frames.append(
             forecast_latest_cohorts_recursive(
                 latest_features=latest_features,
@@ -2178,7 +2286,7 @@ def write_reports(output_dir: Path, report: dict[str, Any]) -> None:
             {
                 "cohort_columns": COHORT_COLUMNS,
                 "categorical_features": CATEGORICAL_FEATURES,
-                "numeric_features": NUMERIC_FEATURES,
+                "numeric_features": [c for c in NUMERIC_FEATURES + NHTSA_FEATURE_COLUMNS if c in report["feature_columns"]],
                 "feature_columns": report["feature_columns"],
                 "excluded_price_leakage_columns": report.get("excluded_price_leakage_columns", []),
                 "price_feature_policy": report.get("price_feature_policy"),
@@ -2306,6 +2414,8 @@ def run_cohort_forecast(
     max_local_model_cohorts: int = DEFAULT_MAX_LOCAL_MODEL_COHORTS,
     timesfm_model_id: str = DEFAULT_TIMESFM_MODEL_ID,
     min_rolling_history_months: int = MIN_ROLLING_HISTORY_MONTHS,
+    nhtsa_feature_db: Path = FEATURE_DB,
+    feature_set: str = "baseline",
 ) -> dict[str, Any]:
     if target_months is None:
         target_months = horizons or DEFAULT_TARGET_MONTHS
@@ -2327,6 +2437,8 @@ def run_cohort_forecast(
         max_local_model_cohorts=max_local_model_cohorts,
         timesfm_model_id=timesfm_model_id,
         min_rolling_history_months=min_rolling_history_months,
+        nhtsa_feature_db=nhtsa_feature_db,
+        feature_set=feature_set,
     )
     report.update(
         {
@@ -2460,6 +2572,8 @@ def main() -> None:
         max_local_model_cohorts=args.max_local_model_cohorts,
         timesfm_model_id=args.timesfm_model_id,
         min_rolling_history_months=args.min_rolling_history_months,
+        nhtsa_feature_db=args.nhtsa_feature_db,
+        feature_set=args.feature_set,
     )
     print(f"Saved report to {Path(args.output_dir) / 'cohort_depreciation_model_report.json'}")
     for target, model_report in report["models"].items():

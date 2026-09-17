@@ -1,4 +1,5 @@
 import tempfile
+from types import SimpleNamespace
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -20,6 +21,13 @@ from ML.Vehicle_Scenario import (
 
 
 class StreamlitVehicleScenarioTests(unittest.TestCase):
+    def test_inference_rejects_old_feature_contract_artifacts(self):
+        with patch.object(app.joblib, "load", return_value=SimpleNamespace()):
+            with self.assertRaisesRegex(ValueError, "Retrain"):
+                app.load_current_model("legacy_contract_fixture", 1)
+            with self.assertRaisesRegex(ValueError, "Retrain"):
+                app.load_depreciation_model("legacy_contract_fixture.joblib", 1)
+
     def setUp(self) -> None:
         self.rows = pd.DataFrame(
             [

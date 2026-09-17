@@ -49,3 +49,24 @@ Consult [DATA_DICTIONARY.md](../../DATA_DICTIONARY.md) for source-field definiti
 - Use only minimal comments for non-obvious logic.
 - When introducing new packages, update `requirements.txt` in the same change.
 - When NHTSA behavior, schema, scheduler commands, or lineage changes, update all project Markdown and agent guidance files in the same change.
+
+
+## Collected-time NLP and model contracts (2026-09-16)
+
+- Keep YouTube ABSA incremental with per-batch commits; never launch long inference
+  during implementation verification. The user stopped the previous worker.
+- NHTSA_text_features.py owns the optional derived CAR_NHTSA_TEXT_FEATURES.db;
+  raw source schemas and scheduled acquisition steps are unchanged. Keep its
+  pinned configuration, event deduplication and read-only source access intact.
+- Keep complaint experience, recall potential hazards and remedy text separate.
+  Join query metadata on exact normalized make/model/year, never masked VIN or
+  trim. Availability uses retained collection time before observation month;
+  unknown/failure is not zero. Do not claim fleet failure rates or NLP lift.
+- Baseline is the default model feature set. Use isolated, frozen-input ablation
+  runs for youtube, nhtsa-structured, nhtsa and all; validate text labels manually.
+- Current-price uses an allowlist and bounded one-hot encoding, separate selection,
+  calibration and test data. Forecasts use calendar targets, origin-known support,
+  one VIN/month and observed actuals. Preserve recursive/naive/drift comparisons.
+- Synchronize the pit-v1 artifact contract, notebook and dashboard. Old artifacts
+  require retraining before new-contract inference. See PROJECT_SUMMARY.md for
+  exact commands, limitations and remaining research rather than inferring lift.

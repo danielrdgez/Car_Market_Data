@@ -58,6 +58,9 @@ The active scraper is `DataPipeline/Playwright_test.py`. It uses Playwright resp
 - Visualization: Plotly for Python EDA, ggplot2 for R EDA
 - Modeling: scikit-learn, LightGBM, category encoders, joblib
 - NLP/sentiment: YouTube Data API, transformers, torch
+- ABSA cumulative video counts use first eligible make/video month and cumulative
+  new-video counts. Keep those exact semantics when optimizing. The implemented
+  NHTSA sidecar and reviewed run order live in PROJECT_SUMMARY.md.
 - Enrichment: NHTSA vPIC, SafetyRatings, Recalls, Complaints APIs, and official bulk datasets. Normalized NHTSA history is stored in `CAR_DATA_OUTPUT/CAR_DATA_NHTSA.db`; `CAR_DATA.db` retains the compatibility projection.
 
 ## NHTSA Implementation Rules
@@ -70,3 +73,24 @@ The active scraper is `DataPipeline/Playwright_test.py`. It uses Playwright resp
 - Use --backup-path for a one-time live SQLite backup before the first migration of an existing primary database; never overwrite an existing backup.
 - Use --backfill-legacy as the explicit full-history refresh alias when the goal is to reprocess every historical VIN with current mappings.
 - Update README.md, PROJECT_SUMMARY.md, AGENTS.md, and relevant `.github` guidance whenever this workflow or its schema changes.
+
+
+## Collected-time NLP and model contracts (2026-09-16)
+
+- Keep YouTube ABSA incremental with per-batch commits; never launch long inference
+  during implementation verification. The user stopped the previous worker.
+- NHTSA_text_features.py owns the optional derived CAR_NHTSA_TEXT_FEATURES.db;
+  raw source schemas and scheduled acquisition steps are unchanged. Keep its
+  pinned configuration, event deduplication and read-only source access intact.
+- Keep complaint experience, recall potential hazards and remedy text separate.
+  Join query metadata on exact normalized make/model/year, never masked VIN or
+  trim. Availability uses retained collection time before observation month;
+  unknown/failure is not zero. Do not claim fleet failure rates or NLP lift.
+- Baseline is the default model feature set. Use isolated, frozen-input ablation
+  runs for youtube, nhtsa-structured, nhtsa and all; validate text labels manually.
+- Current-price uses an allowlist and bounded one-hot encoding, separate selection,
+  calibration and test data. Forecasts use calendar targets, origin-known support,
+  one VIN/month and observed actuals. Preserve recursive/naive/drift comparisons.
+- Synchronize the pit-v1 artifact contract, notebook and dashboard. Old artifacts
+  require retraining before new-contract inference. See PROJECT_SUMMARY.md for
+  exact commands, limitations and remaining research rather than inferring lift.

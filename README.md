@@ -6,6 +6,9 @@ The pipeline captures vehicle listings from AutoTempest-style result pages, stor
 
 ## Research Goals
 
+The saved [modeling roadmap and NHTSA text research plan](PROJECT_SUMMARY.md#modeling-roadmap-and-nhtsa-text-workflow)
+records the implemented safeguards, source-specific NLP workflow, and remaining evaluation gates.
+
 1. Quantify how safety technology, safety ratings, recalls, and complaints relate to resale price and depreciation.
 2. Improve current vehicle price prediction with enriched NHTSA attributes, listing metadata, mileage, geography, and market timing.
 3. Model depreciation as a time-series problem using price history by make, model, model year, and trim-like cohorts.
@@ -209,7 +212,7 @@ the entire page.
 
 ## Modeling Approach
 
-The current-price pipeline uses `canonical_make`, `canonical_model`, `canonical_year`, and `canonical_trim`, plus engineered mileage/age, market, safety, and listing features. Raw NHTSA trims, legacy combined trims, identity provenance, confidence, agreement flags, and EPA IDs are excluded from predictive inputs. Candidate models are Ridge, ElasticNet, RandomForest, and LightGBM; each candidate first trains a leakage-safe classifier to route everyday versus high-value vehicles before fitting separate segment regressors.
+The current-price pipeline uses `canonical_make`, `canonical_model`, `canonical_year`, and `canonical_trim`, plus engineered mileage/age, market, safety, and listing features. Raw NHTSA trims, legacy combined trims, identity provenance, confidence, agreement flags, and EPA IDs are excluded from predictive inputs. Median and plain Ridge/LightGBM baselines compete with routed Ridge, ElasticNet, RandomForest, and LightGBM. Selection uses validation MAE with separate calibration and test partitions. Categorical predictors use bounded one-hot encoding.
 
 The depreciation pipeline builds monthly cohorts by make, model, model year, and cleaned trim proxy. It trains a global one-month depreciation model across related vehicle cohorts, then recursively emits a month-by-month median-price forecast for the next 60 months by default. It also benchmarks local SARIMAX, Prophet, and TimesFM cohort forecasts when dependencies and sufficient cohort history are available. Forecast origins use each cohort's latest retained price-history month, and the default run does not impose a global upper-price cap so high-value cohorts keep their full observed history. Sparse and newer cohorts borrow signal from related make/model/year/trim cohorts through the global model; local model families are capped by default for bounded iteration and can be run across all eligible cohorts with `--max-local-model-cohorts 0`.
 
@@ -219,15 +222,34 @@ The depreciation pipeline builds monthly cohorts by make, model, model year, and
 
 Useful sentiment commands:
 
+Monthly video totals count each video's first eligible month per make, avoiding
+repeated full-history scans while preserving cumulative distinct counts. See the
+[reviewed run order](PROJECT_SUMMARY.md#reviewed-run-order-2026-09-16)
+for incremental YouTube scoring, NHTSA pilot/scoring/build commands, and isolated
+model comparisons. The earlier ABSA worker is stopped; no automatic completion is running.
+
 ```powershell
 python DataPipeline\SentimentAnalysis.py --playlist-id PLAYLIST_ID --max-videos 10 --max-comments 100
 python DataPipeline\SentimentAnalysis.py --refresh-days 30 --force-recheck
 python DataPipeline\absa_pipeline.py --migrate-make-grain
 python DataPipeline\absa_pipeline.py --run-all --limit 1000
-python DataPipeline\absa_pipeline.py --run-all --force-reprocess
+python DataPipeline\NHTSA_text_features.py pilot --limit 300
+python DataPipeline\NHTSA_text_features.py build
 ```
 
 Use `--migrate-make-grain` once to backfill existing scored comments without rerunning the Hugging Face model. Set `YOUTUBE_API_KEY` or `GOOGLE_API_KEY` in the environment or `.env` before ingestion. Public Hugging Face models do not require authentication; optional Hub authentication uses `HF_TOKEN` from the same ignored `.env` file.
+
+NHTSA text is separate from YouTube opinion scoring. Its optional sidecar joins
+exact normalized make/model/year using retained collection timestamps before the
+observation month; failed lookups stay unknown. Compare `--feature-set baseline`,
+`youtube`, `nhtsa-structured`, `nhtsa`, and `all`. Text scores require human pilot
+validation; no predictive lift is established. The default is baseline.
+
+Time-series lags/targets use exact calendar months with one observation per
+VIN/month; backtests include the recursive path, no-change/drift baselines and
+matched-case KPIs. Future external covariates remain fixed scenarios. Set
+`MODEL_OUTPUT_DIR` to inspect a separate run in the dashboard/notebook. Retrain
+old artifacts before inference with the changed feature semantics.
 
 ## Databases and Outputs
 
@@ -238,6 +260,8 @@ See [DATA_DICTIONARY.md](DATA_DICTIONARY.md) for every table and column in the t
 - `CAR_DATA_OUTPUT/CAR_DATA_CLEANED.db`: cleaned analysis/modeling database, including `vehicle_identity`, `epa_vehicle_catalog`, and `epa_catalog_metadata`.
 - `CAR_DATA_OUTPUT/reference/epa_fuel_economy/`: ignored local cache of the official [FuelEconomy.gov vehicle dataset](https://www.fueleconomy.gov/feg/epadata/vehicles.csv.zip).
 - `CAR_DATA_OUTPUT/CAR_YOUTUBE_COMMENTS.db`: YouTube comment and sentiment-derived tables, including `youtube_video_fetch_state`, `youtube_playlist_fetch_state`, `youtube_comments_scored`, `make_sentiment_index`, and `make_sentiment_monthly`.
+- `CAR_DATA_OUTPUT/CAR_NHTSA_TEXT_FEATURES.db`: optional derived query-level features and pinned text-score cache; source databases are unchanged.
+- `MODELS_OUTPUT/cohort_backtesting_matched_kpis.csv`: common-case forecast comparisons by horizon.
 - `MODELS_OUTPUT/model_report.json` and `MODELS_OUTPUT/model_report.md`: current-price model reports.
 - `MODELS_OUTPUT/cohort_depreciation_model_report.json` and `.md`: depreciation model reports.
 - `MODELS_OUTPUT/cohort_future_forecasts.csv`: monthly future cohort median-price forecasts by model family used by the dashboard.

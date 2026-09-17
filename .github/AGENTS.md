@@ -72,6 +72,11 @@ cleaning with `--no-epa-refresh` as four blocking, fail-fast stages.
 
 ## Research and Modeling Standards
 
+- The reviewed deferred model/NHTSA text plan and runnable command order are in
+  `PROJECT_SUMMARY.md`. Proposed NHTSA narrative features are not implemented.
+- Preserve make-level ABSA cumulative distinct videos using first eligible
+  make/video month plus cumulative new-video counts; do not sum monthly distincts.
+
 - Tie EDA and feature engineering to the capstone research questions: safety/depreciation, high-dimensional price prediction, cohort depreciation forecasting, NLP/sentiment lift, and segment robustness.
 - Avoid target leakage. Do not train on `price`, `price_band`, future prices, or answer-derived features.
 - Preserve VIN-safe train/test validation for current-price modeling.
@@ -108,3 +113,24 @@ cleaning with `--no-epa-refresh` as four blocking, fail-fast stages.
 - Use NHTSA make/model/model-year values first and listing fields/title parsing as field-level fallbacks. Preserve source, confidence, conflict, missing-result, and request-failed metadata.
 - Treat recall and complaint queries as make/model/year-level evidence unless the source explicitly supplies a VIN.
 - Update all project Markdown and agent guidance in the same change when NHTSA endpoints, schemas, refresh behavior, scheduler commands, or lineage change.
+
+
+## Collected-time NLP and model contracts (2026-09-16)
+
+- Keep YouTube ABSA incremental with per-batch commits; never launch long inference
+  during implementation verification. The user stopped the previous worker.
+- NHTSA_text_features.py owns the optional derived CAR_NHTSA_TEXT_FEATURES.db;
+  raw source schemas and scheduled acquisition steps are unchanged. Keep its
+  pinned configuration, event deduplication and read-only source access intact.
+- Keep complaint experience, recall potential hazards and remedy text separate.
+  Join query metadata on exact normalized make/model/year, never masked VIN or
+  trim. Availability uses retained collection time before observation month;
+  unknown/failure is not zero. Do not claim fleet failure rates or NLP lift.
+- Baseline is the default model feature set. Use isolated, frozen-input ablation
+  runs for youtube, nhtsa-structured, nhtsa and all; validate text labels manually.
+- Current-price uses an allowlist and bounded one-hot encoding, separate selection,
+  calibration and test data. Forecasts use calendar targets, origin-known support,
+  one VIN/month and observed actuals. Preserve recursive/naive/drift comparisons.
+- Synchronize the pit-v1 artifact contract, notebook and dashboard. Old artifacts
+  require retraining before new-contract inference. See PROJECT_SUMMARY.md for
+  exact commands, limitations and remaining research rather than inferring lift.

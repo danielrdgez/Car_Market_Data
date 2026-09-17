@@ -22,10 +22,10 @@ import joblib
 import numpy as np
 import pandas as pd
 import scipy.sparse as sp
-from category_encoders import TargetEncoder
 from lightgbm import LGBMClassifier, LGBMRegressor
 from sklearn.base import BaseEstimator, RegressorMixin, clone
 from sklearn.compose import ColumnTransformer, TransformedTargetRegressor
+from sklearn.dummy import DummyRegressor
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import ElasticNet, Ridge
@@ -42,6 +42,10 @@ from sklearn.preprocessing import FunctionTransformer, OneHotEncoder, StandardSc
 warnings.filterwarnings("ignore")
 
 BASE_DIR = Path(__file__).resolve().parent.parent
+import sys
+if str(BASE_DIR) not in sys.path:
+    sys.path.insert(0, str(BASE_DIR))
+from DataPipeline.NHTSA_text_features import FEATURE_DB, FEATURE_COLUMNS as NHTSA_FEATURE_COLUMNS, attach_features
 DB_PATH = BASE_DIR / "CAR_DATA_OUTPUT" / "CAR_DATA_CLEANED.db"
 ABSA_DB_PATH = BASE_DIR / "CAR_DATA_OUTPUT" / "CAR_YOUTUBE_COMMENTS.db"
 OUTPUT_DIR = BASE_DIR / "MODELS_OUTPUT"
@@ -75,6 +79,22 @@ PRICE_LEAKAGE_FEATURE_COLUMNS = {
     "nhtsa_BasePrice",
     "nhtsa_BasePrice_source",
 }
+
+ALLOWED_PRICE_FEATURES = set("""canonical_make canonical_model canonical_year canonical_trim mileage
+locationCode countryCode sellerType listingType sourceName pendingSale
+vehicle_age vehicle_age_squared miles_per_year model_year_bucket log_mileage mileage_age_interaction mileage_bucket
+listing_recency_days listing_month listing_week location_region trim_proxy make_model_year make_model_year_trim
+body_fuel_segment is_ev_or_hybrid source_is_marketplace title_mentions_luxury_trim
+vehicleTitle_length vehicleTitle_word_count vehicleTitleDesc_length vehicleTitleDesc_word_count title_length title_word_count
+nhtsa_BodyClass nhtsa_DriveType nhtsa_FuelTypePrimary nhtsa_FuelTypeSecondary nhtsa_ElectrificationLevel
+nhtsa_EngineHP nhtsa_EngineCylinders nhtsa_DisplacementL nhtsa_TransmissionStyle nhtsa_TransmissionSpeeds
+nhtsa_Doors nhtsa_Seats nhtsa_SeatRows nhtsa_VehicleType nhtsa_GVWR nhtsa_WheelBaseShort
+nhtsa_ABS nhtsa_ESC nhtsa_TractionControl nhtsa_ForwardCollisionWarning nhtsa_LaneDepartureWarning
+nhtsa_LaneKeepSystem nhtsa_BlindSpotMon nhtsa_AutoReverseSystem nhtsa_RearVisibilitySystem
+nhtsa_AdaptiveCruiseControl nhtsa_CIB nhtsa_PedestrianAutomaticEmergencyBraking
+sentiment_overall_score sentiment_reliability_score sentiment_value_score sentiment_performance_score
+sentiment_comfort_score sentiment_comment_count sentiment_video_count sentiment_aspect_coverage""".split()) | set(NHTSA_FEATURE_COLUMNS)
+
 
 TARGET_ENCODE_TOKENS = (
     "make",
@@ -270,6 +290,9 @@ def parse_args() -> argparse.Namespace:
         default=60,
         help="Number of future monthly depreciation forecast points when --task all is used.",
     )
+    parser.add_argument("--nhtsa-feature-db", type=Path, default=FEATURE_DB)
+    parser.add_argument("--feature-set", choices=["baseline", "youtube", "nhtsa-structured", "nhtsa", "all"], default="baseline",
+                        help="Controlled feature ablation; NLP is opt-in until validated.")
     return parser.parse_args()
 
 
@@ -521,6 +544,7 @@ def load_modeling_frame(
             c
             for c in nhtsa_schema
             if c != "vin" and c not in PRICE_LEAKAGE_FEATURE_COLUMNS
+            and (c in ALLOWED_PRICE_FEATURES or c in IDENTITY_DIAGNOSTIC_COLUMNS)
         ]
         declared_types = {
             **listings_schema,
@@ -584,7 +608,7 @@ def load_modeling_frame(
                                    SELECT MAX(msi2.sentiment_month)
                                    FROM absa.make_sentiment_monthly AS msi2
                                    WHERE msi2.sentiment_make = {make_expr}
-                                     AND msi2.sentiment_month <= {listing_month}
+                                     AND msi2.sentiment_month < {listing_month}
                                )
                         """
             except sqlite3.Error:
@@ -663,7 +687,8 @@ def engineer_current_price_features(
     model_year_col = "canonical_year"
     if model_year_col in df.columns:
         model_year = pd.to_numeric(df[model_year_col], errors="coerce")
-        df["vehicle_age"] = (datetime.now().year - model_year).clip(lower=0)
+        observation_year = pd.to_datetime(df.get("loaddate", pd.Series(pd.NaT, index=df.index)), errors="coerce").dt.year
+        df["vehicle_age"] = (observation_year - model_year).clip(lower=0)
         df["vehicle_age_squared"] = df["vehicle_age"] ** 2
         df["miles_per_year"] = df["mileage"] / df["vehicle_age"].clip(lower=1)
         df["model_year_bucket"] = (
@@ -693,8 +718,8 @@ def engineer_current_price_features(
         ],
     ).astype("string[pyarrow]")
     if "loaddate" in df.columns and df["loaddate"].notna().any():
-        max_load_date = df["loaddate"].max()
-        df["listing_recency_days"] = (max_load_date - df["loaddate"]).dt.days
+        # Fixed reference makes predictions invariant to other rows in the batch.
+        df["listing_recency_days"] = (df["loaddate"] - pd.Timestamp("2000-01-01")).dt.days
         df["listing_month"] = df["loaddate"].dt.month.astype("Int64")
         df["listing_week"] = df["loaddate"].dt.isocalendar().week.astype("Int64")
     else:
@@ -759,7 +784,7 @@ def engineer_current_price_features(
             na=False,
         ).astype("int8[pyarrow]")
         df["title_mentions_luxury_trim"] = title.str.contains(
-            "premium|platinum|limited|reserve|s|amg|m sport|rs|performance|gt350|gt500",
+            r"\b(?:premium|platinum|limited|reserve|amg|m sport|rs|performance|gt350|gt500)\b",
             case=False,
             na=False,
         ).astype("int8[pyarrow]")
@@ -846,7 +871,7 @@ def make_inference_feature_matrix(df: pd.DataFrame) -> pd.DataFrame:
             "Inference frame lacks canonical identity columns: " + ", ".join(missing_identity)
         )
     drop_columns = DROP_FEATURE_COLUMNS | PRICE_LEAKAGE_FEATURE_COLUMNS | IDENTITY_DIAGNOSTIC_COLUMNS
-    feature_df = df.drop(columns=[c for c in drop_columns if c in df.columns], errors="ignore")
+    feature_df = df[[c for c in df.columns if c in ALLOWED_PRICE_FEATURES and c not in drop_columns]].copy()
     assert_canonical_identity_contract(feature_df)
     return feature_df
 
@@ -886,7 +911,7 @@ def split_train_test(
     if "loaddate" in df.columns:
         df["loaddate"] = pd.to_datetime(df["loaddate"], errors="coerce")
 
-    if "loaddate" in df.columns and df["loaddate"].notna().nunique() >= 2:
+    if "loaddate" in df.columns and df["loaddate"].nunique(dropna=True) >= 2:
         cutoff = pd.Timestamp(split_date) if split_date else df["loaddate"].quantile(1 - test_size)
         raw_train = df[df["loaddate"] < cutoff].copy()
         test_df = df[df["loaddate"] >= cutoff].copy()
@@ -903,6 +928,8 @@ def split_train_test(
             }
             return train_df.reset_index(drop=True), test_df.reset_index(drop=True), metadata
 
+    if split_date:
+        raise ValueError("Requested time split has insufficient disjoint train/test support (100/50 rows).")
     splitter = GroupShuffleSplit(n_splits=1, test_size=test_size, random_state=RANDOM_STATE)
     groups = df["vin"].fillna("UNKNOWN")
     train_idx, test_idx = next(splitter.split(df, df["price"], groups=groups))
@@ -920,9 +947,9 @@ def split_train_test(
 def make_feature_matrix(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series, pd.DataFrame]:
     y = df["price"].astype("float32")
     drop_columns = DROP_FEATURE_COLUMNS | PRICE_LEAKAGE_FEATURE_COLUMNS | IDENTITY_DIAGNOSTIC_COLUMNS
-    feature_df = df.drop(columns=[c for c in drop_columns if c in df.columns], errors="ignore")
+    feature_df = df[[c for c in df.columns if c in ALLOWED_PRICE_FEATURES and c not in drop_columns]].copy()
     assert_canonical_identity_contract(feature_df)
-    return feature_df, y, df[["vin", "price", "price_band", "canonical_make", "canonical_year"]].copy()
+    return feature_df, y, df[[c for c in ["vin", "price", "price_band", "canonical_make", "canonical_year", "loaddate"] if c in df]].copy()
 
 
 def to_float32(X: Any) -> Any:
@@ -999,7 +1026,10 @@ def build_preprocessors(X_train: pd.DataFrame) -> tuple[ColumnTransformer, Pipel
         [
             ("normalize_missing", categorical_missing),
             ("imputer", SimpleImputer(strategy="constant", fill_value="UNKNOWN")),
-            ("target", TargetEncoder(min_samples_leaf=20, smoothing=10)),
+            # Bounded, target-independent encoding avoids in-sample target leakage.
+            ("onehot", OneHotEncoder(handle_unknown="infrequent_if_exist", min_frequency=10,
+                                     max_categories=RANDOM_FOREST_MAX_CATEGORIES_PER_FEATURE,
+                                     sparse_output=True, dtype=np.float32)),
             ("float32", float32_cast),
         ]
     )
@@ -1188,6 +1218,9 @@ def model_candidates(tree_preprocessor: ColumnTransformer, linear_preprocessor: 
     )
 
     return {
+        "MedianBaseline": (Pipeline([("preprocessor", clone(tree_preprocessor)), ("model", DummyRegressor(strategy="median"))]), {}),
+        "RidgePlain": (Pipeline([("preprocessor", clone(linear_preprocessor)), ("model", clone(ridge))]), {"model__regressor__alpha": [1.0, 10.0, 30.0]}),
+        "LightGBMPlain": (Pipeline([("preprocessor", clone(tree_preprocessor)), ("model", clone(lightgbm))]), {"model__regressor__num_leaves": [31, 63]}),
         "Ridge": (
             routed_pipeline(linear_preprocessor, ridge),
             {
@@ -1384,7 +1417,7 @@ def get_preprocessor_feature_names(preprocessor: Any, expected_count: int | None
 
 
 def get_column_transformer_feature_names(preprocessor: Any) -> list[str]:
-    """Return report-friendly feature names, including target-encoded source fields."""
+    """Return report-friendly names for fitted numeric and categorical blocks."""
     if isinstance(preprocessor, Pipeline):
         if "features" in preprocessor.named_steps:
             return get_column_transformer_feature_names(preprocessor.named_steps["features"])
@@ -1407,10 +1440,6 @@ def get_column_transformer_feature_names(preprocessor: Any) -> list[str]:
         else:
             source_columns = [str(column) for column in list(columns)]
         if not source_columns:
-            continue
-
-        if block_name == "cat_high":
-            feature_names.extend([f"target_encoded__{column}" for column in source_columns])
             continue
 
         try:
@@ -1513,13 +1542,26 @@ def tune_and_fit(
 
     total_param_combinations = prod(len(values) for values in param_grid.values())
     cv = GroupKFold(n_splits=min(3, int(groups_tune.nunique())))
+    if "loaddate" in train_segments:
+        dates = pd.to_datetime(train_segments.iloc[tuning_positions]["loaddate"], errors="coerce").reset_index(drop=True)
+        folds = []
+        unique_dates = pd.Index(dates.dropna().unique()).sort_values()
+        if len(unique_dates) >= 4:
+            for block in np.array_split(unique_dates, 4)[1:]:
+                valid = np.flatnonzero(dates.isin(block))
+                earlier = dates.lt(block.min()).to_numpy() & ~groups_tune.reset_index(drop=True).isin(groups_tune.iloc[valid]).to_numpy()
+                fit = np.flatnonzero(earlier)
+                if len(fit) >= 20 and len(valid) >= 10:
+                    folds.append((fit, valid))
+        if folds:
+            cv = folds
     tuning_n_jobs = tuning_search_n_jobs(X_tune.shape[0])
     search = RandomizedSearchCV(
         pipeline,
         param_distributions=param_grid,
         n_iter=min(8, total_param_combinations),
         cv=cv,
-        scoring="neg_root_mean_squared_error",
+        scoring="neg_mean_absolute_error",
         n_jobs=tuning_n_jobs,
         random_state=RANDOM_STATE,
         verbose=1,
@@ -1536,7 +1578,8 @@ def tune_and_fit(
         {
             "tuned": True,
             "tuning_rows": int(X_tune.shape[0]),
-            "cv_folds": int(cv.n_splits),
+            "cv_folds": len(cv) if isinstance(cv, list) else int(cv.n_splits),
+            "cv_strategy": "expanding_dates_vin_exclusion" if isinstance(cv, list) else "group_kfold",
             "candidate_count": int(min(8, total_param_combinations)),
             "best_params": search.best_params_,
         }
@@ -1557,6 +1600,8 @@ def train_current_price_models(
     sample_strategy: str = DEFAULT_SAMPLE_STRATEGY,
     deduplicate_vins: bool = True,
     split_date: str | None = None,
+    nhtsa_feature_db: Path = FEATURE_DB,
+    feature_set: str = "baseline",
 ) -> dict[str, Any]:
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1569,6 +1614,18 @@ def train_current_price_models(
         deduplicate_vins=deduplicate_vins,
     )
     sql_dedup_metadata = raw_df.attrs.get("deduplication")
+    if feature_set in {"all", "nhtsa", "nhtsa-structured"}:
+        raw_df = attach_features(raw_df, "loaddate", nhtsa_feature_db)
+    data_profile["nhtsa_features"] = raw_df.attrs.get("nhtsa_features", {"available": False, "reason": "excluded by feature set"})
+    data_profile["feature_set"] = feature_set
+    excluded = []
+    if feature_set not in {"all", "youtube"}:
+        excluded += [c for c in raw_df if c.startswith("sentiment_")]
+    if feature_set not in {"all", "nhtsa", "nhtsa-structured"}:
+        excluded += NHTSA_FEATURE_COLUMNS
+    if feature_set == "nhtsa-structured":
+        excluded += [c for c in NHTSA_FEATURE_COLUMNS if c.endswith("_score")]
+    raw_df = raw_df.drop(columns=excluded, errors="ignore")
     raw_rows = int(raw_df.shape[0])
     identity_profile = identity_normalization_profile(raw_df)
     model_df = engineer_current_price_features(raw_df, copy_frame=False)
@@ -1598,9 +1655,16 @@ def train_current_price_models(
         split_date,
         copy_frame=False,
     )
+    train_df, calibration_df, calibration_split = split_train_test(train_df, test_size=0.2)
+    train_df, validation_df, validation_split = split_train_test(train_df, test_size=0.2)
+    split_metadata["calibration_split"] = calibration_split
+    split_metadata["validation_split"] = validation_split
+    split_metadata["selection_metric"] = "validation_mae"
     del model_df
     gc.collect()
 
+    X_calibration, y_calibration, _ = make_feature_matrix(calibration_df)
+    X_validation, y_validation, _ = make_feature_matrix(validation_df)
     X_train, y_train, train_segments = make_feature_matrix(train_df)
     X_test, y_test, test_segments = make_feature_matrix(test_df)
     tree_preprocessor, linear_preprocessor, feature_metadata = build_preprocessors(X_train)
@@ -1629,16 +1693,32 @@ def train_current_price_models(
             train_segments,
         )
         model_fit_metadata[name] = fit_metadata
+        validation_metrics = evaluate_predictions(y_validation, model.predict(X_validation))
         predictions = model.predict(X_test)
         model_metrics = evaluate_predictions(y_test, predictions)
+        model_metrics["validation_metrics"] = validation_metrics
+        residuals = np.abs(y_calibration.to_numpy() - model.predict(X_calibration))
+        if len(residuals) >= 30:
+            quantile = min(1.0, np.ceil((len(residuals) + 1) * 0.9) / len(residuals))
+            radius = float(np.quantile(residuals, quantile, method="higher"))
+            model.interval_radius_ = radius
+            lower = np.maximum(0, predictions - radius)
+            upper = predictions + radius
+            model_metrics["prediction_interval"] = {
+                "nominal_coverage": 0.9, "calibration_rows": len(residuals), "radius": radius,
+                "test_coverage": float(np.mean((y_test >= lower) & (y_test <= upper))),
+                "test_mean_width": float(np.mean(upper - lower)),
+                "caveat": "Marginal residual interval; temporal drift and segment coverage are not guaranteed."}
+
         model_metrics["segment_metrics"] = segment_metrics(y_test, predictions, test_segments)
         metrics[name] = model_metrics
         model_feature_weights[name] = extract_model_feature_weights(model)
+        model.feature_contract_version_ = "pit-v1"
         joblib.dump(model, output_dir / f"{name}.joblib")
         gc.collect()
 
-        if model_metrics["mae"] < best_mae:
-            best_mae = model_metrics["mae"]
+        if validation_metrics["mae"] < best_mae:
+            best_mae = validation_metrics["mae"]
             best_name = name
             best_model = model
 
@@ -1657,6 +1737,8 @@ def train_current_price_models(
             "raw_rows": raw_rows,
             "model_rows": model_rows,
             "train_rows": int(train_df.shape[0]),
+            "validation_rows": int(validation_df.shape[0]),
+            "calibration_rows": int(calibration_df.shape[0]),
             "test_rows": int(test_df.shape[0]),
             "train_vins": int(train_df["vin"].nunique()),
             "test_vins": int(test_df["vin"].nunique()),
@@ -1669,7 +1751,7 @@ def train_current_price_models(
             "test_loaddate_max": str(test_df["loaddate"].max()) if "loaddate" in test_df else None,
         },
         "split": split_metadata,
-        "features": feature_metadata,
+        "features": {**feature_metadata, "categorical_encoding": "bounded_one_hot", "feature_set": feature_set},
         "trim_features": {
             "canonical_trim_input": canonical_trim_input,
             "comparison_columns_available": comparison_columns_available,
@@ -1689,7 +1771,7 @@ def train_current_price_models(
             "dropped_price_leakage_columns": sorted(PRICE_LEAKAGE_FEATURE_COLUMNS),
             "price_band_usage": "diagnostic segmentation and high-value classifier labels only; never included in model inputs",
             "high_value_routing": (
-                "Every candidate model first trains a leakage-safe classifier on training labels "
+                "Routed candidates train a leakage-safe classifier on training labels "
                 f"for price > ${HIGH_VALUE_THRESHOLD:,}, then routes predictions to separately "
                 "fit everyday or high-value regressors."
             ),
@@ -1705,7 +1787,7 @@ def train_current_price_models(
             "NHTSA make/model anchor canonical identity; title-derived canonical trim is the only trim input.",
             "Hyperparameters are tuned on a representative bounded sample, then refit on the full training split.",
             "RandomForest is sample-bounded and leaf-bounded on large full-database runs because scikit-learn stores every fitted tree node in memory.",
-            "All current-price candidates use the same high-value classifier router before model-specific regressors.",
+            "Median and plain Ridge/LightGBM baselines are compared with routed candidates; selection uses a separate validation set.",
             "CatBoost remains a strong future candidate for categorical-heavy modeling but is not required for this dependency set.",
         ],
         "research_sources": RESEARCH_REFERENCES,
@@ -1790,7 +1872,7 @@ def write_reports(output_dir: Path, report: dict[str, Any]) -> None:
             "## Notes",
             "- The current-price benchmark now uses leakage-safe VIN handling.",
             "- Answer-derived `price_band` is excluded from model features and used only for diagnostics and high-value router labels during training.",
-            "- Every candidate model uses a leakage-safe classifier router before separately fit everyday/high-value regressors.",
+            "- Plain median/Ridge/LightGBM baselines are compared with routed candidates; validation MAE selects the recommendation.",
             "- `nhtsa_BasePrice` and `nhtsa_BasePrice_source` are excluded because base price can be filled from observed price history.",
             "- Hyperparameters are tuned on a representative bounded sample, then refit on the full training split.",
             "- Full eligible-VIN training is the default; pass a positive `--sample-size` for bounded development runs.",
@@ -1828,6 +1910,8 @@ def main() -> None:
         sample_strategy=args.sample_strategy,
         deduplicate_vins=not args.keep_duplicate_vins,
         split_date=args.split_date,
+        nhtsa_feature_db=args.nhtsa_feature_db,
+        feature_set=args.feature_set,
     )
     print(f"Recommended current-price model: {report['recommended_model']}")
     print(f"Saved report to {Path(args.output_dir) / 'model_report.json'}")
@@ -1844,6 +1928,8 @@ def main() -> None:
             target_months=target_months,
             forecast_months=args.forecast_months,
             split_date=args.split_date,
+            nhtsa_feature_db=args.nhtsa_feature_db,
+            feature_set=args.feature_set,
         )
 
 

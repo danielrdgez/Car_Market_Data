@@ -22,7 +22,7 @@ DB_PATH = Path(os.environ.get("CAR_DATA_DB_PATH", BASE_DIR / "CAR_DATA_OUTPUT" /
 SENTIMENT_DB_PATH = Path(
     os.environ.get("CAR_SENTIMENT_DB_PATH", BASE_DIR / "CAR_DATA_OUTPUT" / "CAR_YOUTUBE_COMMENTS.db")
 )
-MODELS_DIR = BASE_DIR / "MODELS_OUTPUT"
+MODELS_DIR = Path(os.environ.get("MODEL_OUTPUT_DIR", str(BASE_DIR / "MODELS_OUTPUT")))
 CURRENT_REPORT_PATH = MODELS_DIR / "model_report.json"
 COHORT_REPORT_PATH = MODELS_DIR / "cohort_depreciation_model_report.json"
 FORECAST_PATH = MODELS_DIR / "cohort_future_forecasts.csv"
@@ -544,7 +544,10 @@ def load_cohort_feature_metadata(path_text: str) -> dict[str, Any]:
 @st.cache_resource(show_spinner=False)
 def load_depreciation_model(model_name: str, modified_ns: int) -> Any:
     _ = modified_ns
-    return joblib.load(MODELS_DIR / model_name)
+    model = joblib.load(MODELS_DIR / model_name)
+    if getattr(model, "feature_contract_version_", None) != "pit-v1":
+        raise ValueError("Retrain this artifact with the current feature contract before scenario inference.")
+    return model
 
 
 @st.cache_data(show_spinner=False)
@@ -840,7 +843,10 @@ def load_backtesting_results() -> pd.DataFrame:
 @st.cache_resource(show_spinner=False)
 def load_current_model(model_name: str, modified_ns: int) -> Any:
     _ = modified_ns
-    return joblib.load(MODELS_DIR / f"{model_name}.joblib")
+    model = joblib.load(MODELS_DIR / f"{model_name}.joblib")
+    if getattr(model, "feature_contract_version_", None) != "pit-v1":
+        raise ValueError("Retrain this artifact with the current date and encoding contract before inference.")
+    return model
 
 
 def current_model_predictions(vin: str, model_names: list[str]) -> tuple[pd.DataFrame, list[str]]:
@@ -848,6 +854,8 @@ def current_model_predictions(vin: str, model_names: list[str]) -> tuple[pd.Data
     if raw.empty:
         return pd.DataFrame(), [f"No current-price model row found for VIN {vin}."]
 
+    from DataPipeline.NHTSA_text_features import attach_features
+    raw = attach_features(raw, "loaddate")
     engineered = engineer_current_price_features(raw)
     if engineered.empty:
         return pd.DataFrame(), [f"VIN {vin} was removed by model feature cleaning."]
@@ -864,7 +872,7 @@ def current_model_predictions(vin: str, model_names: list[str]) -> tuple[pd.Data
             continue
         try:
             model = load_current_model(model_name, artifact_path.stat().st_mtime_ns)
-            prediction = float(np.ravel(model.predict(X))[0])
+            prediction = float(np.ravel(model.predict(X.reindex(columns=getattr(model, "feature_names_in_", X.columns))))[0])
             rows.append(
                 {
                     "model": model_name,
@@ -897,6 +905,8 @@ def current_scenario_predictions(
     if resolved_raw_row.empty:
         return pd.DataFrame(columns=["model", "predicted_price"]), ["Resolved scenario row is empty."]
     try:
+        from DataPipeline.NHTSA_text_features import attach_features
+        resolved_raw_row = attach_features(resolved_raw_row, "loaddate")
         engineered = engineer_current_price_features(resolved_raw_row, require_target=False)
         if engineered.empty:
             return pd.DataFrame(columns=["model", "predicted_price"]), [
@@ -915,7 +925,7 @@ def current_scenario_predictions(
             continue
         try:
             model = load_current_model(model_name, artifact_path.stat().st_mtime_ns)
-            prediction = float(np.ravel(model.predict(X))[0])
+            prediction = float(np.ravel(model.predict(X.reindex(columns=getattr(model, "feature_names_in_", X.columns))))[0])
             rows.append({"model": model_name, "predicted_price": prediction})
         except Exception as exc:  # pragma: no cover - defensive dashboard path
             errors.append(f"{model_name}: {exc}")
@@ -935,6 +945,8 @@ def filtered_current_model_metrics(
     if raw.empty:
         return pd.DataFrame(), ["No model-ready rows were found for the filtered VIN set."]
 
+    from DataPipeline.NHTSA_text_features import attach_features
+    raw = attach_features(raw, "loaddate")
     engineered = engineer_current_price_features(raw)
     if engineered.empty:
         return pd.DataFrame(), ["Filtered VIN rows were removed by model feature cleaning."]
@@ -952,7 +964,7 @@ def filtered_current_model_metrics(
             continue
         try:
             model = load_current_model(model_name, artifact_path.stat().st_mtime_ns)
-            predictions = np.ravel(model.predict(X)).astype("float64")
+            predictions = np.ravel(model.predict(X.reindex(columns=getattr(model, "feature_names_in_", X.columns)))).astype("float64")
             errors_abs = np.abs(y_values - predictions)
             rows.append(
                 {

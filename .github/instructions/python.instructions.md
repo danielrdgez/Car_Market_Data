@@ -61,13 +61,18 @@ If touching this file:
 NHTSA-specific implementation:
 
 1. Use the vPIC batch `data` field with at most 50 `vin,modelYear` entries.
-2. Persist every response field, variable/value identifier when supplied, request status, and raw JSON.
+2. Persist source fields, variable/value identifiers and request status in typed columns or normalized tables; do not persist raw JSON blobs.
 3. Perform the Safety Ratings variant lookup and then a detail lookup for every `VehicleId`.
 4. Store all recall and complaint records without truncation, and retain their source grain.
 5. Resolve NHTSA identity fields before listing fallbacks and record provenance/conflicts.
 6. Keep NHTSA writes incremental, resumable, rate-limited, and documented in the project Markdown and agent files.
 
 ## 5. Modeling and Research Standards
+
+For future model/NHTSA NLP work, read the reviewed roadmap in PROJECT_SUMMARY.md.
+For ABSA aggregation, preserve cumulative distinct-video counts through first
+eligible make/video month; batch callers may reuse a matching classifier without
+changing scoring or model provenance.
 
 1. Avoid target leakage. Do not include `price`, `price_band`, future prices, or answer-derived fields in model features.
 2. Preserve VIN-safe validation for current-price modeling.
@@ -89,3 +94,24 @@ NHTSA-specific implementation:
 4. If you add a Python package, update `requirements.txt` in the same change.
 5. Keep direct script execution intact with `if __name__ == "__main__": main()`.
 6. Prefer repo-root-relative paths over machine-specific absolute paths when touching path logic.
+
+
+## Collected-time NLP and model contracts (2026-09-16)
+
+- Keep YouTube ABSA incremental with per-batch commits; never launch long inference
+  during implementation verification. The user stopped the previous worker.
+- NHTSA_text_features.py owns the optional derived CAR_NHTSA_TEXT_FEATURES.db;
+  raw source schemas and scheduled acquisition steps are unchanged. Keep its
+  pinned configuration, event deduplication and read-only source access intact.
+- Keep complaint experience, recall potential hazards and remedy text separate.
+  Join query metadata on exact normalized make/model/year, never masked VIN or
+  trim. Availability uses retained collection time before observation month;
+  unknown/failure is not zero. Do not claim fleet failure rates or NLP lift.
+- Baseline is the default model feature set. Use isolated, frozen-input ablation
+  runs for youtube, nhtsa-structured, nhtsa and all; validate text labels manually.
+- Current-price uses an allowlist and bounded one-hot encoding, separate selection,
+  calibration and test data. Forecasts use calendar targets, origin-known support,
+  one VIN/month and observed actuals. Preserve recursive/naive/drift comparisons.
+- Synchronize the pit-v1 artifact contract, notebook and dashboard. Old artifacts
+  require retraining before new-contract inference. See PROJECT_SUMMARY.md for
+  exact commands, limitations and remaining research rather than inferring lift.

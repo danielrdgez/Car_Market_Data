@@ -131,6 +131,13 @@ run_pipeline_scheduler.bat --dry-run
 
 ## Modeling Rules
 
+- Implemented modeling safeguards and remaining research are recorded in
+  PROJECT_SUMMARY.md under "Modeling Roadmap and NHTSA Text Workflow".
+- The selected YouTube rerun policy is to reuse existing aspect scores, rebuild
+  make attribution/aggregates, and score only unprocessed comments. Keep NHTSA
+  complaint/recall NLP separate from YouTube opinion scoring and preserve its
+  make/model/year and point-in-time semantics when implementing the saved plan.
+
 - Avoid target leakage. Do not train on `price`, `price_band`, future price fields, or any feature created from the target unless it is explicitly removed before fitting.
 - Preserve VIN-safe validation. Current-price splits should avoid VIN overlap between train and test.
 - Prefer time-based validation when enough dates exist; fall back to grouped validation by VIN or cohort.
@@ -160,8 +167,13 @@ run_pipeline_scheduler.bat --dry-run
 - Preserve comment deduplication by `comment_id`.
 - Preserve video-level fetch progress in `youtube_video_fetch_state` and playlist discovery state in `youtube_playlist_fetch_state`; unseen videos should be prioritized ahead of refresh runs.
 - Keep ABSA incremental by `comment_id`. Do not revert to full-table rescoring unless the user explicitly asks for a forced reprocess.
+- Keep cumulative distinct-video counts exact across months: count each video's
+  first eligible month within a make, then accumulate new-video counts. Do not
+  sum monthly distinct-video counts or restore per-month full-history scans.
+- Batch callers may supply a matching classifier to `run_absa_on_comments` to
+  reuse loaded weights; preserve scoring semantics and model-revision provenance.
 - Keep sentiment aggregation at canonical make grain. `make_sentiment_index` is the current rollup and `make_sentiment_monthly` is the cumulative point-in-time source for ML joins; do not restore year/make/model/trim sentiment cohorts.
-- Current-price and depreciation models may use only `sentiment_overall_score`, the four `sentiment_{aspect}_score` fields, `sentiment_comment_count`, `sentiment_video_count`, and `sentiment_aspect_coverage`. Join monthly sentiment on or before the listing/history month to prevent future-comment leakage.
+- Current-price and depreciation models may use only `sentiment_overall_score`, the four `sentiment_{aspect}_score` fields, `sentiment_comment_count`, `sentiment_video_count`, and `sentiment_aspect_coverage`. Join monthly sentiment strictly before the listing/history month to prevent future-comment leakage.
 - Use `DataPipeline/absa_pipeline.py --migrate-make-grain` to backfill existing scored comments without inference. Do not combine this migration with `--force-reprocess`.
 - Keep aspect labels and thresholds documented when changing `absa_pipeline.py`.
 - Validate whether sentiment joins have enough support before claiming predictive lift.
@@ -211,3 +223,24 @@ For most changes, a good finish includes:
 3. Lightweight validation has been run, or the reason it could not be run is documented.
 4. All relevant project Markdown and agent guidance files are updated when workflow or architecture changes.
 5. The final response clearly states what changed and what was verified.
+
+
+## Collected-time NLP and model contracts (2026-09-16)
+
+- Keep YouTube ABSA incremental with per-batch commits; never launch long inference
+  during implementation verification. The user stopped the previous worker.
+- NHTSA_text_features.py owns the optional derived CAR_NHTSA_TEXT_FEATURES.db;
+  raw source schemas and scheduled acquisition steps are unchanged. Keep its
+  pinned configuration, event deduplication and read-only source access intact.
+- Keep complaint experience, recall potential hazards and remedy text separate.
+  Join query metadata on exact normalized make/model/year, never masked VIN or
+  trim. Availability uses retained collection time before observation month;
+  unknown/failure is not zero. Do not claim fleet failure rates or NLP lift.
+- Baseline is the default model feature set. Use isolated, frozen-input ablation
+  runs for youtube, nhtsa-structured, nhtsa and all; validate text labels manually.
+- Current-price uses an allowlist and bounded one-hot encoding, separate selection,
+  calibration and test data. Forecasts use calendar targets, origin-known support,
+  one VIN/month and observed actuals. Preserve recursive/naive/drift comparisons.
+- Synchronize the pit-v1 artifact contract, notebook and dashboard. Old artifacts
+  require retraining before new-contract inference. See PROJECT_SUMMARY.md for
+  exact commands, limitations and remaining research rather than inferring lift.

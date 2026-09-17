@@ -18,7 +18,7 @@ Every analysis step should support at least one of these capstone questions:
 
 1. Safety and depreciation: do ADAS features, official safety ratings, recalls, or complaints mitigate depreciation or improve resale value?
 2. High-dimensional price prediction: do enriched NHTSA vehicle attributes improve current-price prediction beyond age, mileage, location, and listing metadata?
-3. Cohort depreciation forecasting: can make/model/model-year/trim cohorts forecast future median-price changes over 30, 90, 180, and 365 day horizons?
+3. Cohort depreciation forecasting: can make/model/model-year/trim cohorts forecast future median-price changes over monthly horizons out to five years?
 4. Sentiment integration: do YouTube comment sentiment and aspect-based sentiment indexes improve predictive accuracy or explain residuals?
 5. Segment robustness: how do findings vary by price band, high-value vehicles, make, model year, fuel type, body class, and data collection window?
 
@@ -38,13 +38,13 @@ Core tables:
 - `listing_history`: longitudinal listing records by VIN and date.
 - `price_history`: longitudinal price records by VIN and date.
 - `youtube_comments_sentiment`: raw YouTube comments.
-- `vehicle_sentiment_index`: ABSA-derived vehicle-level sentiment features when available.
+- `make_sentiment_monthly`: cumulative make-level ABSA features for historical joins.
 
 Preferred joins:
 
 - Current-price analysis: latest or deduplicated `listings` joined to `nhtsa_enrichment` on `vin`.
 - Time-series analysis: `price_history` and/or `listing_history` joined to latest listing metadata and `nhtsa_enrichment` on `vin`.
-- Sentiment analysis: join cautiously by normalized make/model/model year or generated vehicle entity, and report support counts.
+- Sentiment analysis: join YouTube by canonical make using only prior completed months; join NHTSA query features by exact normalized make/model/year and prior collection timestamp.
 
 ## 4. Analytical Guidelines
 
@@ -68,10 +68,10 @@ Useful feature families:
 - `vehicle_age`, `vehicle_age_squared`, `miles_per_year`, `log_mileage`, and mileage-age interactions.
 - Market timing features such as listing month, week, recency, and load-date windows.
 - Safety and technology composites from ADAS fields such as adaptive cruise, blind spot monitoring, lane keeping, forward collision warning, and automatic emergency braking.
-- Safety/defect indicators from safety ratings, recall counts, complaint counts, crash/fire/injury complaint rates.
+- Safety/defect indicators from safety ratings, recall counts, complaint counts, crash/fire/injury shares of reports with known flags.
 - Vehicle attribute segments: body class, drive type, fuel type, electrification level, engine horsepower, cylinders, and curb weight.
 - Price-history features: lagged median price, rolling price, volume, price-down rate, and market index.
-- Sentiment features: reliability, value, performance, comfort, general enthusiast score, volatility, confidence, and support counts.
+- Sentiment features: overall, reliability, value, performance, comfort, comment count, video count, and aspect coverage only.
 
 ### Phase 3: Visualization
 
@@ -93,3 +93,24 @@ Useful feature families:
 6. Keep code and markdown professional and emoji-free.
 7. If a new package is introduced, update `requirements.txt`.
 8. Update `README.md`, `PROJECT_SUMMARY.md`, root `AGENTS.md`, or `.github` instructions when workflows or research framing change.
+
+
+## Collected-time NLP and model contracts (2026-09-16)
+
+- Keep YouTube ABSA incremental with per-batch commits; never launch long inference
+  during implementation verification. The user stopped the previous worker.
+- NHTSA_text_features.py owns the optional derived CAR_NHTSA_TEXT_FEATURES.db;
+  raw source schemas and scheduled acquisition steps are unchanged. Keep its
+  pinned configuration, event deduplication and read-only source access intact.
+- Keep complaint experience, recall potential hazards and remedy text separate.
+  Join query metadata on exact normalized make/model/year, never masked VIN or
+  trim. Availability uses retained collection time before observation month;
+  unknown/failure is not zero. Do not claim fleet failure rates or NLP lift.
+- Baseline is the default model feature set. Use isolated, frozen-input ablation
+  runs for youtube, nhtsa-structured, nhtsa and all; validate text labels manually.
+- Current-price uses an allowlist and bounded one-hot encoding, separate selection,
+  calibration and test data. Forecasts use calendar targets, origin-known support,
+  one VIN/month and observed actuals. Preserve recursive/naive/drift comparisons.
+- Synchronize the pit-v1 artifact contract, notebook and dashboard. Old artifacts
+  require retraining before new-contract inference. See PROJECT_SUMMARY.md for
+  exact commands, limitations and remaining research rather than inferring lift.

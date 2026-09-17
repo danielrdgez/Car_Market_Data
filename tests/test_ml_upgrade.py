@@ -636,7 +636,7 @@ class DataCleaningUpgradeTests(unittest.TestCase):
                 set(),
             )
             toyota = frame.loc[frame["canonical_make"].eq("TOYOTA")].iloc[0]
-            self.assertAlmostEqual(float(toyota["sentiment_overall_score"]), 0.20)
+            self.assertAlmostEqual(float(toyota["sentiment_overall_score"]), 0.10)
             engineered = engineer_current_price_features(frame)
             features, _, _ = make_feature_matrix(engineered)
             self.assertTrue(NEW_SENTIMENT_COLUMNS.issubset(features.columns))
@@ -980,7 +980,7 @@ class ModelingUpgradeTests(unittest.TestCase):
 
         self.assertTrue(DEPRECIATION_PRICE_LEAKAGE_FEATURE_COLUMNS.isdisjoint(depreciation_features))
 
-    def test_target_encoded_feature_names_map_to_source_columns(self):
+    def test_one_hot_feature_names_map_to_source_columns(self):
         X = pd.DataFrame(
             {
                 "mileage": [10_000, 20_000, 30_000, 40_000],
@@ -999,9 +999,9 @@ class ModelingUpgradeTests(unittest.TestCase):
             tree_preprocessor.transform(X).shape[1],
         )
 
-        self.assertIn("target_encoded__nhtsa_Make", feature_names)
-        self.assertIn("target_encoded__nhtsa_Model", feature_names)
-        self.assertIn("target_encoded__trim_proxy", feature_names)
+        self.assertIn("nhtsa_Make_infrequent_sklearn", feature_names)
+        self.assertIn("nhtsa_Model_infrequent_sklearn", feature_names)
+        self.assertIn("trim_proxy_infrequent_sklearn", feature_names)
         self.assertFalse(any(name.startswith("cat_high__") and name.split("__", 1)[1].isdigit() for name in feature_names))
 
     def test_preprocessors_accept_arrow_nullable_categorical_values(self):
@@ -1049,8 +1049,11 @@ class ModelingUpgradeTests(unittest.TestCase):
 
         candidates = model_candidates(tree_preprocessor, linear_preprocessor)
 
-        self.assertEqual(set(candidates), {"Ridge", "ElasticNet", "LightGBM", "RandomForest"})
+        self.assertEqual(set(candidates), {"Ridge", "ElasticNet", "LightGBM", "RandomForest", "MedianBaseline", "RidgePlain", "LightGBMPlain"})
         for name, (pipeline, param_grid) in candidates.items():
+            if name in {"MedianBaseline", "RidgePlain", "LightGBMPlain"}:
+                self.assertNotIsInstance(pipeline.named_steps["model"], HighValueRoutedRegressor)
+                continue
             self.assertIsInstance(pipeline.named_steps["model"], HighValueRoutedRegressor)
             self.assertFalse(name.startswith(("Readable_", "Tree_", "Advanced_", "Segmented_")))
             self.assertIn("model__probability_cutoff", param_grid)
